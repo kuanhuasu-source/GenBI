@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 環境設定 (敏感資訊)
+.env
+.env.local
+*.env
+
+# 測試產物
+test_results.md
+test_results.json
+test_generality_*.json
+test_runner*.log
+test_generality*.log
+test_runner_v*.log
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 日誌
+*.log
