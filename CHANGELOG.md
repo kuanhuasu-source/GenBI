@@ -5,6 +5,20 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.2.1] · 2026-05-12 — Docs:LLM handoff brief
+
+**Patch release · docs only,無功能變動。**
+
+### 📝 新增
+
+- **`AI_CONTEXT.md`** — 單檔自足的專案濃縮文件,給 LLM agent / 接手開發者直接讀。
+  - ~163 KB / 3,714 行,14 個 narrative 區段 + 7 個內嵌源碼區段。
+  - 涵蓋:架構地圖、檔案職責、模組 API、環境變數對照、常見錯誤速查、Debug SOP、測試指令、新 domain 接入指南、設計原則。
+  - 內嵌完整源碼:`requirements.txt` / `.env.example` / `config.py` / `llm_service.py` / `app.py` / `tflex_task_metadata_agent_v3.py`。
+  - 用途:可直接餵進新 LLM session 取得專案全貌,不需另外 navigate repo。
+
+---
+
 ## [0.2.0] · 2026-05-12 — Pre-Phase 0 UX Layer + Continuity
 
 新增「**對話式 BI**」的 UX 基礎建設:Intent Router、Follow-up Detection、out_of_scope 拒絕。
