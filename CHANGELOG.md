@@ -5,6 +5,63 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.2.0] · 2026-05-12 — Pre-Phase 0 UX Layer + Continuity
+
+新增「**對話式 BI**」的 UX 基礎建設:Intent Router、Follow-up Detection、out_of_scope 拒絕。
+使用者從第一次見面到深度迭代分析的完整 journey 都被覆蓋,且大部分 meta query 是 **0 LLM call** 毫秒級回應。
+
+### ✨ 新增 — Pre-Phase 0 路由層
+
+- **Intent Router**(6 種 intent · 全部 0 LLM call):
+  - `greeting`(hi / 你好)→ 簡短歡迎 + 下一步建議
+  - `intro`(你會做什麼?)→ 從 metadata 生成產品介紹 + 範例問題
+  - `data_overview`(你有什麼資料?)→ 列出 collections / KPI / 限制
+  - `data_check`(你有 X 嗎?)→ subject 萃取 + metadata 搜尋,引用 data_limitations
+  - `guidance`(怎麼開始?)→ 分類引導 + 範例
+  - **`out_of_scope`**(今天天氣 / 股價 / 翻譯 等)→ 從 metadata 建 bilingual vocab,query 無 vocab match 時友善引導
+- **Follow-up Detection** — 偵測「改成 X / 也加 Y / 排序 / 只看 Z」等修改詞 + last_analysis 存在時自動注入前次脈絡到 Phase 0
+- **Routing 優先序**:explicit intent → follow-up → out_of_scope → analysis(follow-up 優先於 out_of_scope,避免短修改指令被誤判離題)
+
+### ✨ 新增 — 對話延續性
+
+- `st.session_state.last_analysis` 儲存前次分析脈絡(query / Q.columns / chart type / plan summary)
+- Phase 0 follow-up preamble 採用 **Minimal Change Principle**:
+  - 純改圖表 → A/B 段沿用,只改 C
+  - 加 KPI → A 段保持,B 段加新欄位,C 段加 series
+  - 收窄範圍 → A 段加 $match,B/C 沿用
+- Sidebar 加「🆕 開始新分析」「🗑️ 清除對話歷史」按鈕,使用者可手動中斷接續
+
+### 🛡️ 結構性防禦強化
+
+- **比率類 KPI 標準骨架** — Phase B prompt 直接內建三步驟 (bool flag → sum → int/int rate),防 follow-up 加 KPI 時誤把 string 欄位當分母
+- **Anti-pattern cheatsheet 新增** — 「string / int 除法」TypeError 對照表
+- **單一指標 stack 處理** — 若前次 Q 只有 1 個 numeric 指標而使用者要 stacked bar,prompt 提供 3 條合理應對(保留 bar / 建議改看占比 / 用戶明示堆疊指標)
+- **絕對禁忌列表** — 不要把 hc 當 x-axis 維度、不要產生重複 Q 行、不要 raw count 配 `{value}%` formatter
+
+### 🎨 UX 細節
+
+- 移除預設 welcome panel — **極簡開場**,只在使用者主動問才呈現引導(`你會做什麼?` 等)
+- Chat input placeholder 含 3 個 meta query 提示
+- Follow-up 偵測到時顯示「🔗 偵測為延續性分析」info banner,透明化
+- out_of_scope 響應「🧭 你問的不在範圍內」+ 來自 metadata 的範例問題引導
+
+### 📋 測試與文件
+
+- `TEST_UX_SCENARIOS.md` — 完整 9 個 scenario / 57 case 的 UI 整合測試計畫
+- 涵蓋:冷啟動 / 探索資料 / 標準分析 / 接續修改 / 拒絕路徑 / 完全離題 / 複合需求 / 完整 User Journey / 邊界防禦
+
+### 🐛 修正
+
+- Routing 順序 bug:「改成 stacked bar」這類短的修改指令不再被誤判為 out_of_scope
+- _GENERIC_BI_TERMS 擴大:加入 `stacked / bar / line / scatter / heatmap / 圖` 等視覺化術語
+
+### ⚠️ Known Issue
+
+- 接續分析在「同時換圖表類型 + LLM 自由發揮」時,偶爾仍會誤解維度(如 hc 當 x 軸)
+- 後續可考慮 architectural fast path:純改圖表類型的 follow-up 跳過 Phase 0/A/B,直接重新跑 Phase C
+
+---
+
 ## [0.1.0] · 2026-05-12 — Initial Release
 
 第一個可用版本。系統已完成核心 architecture,在三個 domain (tFlex / 電商 / 健保) 上驗證通用化能力。

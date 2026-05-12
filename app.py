@@ -19,7 +19,12 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 from streamlit_echarts import st_echarts
 
-from llm_service import LLMService, is_dashboard_query
+from llm_service import (
+    LLMService,
+    is_dashboard_query,
+    classify_intent,
+    is_followup_query,
+)
 import config
 
 
@@ -245,6 +250,14 @@ st.markdown(f"**Powered by `{LLM_MODEL}` via OpenAI-compatible endpoint**")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# 用於延續性分析:儲存上一次成功(或部分成功)的分析脈絡
+if "last_analysis" not in st.session_state:
+    st.session_state.last_analysis = None
+
+# 用於 sample question 按鈕注入到 chat input
+if "pending_query" not in st.session_state:
+    st.session_state.pending_query = None
+
 # LLMService 用 session_state 快取避免重複建立 OpenAI client
 if "llm_service" not in st.session_state:
     st.session_state.llm_service = LLMService(
@@ -305,6 +318,22 @@ with st.sidebar:
 
     enable_insight = st.toggle("啟用 Phase D 商業洞察", value=True)
     st.divider()
+
+    # 接續分析狀態
+    if st.session_state.last_analysis:
+        st.markdown("**🔗 延續性分析狀態**")
+        la = st.session_state.last_analysis
+        st.caption(f"前次:_{(la.get('query') or '')[:40]}_")
+        if st.button("🆕 開始新分析(清除延續脈絡)"):
+            st.session_state.last_analysis = None
+            st.rerun()
+    if st.session_state.messages:
+        if st.button("🗑️ 清除對話歷史"):
+            st.session_state.messages = []
+            st.session_state.last_analysis = None
+            st.rerun()
+
+    st.divider()
     st.caption("💡 環境變數可調:HRDA_MODEL_BASE_URL / HRDA_MODEL_NAME / MONGO_URI …")
 
 # ============================================================
@@ -336,14 +365,60 @@ for idx, msg in enumerate(st.session_state.messages):
 # ============================================================
 # 🚀 核心執行引擎 (Agentic Workflow)
 # ============================================================
-query = st.chat_input("請輸入你想分析的 tFlex 指標 (例:比較各公司的退單率與人數)")
+# 極簡開場 — 不顯示預設範例 / 按鈕,引導資訊在使用者主動問時才出現
+chat_input_value = st.chat_input(
+    "輸入你想分析的問題;若不確定可問「你會做什麼?」「有什麼資料?」「怎麼開始?」"
+)
+# pending_query 機制保留(供未來功能注入查詢使用,例如 follow-up 建議按鈕)
+query = chat_input_value or st.session_state.pending_query
+if st.session_state.pending_query:
+    st.session_state.pending_query = None  # consume
 
 if query:
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.write(query)
 
+    # ============================================================
+    # 🎯 Pre-Phase 0 · Intent Router
+    # 偵測非分析類查詢(intro / data_overview / data_check / guidance / greeting)
+    # 直接回應 meta response,不走 Phase 0/A/B/C/D
+    # ============================================================
+    # 🔧 routing 優先序:explicit intent → follow-up → out_of_scope → analysis
+    intent_result = llm_service.classify_intent_for_query(
+        query, last_analysis=st.session_state.last_analysis
+    )
+    intent = intent_result.get("intent", "analysis")
+
+    if intent != "analysis":
+        with st.chat_message("assistant"):
+            # out_of_scope 與 data_check 都需要 query 內容做 subject 萃取
+            meta_md = llm_service.generate_meta_response(
+                intent,
+                subject=intent_result.get("subject", ""),
+                query=query,
+            )
+            st.markdown(meta_md)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": meta_md,
+                "meta_intent": intent,
+            })
+        st.stop()  # 不進入分析 pipeline
+
+    # ============================================================
+    # 🔗 Pre-Phase 0 · Follow-up flag(由 classifier 提供)
+    # 延續性分析會在 Phase 0 注入前次脈絡
+    # ============================================================
+    is_followup = intent_result.get("is_followup", False)
+    followup_context = st.session_state.last_analysis if is_followup else None
+
     with st.chat_message("assistant"):
+        if is_followup:
+            st.info(
+                "🔗 **偵測為延續性分析** — 將帶入前次的 Q 欄位、圖表類型、計畫摘要等脈絡到 Phase 0。"
+                "若需開新分析,可在左側 sidebar 按「🆕 開始新分析」清除脈絡。"
+            )
         status = st.status("🧠 Agent 思考與執行中...", expanded=True)
         workflow_namespace = {"pd": pd, "np": __import__("numpy")}
         final_fig = None
@@ -353,8 +428,9 @@ if query:
             # ============================================================
             # Phase 0 — 制定分析計畫
             # ============================================================
-            status.update(label="📋 Phase 0:制定分析計畫...")
-            plan_res = llm_service.generate_plan(query)
+            status.update(label="📋 Phase 0:制定分析計畫..." +
+                          (" (含接續脈絡)" if followup_context else ""))
+            plan_res = llm_service.generate_plan(query, followup_context=followup_context)
             if plan_res["status"] == "error":
                 raise Exception(plan_res["message"])
             plan_text = plan_res["message"]
@@ -604,6 +680,27 @@ if query:
                 "table_option": final_option if use_table_fallback else None,
                 "insight": insight_text,
             })
+
+            # 🔗 寫入「上次分析脈絡」供下一輪 follow-up 使用
+            if use_table_fallback:
+                chart_descriptor = f"{chart_engine} table fallback"
+            elif chart_engine == "ECharts" and isinstance(final_option, dict):
+                series_types = [s.get("type", "?") for s in final_option.get("series", [])]
+                chart_descriptor = f"ECharts ({'/'.join(series_types) or 'unknown'})"
+            elif chart_engine == "Plotly":
+                chart_descriptor = "Plotly chart"
+            else:
+                chart_descriptor = chart_engine
+
+            st.session_state.last_analysis = {
+                "query": query,
+                "plan_summary": plan_text[:400],
+                "Q_cols": list(Q.columns) if Q is not None else [],
+                "chart_engine": chart_engine,
+                "chart_descriptor": chart_descriptor,
+                "is_dashboard": dashboard_mode,
+                "was_followup": is_followup,
+            }
 
         except Exception as e:
             status.update(label="❌ 系統執行中斷", state="error", expanded=True)
