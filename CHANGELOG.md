@@ -5,6 +5,57 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.3.1] · 2026-05-14 — Prompt / Metadata admin pages + per-domain baseline
+
+**Patch · v0.3.0 follow-up,補完 admin UI 缺口 + 修 cross-domain baseline 污染。**
+
+### ✨ 新增 admin UI
+
+- **`pages/03_prompts.py`** — Prompt 版本管理
+  - 5 phase prompt × domain_scope 選擇器
+  - 版本歷史 + 一鍵 activate(自動 deactivate 同 key/scope 其他版本)
+  - Jinja2 編輯器 + sample 變數即時預覽(`Render preview` 按鈕)
+  - 儲存為新版本 + auto-activate option
+
+- **`pages/04_metadata.py`** — Metadata 管理
+  - Domain selector + 「➕ 新增 domain」精靈
+  - 4-metric summary(collections / KPIs / limitations / charts)
+  - 6 個 expandable sections(collections / kpi_definitions / data_limitations / charting_guidance / relationships / business_context)
+  - 版本歷史 + activate
+  - 完整 JSON 編輯器(含 validation)
+
+### 🐛 修正 · Per-domain baseline 隔離
+
+**根因**:v0.3.0 的 `get_baseline()` / `get_latest()` / `compare_with_baseline()` 沒有 domain filter,造成 tflex 跟 ecommerce baseline 會交叉污染。
+
+- `TestRunRepository.get_baseline(domain=None)` / `get_latest(domain=None)` 加 domain filter
+- `compare_with_baseline(run_id)` 自動讀 `run.domain` 找對應 baseline
+- `admin/compare_baseline.py` 預設先讀 latest run 推斷 domain → 找該 domain 的 baseline
+- `admin/mark_baseline.py` `--latest` 模式偵測該 domain 已有舊 baseline 時 warn
+- `pages/02_test_runs.py` 用 sidebar 當前 domain filter 撈 baseline
+
+**現在每個 domain 都是獨立的 baseline pipeline**。
+
+### 📚 文件拆分
+
+- **`AI_CONTEXT.md`**(603 行,25KB)— 架構 + API + deployment(主要餵 LLM agent 的文件)
+- **`AI_CODE.md`**(3372 行,148KB,新增)— v0.2.x 完整源碼快照(深入 debug / 移植時用)
+- v0.3.0 新檔(repositories / migrations / admin / pages)的 API 在 AI_CONTEXT.md section 17 完整列出,不重複 embed
+
+### 📦 受影響檔案
+
+新增:
+- `pages/03_prompts.py` / `pages/04_metadata.py`
+- `AI_CODE.md`
+
+修改:
+- `test_run_repository.py` — `get_baseline` / `get_latest` 加 domain filter
+- `admin/compare_baseline.py` / `admin/mark_baseline.py` — per-domain 邏輯
+- `pages/02_test_runs.py` — baseline lookup 用 domain filter
+- `AI_CONTEXT.md` — section 19 加「源碼移到 AI_CODE.md」指引
+
+---
+
 ## [0.3.0] · 2026-05-14 — Repository 層 + DB-backed prompts / metadata / test infra
 
 **Minor release · 內容外部化的關鍵架構升級。所有 prompt / metadata / test case / test run 全部從 hardcoded Python 檔案搬進 MongoDB,且有 Streamlit 管理 UI。**

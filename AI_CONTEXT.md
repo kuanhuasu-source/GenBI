@@ -357,6 +357,7 @@ llm_service = LLMService(**config.llm_service_kwargs(), task_metadata=MY_METADAT
 | `v0.2.3` | 2026-05-13 | Stacked Bar 結構性防禦 — `sanitize_pipeline` / `rescue_empty_echarts` 兩道 utility,Phase A/C 多條 rule (5.5/5.55/5.58/5.65),STK-01~08 測試套件,test_runner `--filter`/`--only` CLI,follow-up setup 支援,denial_markers 擴大 |
 | `v0.2.4` | 2026-05-13 | UI 大翻修 + 圖表渲染品質 — GenBI 品牌建立、slogan、廚師 logo SVG、Current Question 橫條、Phase A/B 收 expander、Phase C inline banner、第三道救援 `ensure_default_styling`(色盤擴充 / heatmap 三雷 / 偏態 log scale)、`rescue_empty_echarts` 雙軸支援、rule 5.7/5.7H/5.8 加入、Stack vs 100% Stack 預設邏輯翻轉 |
 | `v0.3.0` | 2026-05-14 | Repository 層 + DB-backed content — 4 個 Repository class、5 個 prompts / 3 domain metadata / 26 test cases 全進 MongoDB、3 道 migration script(idempotent + byte-equal verify)、Streamlit multi-page admin UI(test_cases + test_runs)、4 個 admin CLI、sidebar domain switcher + confirm dialog、test_runner 寫 test_runs with active_versions snapshot |
+| `v0.3.1` | 2026-05-14 | Admin UI 補完 + per-domain baseline 修 — `pages/03_prompts.py` Jinja2 編輯器、`pages/04_metadata.py` JSON 編輯器、`get_baseline(domain=)` 修 cross-domain 污染、文件拆 AI_CONTEXT.md / AI_CODE.md |
 
 ---
 
