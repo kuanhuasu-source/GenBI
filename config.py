@@ -126,7 +126,25 @@ MONGO_SERVER_SELECTION_TIMEOUT_MS: int = int(
 
 
 # ============================================================
-# 3. 開發 / 路徑相關
+# 3. Prompt / Metadata Repository (v0.3.0+)
+# ============================================================
+# 是否從 MongoDB 讀 prompt / metadata (False = 純走 code-embedded fallback)。
+# 為了 v0.3.0 增量遷移,**目前預設 False**,即使 DB 沒接也能跑;
+# seed migration 跑完 + 驗證 byte-equal 後再切 True。
+PROMPT_REPO_ENABLED: bool = os.getenv("GENBI_PROMPT_REPO", "false").lower() in ("true", "1", "yes")
+
+# Cache TTL — repo 讀取後在記憶體保留多久,避免每次 LLM call 都打 DB
+PROMPT_CACHE_TTL_S: int = int(os.getenv("GENBI_PROMPT_CACHE_TTL_S", "60"))
+
+# 4 個 repository 用的 collection 名(可由 env 覆寫,例如多環境共用同 DB 時加前綴)
+PROMPT_COLLECTION: str = os.getenv("GENBI_PROMPT_COLLECTION", "prompt_templates")
+METADATA_COLLECTION: str = os.getenv("GENBI_METADATA_COLLECTION", "domain_metadata")
+TEST_RUNS_COLLECTION: str = os.getenv("GENBI_TEST_RUNS_COLLECTION", "test_runs")
+AUDIT_LOG_COLLECTION: str = os.getenv("GENBI_AUDIT_LOG_COLLECTION", "audit_log")
+
+
+# ============================================================
+# 4. 開發 / 路徑相關
 # ============================================================
 import pathlib as _pl
 
@@ -135,7 +153,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 
 
 # ============================================================
-# 4. Helpers
+# 5. Helpers
 # ============================================================
 def mask_secret(value: str, keep: int = 4) -> str:
     """敏感字串遮罩 — 用於印出設定不洩漏 api key。"""
@@ -161,6 +179,8 @@ def print_summary() -> None:
     print(f"  MongoDB DB       : {MONGO_DB}")
     print(f"  Mongo app coll   : {MONGO_COLL_APPLICATIONS}")
     print(f"  Mongo hc coll    : {MONGO_COLL_COMPANY_HC}")
+    print(f"  Prompt repo      : {'ON' if PROMPT_REPO_ENABLED else 'OFF (embedded fallback only)'}")
+    print(f"  Prompt cache TTL : {PROMPT_CACHE_TTL_S}s")
     print("─" * 60)
 
 

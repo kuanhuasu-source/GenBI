@@ -893,7 +893,9 @@ class LLMService:
                  model_name: str = "qwen3-coder:30b",
                  timeout_s: float = 180.0,
                  default_temperature: float = 0.0,
-                 task_metadata: dict | None = None):
+                 task_metadata: dict | None = None,
+                 prompt_repo=None,
+                 domain: str = "tflex"):
         """
         參數預設指向 Ollama (localhost:11434);
         若你在用 vLLM,把 api_url 改成 http://localhost:8000/v1/chat/completions、
@@ -904,6 +906,10 @@ class LLMService:
         task_metadata: domain 描述 dict (schema/KPI/限制/recommended_charts)。
                        若 None,自動載入 tflex_task_metadata_agent_v3.TASK_METADATA。
                        換不同 domain 時傳入該 domain 的 metadata 即可,不必改本 module 的程式碼。
+        prompt_repo: 可選的 PromptRepository (v0.3.0+)。
+                     若 None,自動 build 一個(走 config.PROMPT_REPO_ENABLED + embedded fallback)。
+                     傳入 False 強制不使用 repo,完全 inline f-string(用於 v0.2.x 行為對照)。
+        domain: 目前處理的 domain 名稱(影響 prompt 讀取的 domain_scope)。
         """
         self.client = OpenAI(
             base_url=api_url.replace("/chat/completions", ""),
@@ -913,6 +919,7 @@ class LLMService:
         self.model_name = model_name
         self.default_temperature = default_temperature
         self.timeout_s = timeout_s
+        self.domain = domain
 
         # ── 載入並組裝 domain knowledge / few-shot ──
         if task_metadata is None:
@@ -927,6 +934,21 @@ class LLMService:
         # ── Telemetry:每次 LLM call 的耗時與 token 用量 ──
         # 由外部測試框架在 case 開始前呼叫 reset_call_log(),結束時 get_call_summary()
         self.call_log: list[dict] = []
+
+        # ── v0.3.0+ Prompt Repository ──
+        # 若 prompt_repo is False,完全停用 repo(回退 v0.2.x inline 行為)
+        # 若 prompt_repo is None,build default(走 config.PROMPT_REPO_ENABLED + embedded)
+        # 若是 PromptRepository instance,直接用
+        if prompt_repo is False:
+            self.prompt_repo = None
+        elif prompt_repo is None:
+            try:
+                from prompt_repository import build_default_repo
+                self.prompt_repo = build_default_repo(mongo_db=None)
+            except Exception:
+                self.prompt_repo = None
+        else:
+            self.prompt_repo = prompt_repo
 
     def classify_intent_for_query(
         self, query: str, last_analysis: dict | None = None
@@ -1056,7 +1078,53 @@ class LLMService:
     # Phase 0: 計畫
     # --------------------------------------------------------
     def generate_plan(self, query, followup_context: dict | None = None):
-        system_prompt = f"""你是專業的 AI 商業智慧助理。請以上方 Domain Knowledge 為唯一依據規劃分析。
+        # v0.3.0+: 嘗試從 repo 讀模板;失敗則 fallback 到下方 inline f-string
+        # 這個雙軌 design 確保:
+        # - DB enabled 時用 DB 版本(可線上編輯)
+        # - DB disabled / 連不上 / 內容缺 時自動 fallback 到 inline
+        # - 兩條路徑 byte-equal 才算正確(D3 驗證重點)
+        system_prompt = self._render_phase_0_plan_prompt()
+        # 接續分析時注入前次脈絡
+        followup_preamble = build_followup_preamble(followup_context) if followup_context else ""
+        user_msg = followup_preamble + f"需求:{query}\n請給出計畫:"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        try:
+            return {"status": "success", "message": self._call_llm(messages, temperature=0.2, phase="plan")}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def _render_phase_0_plan_prompt(self) -> str:
+        """
+        產生 Phase 0 plan system prompt。
+
+        優先序:
+        1. PromptRepository.render() — 若 repo 可用且 enabled
+        2. Inline f-string fallback — v0.2.x 行為
+
+        驗證點(D3 byte-equal):
+            assert llm._render_phase_0_plan_prompt(via_repo=True) == _inline_version
+        """
+        if self.prompt_repo is not None:
+            try:
+                return self.prompt_repo.render(
+                    "phase_0_plan",
+                    domain=self.domain,
+                    domain_knowledge=self.domain_knowledge,
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Phase 0 prompt repo render 失敗,fallback to inline: {e}"
+                )
+        # Inline fallback(跟 v0.2.x 完全一致)
+        return self._inline_phase_0_plan_prompt()
+
+    def _inline_phase_0_plan_prompt(self) -> str:
+        """v0.2.x 行為的 inline f-string 副本 — repo 失敗時的最終救援。"""
+        return f"""你是專業的 AI 商業智慧助理。請以上方 Domain Knowledge 為唯一依據規劃分析。
 
 {self.domain_knowledge}
 
@@ -1123,17 +1191,6 @@ class LLMService:
 **B. 資料處理:** 要算哪些 KPI (引用上方 kpi_definitions 公式) 與 pandas 邏輯重點。
 **C. 視覺化建議:** 圖型選擇與理由。多類別比較禁止 pie chart;若是「dashboard / 執行摘要」場景,建議走表格 + KPI 卡片。
 """
-        # 接續分析時注入前次脈絡
-        followup_preamble = build_followup_preamble(followup_context) if followup_context else ""
-        user_msg = followup_preamble + f"需求:{query}\n請給出計畫:"
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
-        try:
-            return {"status": "success", "message": self._call_llm(messages, temperature=0.2, phase="plan")}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
 
     # --------------------------------------------------------
     # Phase A: MongoDB pipeline
