@@ -276,7 +276,7 @@ class PromptRepository:
             "domain_scope": domain,
             "template": template,
             "is_active": False,  # 預設不啟用,要明確 activate
-            "created_at": _dt.datetime.utcnow(),
+            "created_at": _dt.datetime.now(_dt.timezone.utc),
             "created_by": created_by,
             "notes": notes,
         }
@@ -432,7 +432,7 @@ class PromptRepository:
             "domain": domain,
             "version": next_version,
             "is_active": False,
-            "created_at": _dt.datetime.utcnow(),
+            "created_at": _dt.datetime.now(_dt.timezone.utc),
             "created_by": created_by,
             "notes": notes,
             **metadata,  # schema / kpi_definitions / ... 直接展開

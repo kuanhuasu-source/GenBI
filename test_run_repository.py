@@ -63,6 +63,11 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _utcnow() -> _dt.datetime:
+    """Timezone-aware UTC now(避免 utcnow deprecation warning,Python 3.12+ 友好)。"""
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
 class TestRunRepository:
     """test_runs collection 的存取層。"""
 
@@ -106,15 +111,15 @@ class TestRunRepository:
             insert_one result.inserted_id (ObjectId)
         """
         doc = dict(run_data)  # shallow copy 避免動到 caller
-        doc.setdefault("started_at", _dt.datetime.utcnow())
-        doc.setdefault("completed_at", _dt.datetime.utcnow())
+        doc.setdefault("started_at", _utcnow())
+        doc.setdefault("completed_at", _utcnow())
         doc.setdefault("is_baseline", False)
         doc.setdefault("baseline_notes", "")
 
         # run_id — 人讀 timestamp
         if "run_id" not in doc:
             ts = doc["started_at"] if isinstance(doc["started_at"], _dt.datetime) \
-                else _dt.datetime.utcnow()
+                else _utcnow()
             doc["run_id"] = ts.strftime("%Y%m%d_%H%M%S")
 
         # active_versions 快照

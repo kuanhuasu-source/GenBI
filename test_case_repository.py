@@ -231,7 +231,7 @@ class TestCaseRepository:
         if self._db is None:
             raise RuntimeError("Cannot upsert: mongo_db not provided.")
         coll = self._db[self._coll_name]
-        now = _dt.datetime.utcnow()
+        now = _dt.datetime.now(_dt.timezone.utc)
 
         # 不允許 caller 蓋掉 system 欄位
         for key in ("_id", "domain", "case_id", "created_at", "created_by"):
@@ -268,7 +268,7 @@ class TestCaseRepository:
             {"domain": domain, "case_id": case_id},
             {"$set": {
                 "is_active": False,
-                "updated_at": _dt.datetime.utcnow(),
+                "updated_at": _dt.datetime.now(_dt.timezone.utc),
                 "updated_by": user,
             }},
         )
@@ -284,7 +284,7 @@ class TestCaseRepository:
             {"domain": domain, "case_id": case_id},
             {"$set": {
                 "is_active": True,
-                "updated_at": _dt.datetime.utcnow(),
+                "updated_at": _dt.datetime.now(_dt.timezone.utc),
                 "updated_by": user,
             }},
         )

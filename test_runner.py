@@ -1353,15 +1353,15 @@ def main() -> int:
 
             inserted_id = run_repo.save_run({
                 "domain": args.domain,
-                "started_at": _dt.datetime.utcfromtimestamp(total_start),
-                "completed_at": _dt.datetime.utcnow(),
+                "started_at": _dt.datetime.fromtimestamp(total_start, _dt.timezone.utc),
+                "completed_at": _dt.datetime.now(_dt.timezone.utc),
                 "total_wall_s": round(total_elapsed, 2),
                 "filter": args.filter or args.only or None,
                 "summary": summary,
                 "case_results": results,
                 "is_baseline": bool(args.baseline),
                 "baseline_notes": (
-                    f"Auto-marked baseline at {_dt.datetime.utcnow().isoformat()}"
+                    f"Auto-marked baseline at {_dt.datetime.now(_dt.timezone.utc).isoformat()}"
                     if args.baseline else ""
                 ),
             }, active_versions=active_versions or None)
