@@ -5,6 +5,106 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.3.3] · 2026-05-14 — CLI display fix + docs refresh
+
+**Patch · 修正 admin CLI 顯示讓 baseline 對比直觀。**
+
+### 🐛 修正
+
+- **`admin/list_test_runs.py` `pass/total` 改 `OK/total`**(含 `passed + refusal_detected`)
+  - 原本 CLI 只顯示嚴格 `passed`,易讓人誤以為退步(20 看起來比 22 差)
+  - 對齊 `test_runner.py main()` 的 `pass_count` 計算方式
+  - 新增獨立 `refusal` 欄位顯示拒絕計數
+  - `failed` 欄位也含 `phaseA_error`(更全面)
+
+### 📚 文件
+
+- **`README.md` 全面更新到 v0.3.x**:加 Repository / admin UI / migration / sidebar domain switcher / 新 fallback 機制等
+- **`CHANGELOG.md` 補上 v0.3.2 / v0.3.3 entry**
+- `AI_CONTEXT.md` 版本表加 v0.3.2 / v0.3.3 行
+
+---
+
+## [0.3.2] · 2026-05-14 — Critical .env loading fix + embedded cleanup + datetime deprecation
+
+**Patch · 三個關鍵 hotfix。**
+
+### 🚨 Critical fix · `.env` 從來沒被讀進來!
+
+**Root cause**:整個 codebase 都沒呼叫 `load_dotenv()`,`.env` 一直被當裝飾品。系統能跑只是因為 shell 剛好 export 過環境變數。
+
+**症狀**:某次重啟 terminal / 換 shell,`.env` 設定全部失效,LLM endpoint 連到錯地方(例如顯示「Powered by gpt-4o-mini」但實際 endpoint 是 ollama URL)。
+
+**修正**:
+- `config.py` 開頭加 `load_dotenv(override=False)`(shell 已 export 的 env 優先,`.env` 是備援)
+- `requirements.txt` 加 `python-dotenv>=1.0.0`
+
+### 🧹 Embedded metadata 預設只 tflex
+
+**Root cause**:`embedded_metadata.py` 自動 import `_test_ecommerce_metadata` / `_test_healthcare_metadata`(v0.2.x 跨 domain 測試 fixture),merge 進 `EMBEDDED_PROMPTS`,造成 UI sidebar 出現 3 個 domain。
+
+**修正**:
+- `embedded_metadata.py` 預設只 import `tflex`
+- 新增 `load_test_fixture_metadata()` 函式 — 可選載入(給 `test_generality.py` 用)
+- `migrations/002_seed_metadata.py` 加 `--include-test-fixtures` flag(預設不帶)
+- `app.py` / `pages/01_test_cases.py` / `pages/04_metadata.py` 的 domain selector 預設**永遠優先 tflex**
+
+### ⏰ Per-domain baseline isolation(從 v0.3.1 D8i 帶進來)
+
+**Root cause**:`TestRunRepository.get_baseline()` 沒 domain filter,跨 domain compare 會交叉污染。
+
+**修正**:
+- `get_baseline(domain=None)` / `get_latest(domain=None)` 接受 domain filter
+- `compare_with_baseline(run_id)` 自動讀 `run.domain` 找對應 baseline
+- `admin/compare_baseline.py` / `mark_baseline.py` 跟著 domain-aware
+- `pages/02_test_runs.py` 用 sidebar 當前 domain filter 撈 baseline
+
+### 📝 Prompts / Metadata admin pages(從 v0.3.1 D8g/D8h 帶進來)
+
+- **`pages/03_prompts.py`** · Prompt 版本管理
+  - 5 phase × domain_scope 選擇器
+  - 版本歷史 + activate 按鈕
+  - Jinja2 編輯器 + sample 變數即時 render preview
+  - 儲存為新版本 + auto-activate option
+- **`pages/04_metadata.py`** · Metadata 版本管理
+  - Domain selector + 「➕ 新增 domain」精靈
+  - 4-metric summary(collections / KPIs / limitations / charts)
+  - 6 個 expandable sections + JSON 編輯器
+  - 版本歷史 + activate
+
+### 📅 datetime UTC deprecation 修正
+
+Python 3.12+ 開始警告 `datetime.utcnow()` / `datetime.utcfromtimestamp()` 即將移除。全 codebase 4 個檔案改用 `datetime.now(timezone.utc)`:
+- `test_run_repository.py`
+- `test_case_repository.py`
+- `prompt_repository.py`
+- `test_runner.py`
+
+### 📚 文件拆分
+
+- **`AI_CONTEXT.md`**(603 行,25KB)— 架構 + API + deployment(主要餵 LLM agent 的文件)
+- **`AI_CODE.md`**(3372 行,148KB,新增)— v0.2.x 完整源碼快照
+- v0.3.x 新檔(repositories / migrations / admin / pages)的 API 在 AI_CONTEXT.md section 17 完整列出,不重複 embed
+
+### 📦 受影響檔案
+
+新增:
+- `AI_CODE.md`
+- `pages/03_prompts.py` / `pages/04_metadata.py`
+
+修改:
+- `config.py` — load_dotenv 修正
+- `requirements.txt` — python-dotenv 依賴
+- `embedded_metadata.py` — 預設只 tflex + `load_test_fixture_metadata()` helper
+- `migrations/002_seed_metadata.py` — `--include-test-fixtures` flag
+- `test_run_repository.py` — `get_baseline(domain)` / `get_latest(domain)` 加 filter
+- `admin/compare_baseline.py` / `mark_baseline.py` — domain-aware
+- `app.py` / `pages/01_test_cases.py` / `pages/04_metadata.py` — sidebar tflex 優先
+- `test_runner.py` / `test_case_repository.py` / `prompt_repository.py` — datetime 修正
+- `AI_CONTEXT.md` — section 19 加「源碼移到 AI_CODE.md」指引
+
+---
+
 ## [0.3.1] · 2026-05-14 — Prompt / Metadata admin pages + per-domain baseline
 
 **Patch · v0.3.0 follow-up,補完 admin UI 缺口 + 修 cross-domain baseline 污染。**

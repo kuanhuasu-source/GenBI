@@ -81,17 +81,20 @@ def main():
         print("  (no runs found)\n")
         return 0
 
+    # pass 欄含 refusal_detected(預期成功路徑) — 跟 test_runner 的 pass_count 邏輯一致
     print(f"  {'run_id':19s} {'domain':10s} {'commit':9s} "
-          f"{'pass/total':>12s} {'failed':>7s} {'wall':>7s} "
-          f"{'tokens':>10s}  baseline")
-    print(f"  {'-' * 19} {'-' * 10} {'-' * 9} {'-' * 12} "
-          f"{'-' * 7} {'-' * 7} {'-' * 10}  {'-' * 10}")
+          f"{'OK/total':>10s}{'refusal':>8s}{'failed':>7s} "
+          f"{'wall':>7s} {'tokens':>10s}  baseline")
+    print(f"  {'-' * 19} {'-' * 10} {'-' * 9} {'-' * 10}"
+          f"{'-' * 8}{'-' * 7} {'-' * 7} {'-' * 10}  {'-' * 10}")
 
     for r in runs:
         s = r.get("summary", {})
         passed = s.get("passed", 0)
+        refusal = s.get("refusal_detected", 0)
+        ok = passed + refusal  # 預期成功(pass + 正確拒絕)
         total = s.get("total_cases", 0)
-        failed = s.get("failed", 0) + s.get("fatal_error", 0)
+        failed = s.get("failed", 0) + s.get("fatal_error", 0) + s.get("phaseA_error", 0)
         tokens = s.get("total_tokens", 0)
         wall = r.get("total_wall_s", 0)
         is_baseline = "🏁 baseline" if r.get("is_baseline") else ""
@@ -100,7 +103,8 @@ def main():
             f"  {r.get('run_id', '?'):19s} "
             f"{r.get('domain', '?')[:10]:10s} "
             f"{(r.get('git_commit') or '?')[:9]:9s} "
-            f"{passed:>5d}/{total:<6d} "
+            f"{ok:>4d}/{total:<5d}"
+            f"{refusal:>8d}"
             f"{failed:>7d} "
             f"{wall:>6.0f}s "
             f"{tokens:>10,d}  {is_baseline}"
