@@ -26,7 +26,7 @@ from typing import Any
 import pandas as pd
 from pymongo import MongoClient
 
-from llm_service import LLMService, is_dashboard_query, sanitize_pipeline, rescue_empty_echarts
+from llm_service import LLMService, is_dashboard_query, sanitize_pipeline, rescue_empty_echarts, ensure_default_styling
 
 
 # ============================================================
@@ -741,6 +741,10 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                 if rescued:
                     print(f"   🛟 rescue_empty_echarts 啟動,從 Q pivot 補回 series")
                     c_retry_log.append(f"attempt {c_attempt + 1}: rescued from empty option")
+                # 預設樣式安全網:多 series 無 legend → 自動補
+                option, styled = ensure_default_styling(option, case["query"])
+                if styled:
+                    print(f"   🎨 ensure_default_styling 啟動,補上預設 legend")
             plot_err = None
             print(f"   attempt {c_attempt + 1} ({c_elapsed:.1f}s) ✅ exec OK")
             break

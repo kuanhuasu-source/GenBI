@@ -135,6 +135,7 @@ def is_out_of_scope(query, vocab) -> bool            # 離題偵測
 # 結構性防禦 (v0.2.3+ · test_runner / app.py 共用)
 def sanitize_pipeline(pipeline) -> list              # strip 鍵空白 + 補回漏掉的 $
 def rescue_empty_echarts(option, Q) -> tuple        # 偵測空殼 option,自動 pivot 補回 series
+def ensure_default_styling(option, query) -> tuple  # v0.2.4:色盤擴充 / heatmap numpy cast / 長尾 log
 ```
 
 ### `app.py` 結構性 helpers
@@ -354,6 +355,7 @@ llm_service = LLMService(**config.llm_service_kwargs(), task_metadata=MY_METADAT
 | `v0.2.1` | 2026-05-12 | Docs — AI_CONTEXT.md 單檔自足專案濃縮文件 (此檔) |
 | `v0.2.2` | 2026-05-12 | Fix — Phase C ECharts prompt long-format 對齊 (rule 5.55) |
 | `v0.2.3` | 2026-05-13 | Stacked Bar 結構性防禦 — `sanitize_pipeline` / `rescue_empty_echarts` 兩道 utility,Phase A/C 多條 rule (5.5/5.55/5.58/5.65),STK-01~08 測試套件,test_runner `--filter`/`--only` CLI,follow-up setup 支援,denial_markers 擴大 |
+| `v0.2.4` | 2026-05-13 | UI 大翻修 + 圖表渲染品質 — GenBI 品牌建立、slogan、廚師 logo SVG、Current Question 橫條、Phase A/B 收 expander、Phase C inline banner、第三道救援 `ensure_default_styling`(色盤擴充 / heatmap 三雷 / 偏態 log scale)、`rescue_empty_echarts` 雙軸支援、rule 5.7/5.7H/5.8 加入、Stack vs 100% Stack 預設邏輯翻轉 |
 
 ---
 

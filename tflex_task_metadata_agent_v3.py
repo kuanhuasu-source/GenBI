@@ -168,7 +168,7 @@ TASK_METADATA = {
         },
         "total_applications": {
             "name": "總申請張數",
-            "formula": "count of documents in tflex_applications"
+            "formula": "count of documents in tflex_applications(completed_count+in_progress_count)"
         },
         "pay_count": {
             "name": "PAY",
@@ -192,7 +192,7 @@ TASK_METADATA = {
         },
         "average_return_rate": {
             "name": "平均退單率",
-            "formula": "return_count / completed_count",
+            "formula": "return_count / total_applications",
             "important_note": "Do not include in-progress applications in the denominator."
         },
         "completion_rate": {

@@ -26,6 +26,7 @@ from llm_service import (
     is_followup_query,
     sanitize_pipeline,
     rescue_empty_echarts,
+    ensure_default_styling,
 )
 import config
 
@@ -245,9 +246,31 @@ def render_pretty_table(Q: pd.DataFrame, option: dict | None = None, key_prefix:
 # ============================================================
 # 🚀 系統初始化
 # ============================================================
-st.set_page_config(page_title="tFlex GenBI", page_icon="📊", layout="wide")
-st.title("📊 tFlex 員工福利申請 GenBI 系統")
-st.markdown(f"**Powered by `{LLM_MODEL}` via OpenAI-compatible endpoint**")
+_LOGO_PATH = Path(__file__).parent / "assets" / "genbi_logo.svg"
+_LOGO_EXISTS = _LOGO_PATH.exists()
+
+st.set_page_config(
+    page_title="GenBI",
+    page_icon=str(_LOGO_PATH) if _LOGO_EXISTS else "👨‍🍳",
+    layout="wide",
+)
+
+# 標題 + logo 並排呈現
+_title_col1, _title_col2 = st.columns([1, 6])
+with _title_col1:
+    if _LOGO_EXISTS:
+        st.image(str(_LOGO_PATH), width=110)
+    else:
+        st.markdown("<div style='font-size:96px;line-height:1'>👨‍🍳</div>",
+                    unsafe_allow_html=True)
+with _title_col2:
+    st.markdown(
+        "<h1 style='font-size:2.6rem;margin:0 0 .2rem 0;line-height:1.1'>"
+        "GenBI · From question to chart in seconds"
+        "</h1>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Powered by `{LLM_MODEL}` via OpenAI-compatible endpoint")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -416,12 +439,36 @@ if query:
     followup_context = st.session_state.last_analysis if is_followup else None
 
     with st.chat_message("assistant"):
+        # 📌 Current Question 醒目橫條 — 釘在 assistant response 頂端,
+        #    避免長 workflow 跑下來,使用者捲動時看不到當下分析的是什麼
+        _followup_tag = (
+            "<span style='background:#D9342B;color:#FFFFFF;font-size:0.7rem;"
+            "padding:2px 8px;border-radius:10px;margin-left:8px;font-weight:500'>"
+            "🔗 接續分析"
+            "</span>"
+            if is_followup else ""
+        )
+        st.markdown(
+            f"""<div style='background:#FFF7E8;border-left:4px solid #D9342B;
+                           padding:12px 18px;border-radius:6px;margin-bottom:14px;'>
+                  <div style='font-size:0.78rem;color:#8B6F4A;font-weight:600;
+                              letter-spacing:0.5px;text-transform:uppercase;'>
+                    🍳 Current question{_followup_tag}
+                  </div>
+                  <div style='font-size:1.08rem;color:#2A1810;margin-top:4px;
+                              line-height:1.5;'>{query}</div>
+                </div>""",
+            unsafe_allow_html=True,
+        )
         if is_followup:
-            st.info(
-                "🔗 **偵測為延續性分析** — 將帶入前次的 Q 欄位、圖表類型、計畫摘要等脈絡到 Phase 0。"
-                "若需開新分析,可在左側 sidebar 按「🆕 開始新分析」清除脈絡。"
+            st.caption(
+                "🔗 偵測為延續性分析 — 已帶入前次 Q 欄位、圖表類型、計畫摘要等脈絡到 Phase 0。"
+                "若要開新分析,請按左側 sidebar 的「🆕 開始新分析」。"
             )
-        status = st.status("🧠 Agent 思考與執行中...", expanded=True)
+        status = st.status(
+            f"🧠 處理中:{query[:60] + ('…' if len(query) > 60 else '')}",
+            expanded=True,
+        )
         workflow_namespace = {"pd": pd, "np": __import__("numpy")}
         final_fig = None
         insight_text = None
@@ -506,7 +553,8 @@ if query:
                 f"📥 **Phase A 完成** · 來源:{source_label} · "
                 f"撈出 {len(raw_df):,} 筆明細 · 欄位:{list(raw_df.columns)}"
             )
-            st.dataframe(raw_df.head(100), use_container_width=True)
+            with st.expander(f"📄 檢視原始資料前 100 筆 ({len(raw_df):,} 筆中)", expanded=False):
+                st.dataframe(raw_df.head(100), use_container_width=True)
 
             # ============================================================
             # Phase B — Pandas 處理 (帶錯誤回饋自我修正)
@@ -566,7 +614,8 @@ if query:
                 raise ValueError("Phase B 處理後 Q 為空,請檢查篩選條件。")
 
             st.markdown(f"⚙️ **Phase B 完成** · KPI 已計算 (共 {len(Q):,} 筆)")
-            st.dataframe(Q.head(100), use_container_width=True)
+            with st.expander(f"📊 檢視處理後資料前 100 筆 (共 {len(Q):,} 筆)", expanded=False):
+                st.dataframe(Q.head(100), use_container_width=True)
 
             # ============================================================
             # Phase C — 視覺化 (引擎依 sidebar 切換 / 帶錯誤回饋自我修正)
@@ -606,6 +655,10 @@ if query:
                         final_option, _rescued = rescue_empty_echarts(final_option, Q)
                         if _rescued:
                             st.toast("🛟 偵測到 Phase C 產出空殼,已自動 pivot 補回 series", icon="🔧")
+                        # 預設樣式補強:多 series 無 legend 時自動補上
+                        final_option, _styled = ensure_default_styling(final_option, query)
+                        if _styled:
+                            st.toast("🎨 自動補上預設 legend(若想關閉,query 加「精簡」即可)", icon="🎨")
                         # 表格 fallback 旗標
                         use_table_fallback = bool(final_option.get("_use_table"))
                         # 基本健全性:非表格情境必須有 series
@@ -641,6 +694,11 @@ if query:
                         final_fig = None
 
             status.update(label="🖼️ Phase C 完成,繪圖呈現中...")
+            _phase_c_note = (
+                "降級為表格" if use_table_fallback
+                else f"引擎:{chart_engine}"
+            )
+            st.markdown(f"🖼️ **Phase C 完成** · {_phase_c_note}")
             if chart_engine == "ECharts":
                 if use_table_fallback:
                     st.info("📋 LLM 判斷此查詢更適合用表格呈現,套用精美 KPI 表格樣式。")

@@ -5,6 +5,54 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.2.4] · 2026-05-13 — UI 大翻修 + 圖表呈現品質
+
+**Minor patch · 品牌 / UX 全面升級 + 多個圖表渲染防禦補強。**
+
+### 🎨 品牌 / UX
+
+- **GenBI 品牌建立** — 標題改 `GenBI`,加 slogan `From question to chart in seconds`
+- **廚師 logo v5** — `assets/genbi_logo.svg`(SVG 矢量),圓胖大臉 + 淺膚色 + 翹鬍子拿掉 + 紅領巾 + 暗紅圓背景 + 鍋拿食材跳起
+- **字 + 圖同步放大** — 標題 2.6rem(+30%),logo 110px(+53%),column ratio `[1, 6]` 給 logo 更多空間
+- **Current Question 醒目橫條** — 米黃底 + 紅左邊框釘在 assistant response 頂端,workflow 跑長也看得到使用者問什麼;follow-up 自動帶紅色 pill 標示
+
+### 📦 過程資訊整理
+
+- **Phase A / Phase B 中介資料表收進 expander** — `raw_df.head(100)` 與 `Q.head(100)` 預設 collapsed,不再 dominate 視野
+- **Phase C 完成 inline banner** — 補齊 Phase A/B/C 視覺對稱,顯示「引擎:ECharts」或「降級為表格」
+- **Status label 帶 query 摘要** — `🧠 處理中:{query[:60]}…`,即使 status 收起來也看得到
+
+### 🛡️ 圖表渲染防禦(`llm_service.py` 為單一來源)
+
+- **`ensure_default_styling(option, query)`** — 第三道結構性救援:
+  - **色盤循環防禦**:預設 20 色 + HSL 黃金比例自動擴充,15+ series 也不撞色(解 TST/TDC 都紅色 bug)
+  - **Heatmap 三雷防禦**:numpy 型別 cast 成 float、`tooltip.trigger="cell"` 改 `"item"`、`visualMap.inRange.color` 缺則補預設藍漸層
+  - **長尾偏態 auto log scale**:bar/line series `max/min > 100` 自動切 `yAxis.type="log"`,小公司不再被壓扁(解 TST 80K vs TSK 2 場景)
+  - **率類欄位保護**:`name` 含「率 / rate / ratio / 百分比 / percent」即使值域偏也不切 log
+- **`rescue_empty_echarts` 雙軸支援** — `yAxis=list` 或 `xAxis=list` 自動跳過,不再炸 AttributeError
+
+### ✨ Prompt 強化(Phase C)
+
+- **Rule 5.7 預設樣式鐵律** — label + legend 自動帶上(bar/line/scatter/pie/heatmap 各有 position 規範),含智慧抑制(>15 條 bar 自動關 label)
+- **Rule 5.7H Heatmap 完整配方** — 3 個雷 + 正解配方並列,解 numpy 序列化失敗、tooltip 失效、cell 顏色不顯
+- **Rule 5.8 偏態分佈 auto log scale** — 觸發條件 + 解法優先序(log → horizontal sorted → split view)
+- **Rule 6 色盤 20 色擴充** — Few-shot 同步更新
+
+### 🔄 Stack vs 100% Stack 預設邏輯翻轉(關鍵 UX)
+
+- **預設「stacked bar」走 raw count**,只有明示「100%」「百分比+堆疊」「比例+堆疊」「占比分佈」「percentage stack」才 100% normalize
+- 「占比 / 組成 / 結構 / 分佈」單獨出現 → raw count(避免誤判)
+- Rule 9.5(Phase B)+ Rule 5.6(Phase C)同步更新,含判斷練習對照表
+
+### 📚 受影響檔案
+
+- `llm_service.py` — 加 `ensure_default_styling` / `DEFAULT_COLOR_PALETTE` / `_extend_palette`;rule 5.7/5.7H/5.8 + rule 9.5/5.6 翻轉
+- `app.py` — 品牌標題 + slogan + logo 並排佈局、Current Question 橫條、Phase A/B expander、Phase C banner
+- `assets/genbi_logo.svg`(新增) — 廚師 logo 矢量檔
+- `test_runner.py` — 沿用三道救援 utility
+
+---
+
 ## [0.2.3] · 2026-05-13 — Stacked Bar 結構性防禦 + 測試強化
 
 **Patch release · 收斂 stacked bar 失敗模式 + 兩道結構性防禦 + STK 測試套件。**
