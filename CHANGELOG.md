@@ -5,6 +5,129 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.3.0] · 2026-05-14 — Repository 層 + DB-backed prompts / metadata / test infra
+
+**Minor release · 內容外部化的關鍵架構升級。所有 prompt / metadata / test case / test run 全部從 hardcoded Python 檔案搬進 MongoDB,且有 Streamlit 管理 UI。**
+
+### 🏗️ 架構大方向
+
+從 v0.3.0 起,LLM agent 的核心內容(prompts、domain metadata、test cases)不再寫死在程式碼:
+
+```
+v0.2.x:                              v0.3.0:
+  ┌─────────────────┐                 ┌─────────────────┐
+  │ llm_service.py  │                 │ llm_service.py  │ ← code logic only
+  │  + 5 inline     │                 └────────┬────────┘
+  │    f-strings    │                          │
+  │  + TASK_METADATA│                          ↓
+  └─────────────────┘                 ┌─────────────────┐
+                                      │  Repository 層  │
+                                      │  - prompt       │
+                                      │  - metadata     │
+                                      │  - test_cases   │
+                                      │  - test_runs    │
+                                      └────────┬────────┘
+                                               │
+                                MongoDB (live) ┼─→ embedded fallback (緊急救援)
+```
+
+改 prompt 不用 redeploy、新增 domain 不用改 code、test cases 線上可編輯。
+
+### ✨ 新增
+
+- **4 個 Repository class**(`prompt_repository.py` / `test_case_repository.py` / `test_run_repository.py`):
+  - `PromptRepository.get_template(key, domain) / .render(key, domain, **vars)` — Jinja2 template
+  - `PromptRepository.get_metadata(domain) / .save_new_metadata_version() / .list_active_domains()`
+  - `TestCaseRepository.get_cases(domain, filter_prefix, case_ids) / .upsert_case() / .activate / .deactivate / .delete`
+  - `TestRunRepository.save_run() / .list_recent() / .mark_as_baseline() / .compare()`
+  - 三層 fallback:DB → 60s in-memory cache → embedded 副本(緊急救援)
+- **Embedded fallback 副本**(完整,保證 DB 沒接時系統不掛):
+  - `embedded_prompts.py` — 5 個 phase 的 Jinja2 模板(~30K chars)
+  - `embedded_metadata.py` — 3 個 domain metadata(tflex/ecommerce/healthcare)
+  - `embedded_test_cases.py` — 26 個 tflex test cases
+- **3 個 Migration scripts**(idempotent + byte-level verify):
+  - `migrations/001_seed_prompts.py` — 推 5 個 prompts 進 DB
+  - `migrations/002_seed_metadata.py` — 推 3 個 domain metadata
+  - `migrations/003_seed_test_cases.py` — 推 26 個 tflex cases
+- **2 個 Streamlit admin page**(multi-page app):
+  - `pages/01_test_cases.py` — Test case CRUD UI(add / edit / activate / deactivate / delete + ECharts checks)
+  - `pages/02_test_runs.py` — Run history viewer + baseline mark + side-by-side compare
+- **4 個 Admin CLI 工具**:
+  - `admin/list_prompts.py` — 列當前 active prompt versions
+  - `admin/list_test_runs.py` — 列最近 N 筆 runs(table or JSON)
+  - `admin/mark_baseline.py` — 標 / 取消 baseline(含 `--latest` 快捷)
+  - `admin/compare_baseline.py` — 兩筆 run 差異對比(預設 latest vs baseline)
+
+### 🌐 Domain Switching
+
+- **Sidebar `🌐 Active Domain` selector** — 列 active domains,切換時顯示 confirm dialog(清空對話脈絡 + 重建 LLMService)
+- **Current Question 橫條加 domain badge**(暗紅 pill)
+- **`--domain` flag in test_runner** — 跑指定 domain 的 cases
+- **Prompts 全部 domain-agnostic (`domain_scope="*"`)** — 加新 domain = 只寫 metadata,不改 prompt
+
+### 🔄 LLMService 改造
+
+- Constructor 新增 `prompt_repo` + `domain` 參數
+- 5 個 `_render_phase_X_prompt()` 方法走 repo,失敗 fallback inline
+- 5/5 byte-equal 通過驗證(repo render == inline f-string)
+- `PROMPT_REPO_ENABLED=false`(預設)時行為 100% 跟 v0.2.4 一致 — **零 breaking change**
+
+### 📊 Performance Tracking
+
+- 每次 `test_runner.py` 跑完寫入 `test_runs` collection,含:
+  - `active_versions` 快照(prompts + metadata 的 ObjectId)
+  - `git_commit` short SHA
+  - `summary`:pass / fail / refusal / wall time / tokens
+  - 完整 `case_results`
+- `--baseline` flag 自動標 baseline,後續 runs 用 `compare_baseline.py` 對比
+
+### 📦 Dependencies
+
+- 新增 `jinja2>=3.1.0`(template engine)
+
+### 🛡️ 已知 silent bug 保留(將於 v0.3.1 修正)
+
+- **Phase C `{{ECHARTS_FEW_SHOT}}` 從沒被注入過** — 原 f-string `{{...}}` 解析為 `{...}` 後,`.replace("{{...}}", ...)` 雙括號比對 mismatch。v0.3.0 byte-equal 規範下保留,v0.3.1 用 Jinja2 變數正解。
+
+### ⚙️ 部署 / 啟用流程
+
+```bash
+# 1) 安裝 dependency
+pip install jinja2
+
+# 2) 三道 migration(順序重要)
+python migrations/001_seed_prompts.py
+python migrations/002_seed_metadata.py
+python migrations/003_seed_test_cases.py
+
+# 3) 啟用 repo 模式
+export GENBI_PROMPT_REPO=true
+
+# 4) 跑 baseline run
+python test_runner.py --baseline
+
+# 5) 啟動 Streamlit(主頁 + 兩個 admin pages)
+streamlit run app.py
+```
+
+### 📚 受影響檔案
+
+新增:
+- `prompt_repository.py` / `test_case_repository.py` / `test_run_repository.py`
+- `embedded_prompts.py` / `embedded_metadata.py` / `embedded_test_cases.py`
+- `migrations/__init__.py` + 3 個 seed scripts
+- `pages/01_test_cases.py` / `pages/02_test_runs.py`
+- `admin/__init__.py` + 4 個 CLI tools
+
+修改:
+- `config.py` — 5 個 collection name env override + `PROMPT_REPO_ENABLED` flag
+- `requirements.txt` — 加 jinja2
+- `llm_service.py` — 5 個 phase prompt 改用 repo,prompt_repo + domain 構造參數
+- `app.py` — sidebar domain switcher + confirm dialog + Current Question domain badge
+- `test_runner.py` — `--domain` / `--baseline` / `--no-save-run` flags + 寫 test_runs collection
+
+---
+
 ## [0.2.4] · 2026-05-13 — UI 大翻修 + 圖表呈現品質
 
 **Minor patch · 品牌 / UX 全面升級 + 多個圖表渲染防禦補強。**

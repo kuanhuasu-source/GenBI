@@ -356,6 +356,7 @@ llm_service = LLMService(**config.llm_service_kwargs(), task_metadata=MY_METADAT
 | `v0.2.2` | 2026-05-12 | Fix — Phase C ECharts prompt long-format 對齊 (rule 5.55) |
 | `v0.2.3` | 2026-05-13 | Stacked Bar 結構性防禦 — `sanitize_pipeline` / `rescue_empty_echarts` 兩道 utility,Phase A/C 多條 rule (5.5/5.55/5.58/5.65),STK-01~08 測試套件,test_runner `--filter`/`--only` CLI,follow-up setup 支援,denial_markers 擴大 |
 | `v0.2.4` | 2026-05-13 | UI 大翻修 + 圖表渲染品質 — GenBI 品牌建立、slogan、廚師 logo SVG、Current Question 橫條、Phase A/B 收 expander、Phase C inline banner、第三道救援 `ensure_default_styling`(色盤擴充 / heatmap 三雷 / 偏態 log scale)、`rescue_empty_echarts` 雙軸支援、rule 5.7/5.7H/5.8 加入、Stack vs 100% Stack 預設邏輯翻轉 |
+| `v0.3.0` | 2026-05-14 | Repository 層 + DB-backed content — 4 個 Repository class、5 個 prompts / 3 domain metadata / 26 test cases 全進 MongoDB、3 道 migration script(idempotent + byte-equal verify)、Streamlit multi-page admin UI(test_cases + test_runs)、4 個 admin CLI、sidebar domain switcher + confirm dialog、test_runner 寫 test_runs with active_versions snapshot |
 
 ---
 
@@ -376,6 +377,205 @@ llm_service = LLMService(**config.llm_service_kwargs(), task_metadata=MY_METADAT
 - 主 branch: `main`
 - 最新 release: 看 GitHub Releases 頁面
 
+
+---
+
+## 16. v0.3.0 · Repository / DB-backed Content 架構
+
+從 v0.3.0 起,prompts / metadata / test cases / test runs 全部從 hardcoded Python 檔案移到 MongoDB collection。三層 fallback 保證 DB 沒接時系統仍能跑。
+
+### 16.1 · 四個 MongoDB Collections
+
+| Collection | Doc 數量級 | 主用途 | Repo |
+|---|---|---|---|
+| `prompt_templates` | 5 docs (per domain × 5 phases) | 五個 LLM phase 的 Jinja2 模板 | `PromptRepository` |
+| `domain_metadata` | 1 doc per domain | schema / kpi / 限制 / charting_guidance | `PromptRepository`(共用)|
+| `test_cases` | N docs per domain | test runner 跑的 case 定義 | `TestCaseRepository` |
+| `test_runs` | 累計增加 | 每次 test_runner 跑的快照(含 active_versions)| `TestRunRepository` |
+
+### 16.2 · 三層 Fallback 機制(關鍵 design)
+
+```
+讀取流程(以 PromptRepository.get_template() 為例):
+  1) check in-memory cache (60s TTL) → 命中即回
+  2) 若 PROMPT_REPO_ENABLED + DB 連線 → query MongoDB → cache + 回
+  3) 若 DB 失敗 / 內容缺 → fallback to embedded_prompts.EMBEDDED_PROMPTS
+  4) 連 embedded 都沒 → 才 raise KeyError
+```
+
+**結果**:
+- `PROMPT_REPO_ENABLED=false` 預設 → 直接用 embedded,行為跟 v0.2.x 100% 一致
+- `=true` 但 DB 沒 seed → embedded 接住
+- `=true` + DB 已 seed → 從 DB 讀,可線上編輯
+
+### 16.3 · Domain Isolation
+
+- **Prompts 全部 domain-agnostic**(`domain_scope="*"`) — 不寫死 domain 詞彙,domain 內容透過 `{{ domain_knowledge }}` 注入
+- **加新 domain = 只寫 metadata**,不必改 prompt
+- **UI sidebar domain switcher** 切換時 confirm dialog + 重建 LLMService
+
+### 16.4 · 新檔案職責對照
+
+```
+prompt_repository.py          ← PromptRepository (含 metadata methods)
+test_case_repository.py       ← TestCaseRepository
+test_run_repository.py        ← TestRunRepository
+embedded_prompts.py           ← 5 phase templates (Jinja2)
+embedded_metadata.py          ← 3 domains metadata fallback
+embedded_test_cases.py        ← 26 tflex cases fallback
+
+migrations/
+  001_seed_prompts.py         ← seed embedded_prompts → DB
+  002_seed_metadata.py        ← seed embedded_metadata → DB
+  003_seed_test_cases.py      ← seed embedded_test_cases → DB
+
+pages/
+  01_test_cases.py            ← Streamlit page: test case CRUD UI
+  02_test_runs.py             ← Streamlit page: run history + baseline + compare
+
+admin/
+  list_prompts.py             ← CLI: 列當前 active prompts
+  list_test_runs.py           ← CLI: 列最近 runs
+  mark_baseline.py            ← CLI: 標 baseline (含 --latest)
+  compare_baseline.py         ← CLI: latest vs baseline diff
+```
+
+---
+
+## 17. Repository API Surface
+
+### 17.1 · `PromptRepository`
+
+```python
+from prompt_repository import PromptRepository, build_default_repo
+
+repo = build_default_repo(mongo_db=db)   # or mongo_db=None for pure embedded
+
+# Prompts
+repo.get_template(prompt_key, domain="*") -> str        # Jinja2 source
+repo.render(prompt_key, domain="*", **vars) -> str      # rendered prompt
+repo.save_new_version(prompt_key, domain, template, notes, created_by, activate)
+repo.activate(doc_id)                                    # 啟用某版本(自動下線其他)
+repo.list_versions(prompt_key, domain) -> list[dict]
+
+# Metadata (per domain)
+repo.get_metadata(domain) -> dict
+repo.list_active_domains() -> list[str]
+repo.save_new_metadata_version(domain, metadata, notes, activate)
+repo.activate_metadata(doc_id)
+repo.list_metadata_versions(domain) -> list[dict]
+
+# Cache
+repo.invalidate_all()
+```
+
+### 17.2 · `TestCaseRepository`
+
+```python
+from test_case_repository import TestCaseRepository, build_default_test_case_repo
+
+repo = build_default_test_case_repo(mongo_db=db)
+
+repo.get_cases(domain, filter_prefix="", case_ids=None, include_inactive=False) -> list[dict]
+repo.get_case(domain, case_id) -> dict | None
+repo.count(domain, include_inactive=False) -> int
+repo.list_domains_with_cases() -> list[str]
+repo.upsert_case(domain, case_id, case_data, user="system") -> ObjectId
+repo.activate_case(domain, case_id, user)
+repo.deactivate_case(domain, case_id, user)
+repo.delete_case(domain, case_id) -> bool          # 真刪(建議用 deactivate)
+repo.ensure_indexes()                              # idempotent
+repo.invalidate(domain=None)
+```
+
+### 17.3 · `TestRunRepository`
+
+```python
+from test_run_repository import TestRunRepository
+
+repo = TestRunRepository(mongo_db=db)
+
+repo.save_run(run_data, active_versions=None, git_commit=None) -> ObjectId
+repo.list_recent(limit=20, filter_only=None) -> list[dict]
+repo.get_by_run_id(run_id) -> dict | None
+repo.get_baseline() -> dict | None
+repo.get_latest() -> dict | None
+repo.mark_as_baseline(run_id, notes="") -> bool
+repo.unmark_baseline(run_id) -> bool
+repo.compare(run_id_a, run_id_b) -> dict           # 摘要 delta + case_changes
+repo.compare_with_baseline(run_id) -> dict | None
+```
+
+---
+
+## 18. v0.3.0 Deployment Playbook
+
+### 18.1 · 第一次部署 / 從 v0.2.x 升級
+
+```bash
+# 1) 安裝 dependency
+pip install jinja2
+
+# 2) 三道 migration(順序很重要 — metadata 要先,test_cases 才有依據)
+python migrations/001_seed_prompts.py        # 5 prompts → DB
+python migrations/002_seed_metadata.py       # 3 domains → DB
+python migrations/003_seed_test_cases.py     # 26 cases → DB
+
+# 3) 啟用 repo 模式(env var)
+export GENBI_PROMPT_REPO=true
+
+# 4) 跑 baseline run
+python test_runner.py --baseline             # 同時寫 test_runs + 標 baseline
+
+# 5) 啟動 Streamlit
+streamlit run app.py
+```
+
+### 18.2 · 日常操作 cheat sheet
+
+```bash
+# 改完 prompt 想對比有沒退步
+python test_runner.py                        # 跑完寫 test_runs
+python admin/compare_baseline.py             # 自動 latest vs baseline diff
+
+# 看當前 active prompts
+python admin/list_prompts.py
+
+# 列最近 20 筆 runs
+python admin/list_test_runs.py
+
+# 標新 baseline
+python admin/mark_baseline.py --latest "post-v0.3.1 improvements"
+
+# 跑某 domain 的 STK 系列 only
+python test_runner.py --domain tflex --filter STK
+```
+
+### 18.3 · Streamlit 三頁
+
+- **主頁 (`app.py`)** — 對話式 BI(chat input + agentic workflow + sidebar domain switcher)
+- **🧪 Test Cases (`pages/01_test_cases.py`)** — case CRUD UI
+- **📊 Test Runs (`pages/02_test_runs.py`)** — history viewer + baseline mark + compare
+
+### 18.4 · 環境變數
+
+| Env Var | 預設 | 說明 |
+|---|---|---|
+| `GENBI_PROMPT_REPO` | `false` | `true` 才從 DB 讀(否則純 embedded)|
+| `GENBI_PROMPT_CACHE_TTL_S` | `60` | Repository in-memory cache 秒數 |
+| `GENBI_PROMPT_COLLECTION` | `prompt_templates` | Override collection 名(多環境共用 DB 時)|
+| `GENBI_METADATA_COLLECTION` | `domain_metadata` | 同上 |
+| `GENBI_TEST_CASES_COLLECTION` | `test_cases` | 同上 |
+| `GENBI_TEST_RUNS_COLLECTION` | `test_runs` | 同上 |
+
+### 18.5 · 緊急救援
+
+DB 整個壞掉?系統不會死:
+1. Repo 偵測 DB read 失敗 → 自動 fallback to `embedded_*.py` 副本
+2. embedded 副本內容就是 v0.3.0 launch 時的快照
+3. log.warning 會印「DB read failed for X, falling back to embedded」
+
+要硬切回 embedded:`export GENBI_PROMPT_REPO=false` 重啟。
 
 ---
 
