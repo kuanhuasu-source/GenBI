@@ -187,8 +187,13 @@ option = {
 
 
 _DASHBOARD_KEYWORDS = (
-    "dashboard", "執行摘要", "overview", "匯總", "kpi overview",
-    "summary", "管理面板", "一覽", "卡片", "總覽",
+    # 英文
+    "dashboard", "overview", "summary", "kpi overview", "kpi cards",
+    "executive summary", "exec summary",
+    # 中文(含常見變體)
+    "儀表板", "儀錶板", "管理儀表板", "kpi 儀表板",
+    "管理面板", "管理頁面",
+    "執行摘要", "總覽", "概覽", "一覽", "匯總", "卡片",
 )
 
 
