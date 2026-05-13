@@ -5,6 +5,26 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.2.2] · 2026-05-12 — Fix:Long format + Stacked Bar 對齊
+
+**Patch release · 修 Phase C ECharts prompt 的 long-format 對齊 bug。**
+
+### 🐛 修正
+
+- **Long format Q + Stacked Bar 對齊鐵律(新規則 5.55)**
+  - **症狀**:當 Phase B 產出 long format Q(每列 = 一個 dim_a × dim_b 組合,例如 company × category),LLM 在 Phase C 用 `Q["company_code"].tolist()` 直接當 xAxis,導致 xAxis 列出重複的 N 次公司代碼,series 資料只填到前幾個位置,**所有 bar 擠在最左邊、後方空白**。
+  - **根因**:long format Q 沒被 pivot 成 wide,xAxis 與 series.data 順序未對齊。
+  - **修正**:Phase C prompt 加 CRITICAL 規則 5.55,明示「xAxis.data 必須用 `unique().tolist()`」+ 提供 pivot_table + reindex + fillna 的標準配方範例(❌ 反例 vs ✅ 正解對照)。
+  - **影響**:`generate_echarts_option` system prompt,~30 行新內容。
+
+### 📚 受影響的場景
+
+- 公司 × 類別 stacked bar(各公司類別占比)
+- 公司 × 狀態 stacked bar(各公司核准/退件/進行中占比)
+- 任何 long format groupby 結果做 stacked bar / grouped bar 的場景
+
+---
+
 ## [0.2.1] · 2026-05-12 — Docs:LLM handoff brief
 
 **Patch release · docs only,無功能變動。**
