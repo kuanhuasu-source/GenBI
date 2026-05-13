@@ -139,6 +139,7 @@ PROMPT_CACHE_TTL_S: int = int(os.getenv("GENBI_PROMPT_CACHE_TTL_S", "60"))
 # 4 個 repository 用的 collection 名(可由 env 覆寫,例如多環境共用同 DB 時加前綴)
 PROMPT_COLLECTION: str = os.getenv("GENBI_PROMPT_COLLECTION", "prompt_templates")
 METADATA_COLLECTION: str = os.getenv("GENBI_METADATA_COLLECTION", "domain_metadata")
+TEST_CASES_COLLECTION: str = os.getenv("GENBI_TEST_CASES_COLLECTION", "test_cases")
 TEST_RUNS_COLLECTION: str = os.getenv("GENBI_TEST_RUNS_COLLECTION", "test_runs")
 AUDIT_LOG_COLLECTION: str = os.getenv("GENBI_AUDIT_LOG_COLLECTION", "audit_log")
 

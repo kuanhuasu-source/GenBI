@@ -1107,8 +1107,22 @@ def format_markdown_report(results: list[dict]) -> str:
 # ============================================================
 # Main
 # ============================================================
+def _normalize_case(c: dict) -> dict:
+    """讓 case 同時擁有 id / case_id(向下相容),保留所有其他欄位。"""
+    if "case_id" in c and "id" not in c:
+        c["id"] = c["case_id"]
+    elif "id" in c and "case_id" not in c:
+        c["case_id"] = c["id"]
+    return c
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="GenBI headless test runner")
+    parser.add_argument(
+        "--domain",
+        default="tflex",
+        help="跑哪個 domain 的 cases (預設 tflex)",
+    )
     parser.add_argument(
         "--filter",
         default="",
@@ -1119,40 +1133,83 @@ def main() -> int:
         default="",
         help="只跑指定 id (逗號分隔,例: --only STK-01,STK-04)",
     )
+    parser.add_argument(
+        "--no-save-run",
+        action="store_true",
+        help="不寫 test_runs collection(臨時驗證用)",
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="跑完自動標為 baseline(等同 --no-save-run 的反面)",
+    )
     args = parser.parse_args()
 
-    selected_cases = TEST_CASES
-    if args.only:
-        wanted = {x.strip() for x in args.only.split(",") if x.strip()}
-        selected_cases = [c for c in TEST_CASES if c["id"] in wanted]
-    elif args.filter:
-        prefix = args.filter.strip()
-        selected_cases = [c for c in TEST_CASES if c["id"].startswith(prefix)]
-
-    if not selected_cases:
-        print(f"❌ 沒有符合 filter='{args.filter}' only='{args.only}' 的 case")
-        return 1
-
-    banner(" tFlex GenBI · Test Runner ", "═")
+    banner(f" GenBI · Test Runner · domain={args.domain} ", "═")
 
     print(f"LLM       : {OLLAMA_URL}")
     print(f"Model     : {OLLAMA_MODEL}")
     print(f"MongoDB   : {MONGO_URI}{MONGO_DB}")
-    print(f"Cases     : {len(selected_cases)} / {len(TEST_CASES)} 個"
-          + (f"  (filter={args.filter or args.only})" if (args.filter or args.only) else ""))
-    print(f"Timeout   : {OLLAMA_TIMEOUT}s\n")
-
-    print("⏱️  第一個 case 會包含模型 warm-up (預期 30-90s),後續會快很多。\n")
 
     # 連線
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=max(config.MONGO_SERVER_SELECTION_TIMEOUT_MS, 3000))
         client.admin.command("ping")
         db = client[MONGO_DB]
-        print(f"✅ MongoDB 連線 OK · {db.tflex_applications.count_documents({}):,} 筆 application")
+        try:
+            print(f"✅ MongoDB 連線 OK · {db.tflex_applications.count_documents({}):,} 筆 application")
+        except Exception:
+            print("✅ MongoDB 連線 OK")
     except Exception as e:
         print(f"❌ MongoDB 連線失敗: {e}")
         return 1
+
+    # 從 TestCaseRepository 讀 cases(DB → embedded fallback)
+    try:
+        from test_case_repository import build_default_test_case_repo
+        case_repo = build_default_test_case_repo(mongo_db=db)
+        only_ids = None
+        if args.only:
+            only_ids = [x.strip() for x in args.only.split(",") if x.strip()]
+        selected_cases = case_repo.get_cases(
+            domain=args.domain,
+            filter_prefix=args.filter,
+            case_ids=only_ids,
+        )
+        selected_cases = [_normalize_case(c) for c in selected_cases]
+    except Exception as e:
+        print(f"⚠️  TestCaseRepository 失敗,fallback to 內嵌 TEST_CASES list: {e}")
+        selected_cases = TEST_CASES
+        if args.only:
+            wanted = {x.strip() for x in args.only.split(",") if x.strip()}
+            selected_cases = [c for c in TEST_CASES if c["id"] in wanted]
+        elif args.filter:
+            prefix = args.filter.strip()
+            selected_cases = [c for c in TEST_CASES if c["id"].startswith(prefix)]
+
+    if not selected_cases:
+        print(f"❌ 沒有符合 domain={args.domain!r} filter={args.filter!r} only={args.only!r} 的 case")
+        return 1
+
+    total_cases_in_domain = len(case_repo.get_cases(args.domain)) if 'case_repo' in dir() else len(TEST_CASES)
+    print(f"Cases     : {len(selected_cases)} / {total_cases_in_domain} 個"
+          + (f"  (filter={args.filter or args.only})" if (args.filter or args.only) else ""))
+    print(f"Timeout   : {OLLAMA_TIMEOUT}s\n")
+
+    print("⏱️  第一個 case 會包含模型 warm-up (預期 30-90s),後續會快很多。\n")
+
+    # 為了 LLM service 能讀對 domain 的 metadata,從 prompt_repo 取
+    try:
+        from prompt_repository import build_default_repo
+        prompt_repo = build_default_repo(mongo_db=db)
+        task_md = None
+        try:
+            task_md = prompt_repo.get_metadata(args.domain)
+        except KeyError:
+            print(f"⚠️  Metadata 找不到 domain={args.domain!r},LLMService 用 default")
+    except Exception:
+        prompt_repo = None
+        task_md = None
 
     llm = LLMService(
         api_url=OLLAMA_URL,
@@ -1160,6 +1217,9 @@ def main() -> int:
         model_name=OLLAMA_MODEL,
         timeout_s=OLLAMA_TIMEOUT,
         default_temperature=0.0,
+        task_metadata=task_md,
+        prompt_repo=prompt_repo,
+        domain=args.domain,
     )
 
     results = []
@@ -1236,7 +1296,7 @@ def main() -> int:
         print(f"    · Local (A100 $2/hr 估計):  "
               f"${(total_elapsed / 3600 * 2) / pass_count:.4f} / 成功 query")
 
-    # 寫報告
+    # 寫報告(local files,for backward compat)
     REPORT_MD.write_text(format_markdown_report(results), encoding="utf-8")
     REPORT_JSON.write_text(
         json.dumps(results, ensure_ascii=False, indent=2, default=str),
@@ -1244,6 +1304,71 @@ def main() -> int:
     )
     print(f"\n📝 Markdown 報告:{REPORT_MD.resolve()}")
     print(f"📦 JSON 結構:{REPORT_JSON.resolve()}")
+
+    # 寫 test_runs collection(v0.3.0+)
+    if not args.no_save_run:
+        try:
+            from test_run_repository import TestRunRepository
+            import datetime as _dt
+            run_repo = TestRunRepository(
+                mongo_db=db,
+                collection=config.TEST_RUNS_COLLECTION,
+            )
+            # 組摘要
+            summary = {
+                "total_cases": len(results),
+                "passed": sum(1 for r in results if r.get("status") == "pass"),
+                "refusal_detected": sum(1 for r in results if r.get("status") == "refusal_detected"),
+                "failed": sum(1 for r in results if r.get("status", "").startswith("fail")),
+                "fatal_error": sum(1 for r in results if r.get("status") == "fatal_error"),
+                "phaseA_error": sum(1 for r in results if r.get("status") == "phaseA_error"),
+                "phaseC_fallback_used": sum(1 for r in results if r.get("status") == "phaseC_fallback_used"),
+                "total_calls": total_calls,
+                "total_tokens": total_tokens,
+                "prompt_tokens": total_prompt,
+                "completion_tokens": total_completion,
+            }
+            # 組 active_versions 快照(若 repo 接好)
+            active_versions = {}
+            try:
+                if 'prompt_repo' in dir() and prompt_repo is not None and prompt_repo._enabled:
+                    prompt_versions = {}
+                    for key in ("phase_0_plan", "phase_a_pipeline", "phase_b_preprocess",
+                                "phase_c_echarts", "phase_d_insight"):
+                        doc = prompt_repo._db[prompt_repo._prompt_coll].find_one({
+                            "prompt_key": key,
+                            "is_active": True,
+                        }) if prompt_repo._db is not None else None
+                        if doc:
+                            prompt_versions[key] = doc["_id"]
+                    if prompt_versions:
+                        active_versions["prompts"] = prompt_versions
+                    md_doc = prompt_repo._db[prompt_repo._metadata_coll].find_one({
+                        "domain": args.domain, "is_active": True
+                    }) if prompt_repo._db is not None else None
+                    if md_doc:
+                        active_versions["metadata"] = md_doc["_id"]
+            except Exception:
+                pass
+
+            inserted_id = run_repo.save_run({
+                "domain": args.domain,
+                "started_at": _dt.datetime.utcfromtimestamp(total_start),
+                "completed_at": _dt.datetime.utcnow(),
+                "total_wall_s": round(total_elapsed, 2),
+                "filter": args.filter or args.only or None,
+                "summary": summary,
+                "case_results": results,
+                "is_baseline": bool(args.baseline),
+                "baseline_notes": (
+                    f"Auto-marked baseline at {_dt.datetime.utcnow().isoformat()}"
+                    if args.baseline else ""
+                ),
+            }, active_versions=active_versions or None)
+            print(f"\n📦 test_runs 寫入 OK · _id={inserted_id}"
+                  + (" · 已標 baseline" if args.baseline else ""))
+        except Exception as e:
+            print(f"\n⚠️  test_runs 寫入失敗(不影響本地報告): {e}")
 
     client.close()
     return 0
