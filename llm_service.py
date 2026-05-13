@@ -1197,7 +1197,35 @@ class LLMService:
     # --------------------------------------------------------
     def generate_pipeline(self, query, plan_text="",
                           previous_code: str = "", previous_error: str = ""):
-        system_prompt = f"""你是精通 MongoDB 的資料庫工程師,負責【A. 資料獲取】。
+        system_prompt = self._render_phase_a_pipeline_prompt()
+        user_msg = f"需求:{query}\n計畫:{plan_text}"
+        user_msg += self._format_retry_hint(previous_code, previous_error)
+        raw = self._call_llm(
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": user_msg}],
+            phase="pipeline",
+        )
+        return self._strip_code_fence(raw, lang="json")
+
+    def _render_phase_a_pipeline_prompt(self) -> str:
+        """產生 Phase A pipeline system prompt(repo → inline fallback)。"""
+        if self.prompt_repo is not None:
+            try:
+                return self.prompt_repo.render(
+                    "phase_a_pipeline",
+                    domain=self.domain,
+                    domain_knowledge=self.domain_knowledge,
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Phase A prompt repo render 失敗,fallback to inline: {e}"
+                )
+        return self._inline_phase_a_pipeline_prompt()
+
+    def _inline_phase_a_pipeline_prompt(self) -> str:
+        """v0.2.x 行為 inline f-string 副本。"""
+        return f"""你是精通 MongoDB 的資料庫工程師,負責【A. 資料獲取】。
 {self.domain_knowledge}
 
 ### 實作守則 (CRITICAL RULES):
@@ -1239,14 +1267,6 @@ class LLMService:
         }} }}
     ]
 }}"""
-        user_msg = f"需求:{query}\n計畫:{plan_text}"
-        user_msg += self._format_retry_hint(previous_code, previous_error)
-        raw = self._call_llm(
-            [{"role": "system", "content": system_prompt},
-             {"role": "user", "content": user_msg}],
-            phase="pipeline",
-        )
-        return self._strip_code_fence(raw, lang="json")
 
     # --------------------------------------------------------
     # Phase B: Pandas 處理

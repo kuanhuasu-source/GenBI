@@ -317,6 +317,152 @@ class PromptRepository:
         self._template_cache.clear()
         self._metadata_cache.clear()
 
+    # ============================================================
+    # Metadata 路徑 (domain_metadata collection)
+    # ============================================================
+    # 跟 prompt 一樣有 DB → cache → embedded fallback 三層保險。
+    # 但 metadata 不是模板,沒有 Jinja2 render,直接回 dict。
+
+    def get_metadata(self, domain: str) -> dict:
+        """讀某 domain 的 active metadata。優先 DB → cache → embedded fallback。
+
+        Returns:
+            metadata dict(含 schema / kpi_definitions / data_limitations / ...)
+
+        Raises:
+            KeyError: DB 與 embedded 都沒這個 domain。
+        """
+        # Cache 命中
+        cached = self._metadata_cache.get(domain)
+        if cached and cached[1] > time.time():
+            return cached[0]
+
+        # DB
+        if self._enabled and self._db is not None:
+            doc = self._fetch_metadata_from_db(domain)
+            if doc is not None:
+                self._metadata_cache[domain] = (
+                    doc,
+                    time.time() + self._cache_ttl_s,
+                )
+                return doc
+
+        # Embedded fallback
+        embedded = self._embedded.get(("__metadata__", domain))
+        if embedded is not None:
+            self._metadata_cache[domain] = (
+                embedded,
+                time.time() + min(self._cache_ttl_s, 30),
+            )
+            return embedded
+
+        raise KeyError(
+            f"Metadata not found for domain={domain!r}. "
+            f"DB enabled={self._enabled}, embedded keys="
+            f"{[k[1] for k in self._embedded.keys() if k[0] == '__metadata__']}"
+        )
+
+    def _fetch_metadata_from_db(self, domain: str) -> Optional[dict]:
+        """從 MongoDB 撈該 domain 的當前 active metadata。"""
+        try:
+            coll = self._db[self._metadata_coll]
+            doc = coll.find_one({"domain": domain, "is_active": True})
+            if not doc:
+                return None
+            # 去掉 MongoDB 內部欄位,組回乾淨 metadata dict
+            cleaned = {
+                k: v for k, v in doc.items()
+                if k not in ("_id", "domain", "version", "is_active",
+                             "created_at", "created_by", "notes")
+            }
+            return cleaned
+        except Exception as e:
+            logger.warning(
+                f"PromptRepository metadata DB read failed for {domain}: {e}. "
+                f"Will fall back to embedded."
+            )
+            return None
+
+    def list_active_domains(self) -> list[str]:
+        """列出所有有 active metadata 的 domain 名稱。給 sidebar selector 用。
+
+        Returns:
+            sorted list of domain names。DB 沒接時回 embedded 副本的 domain list。
+        """
+        domains = set()
+
+        # DB 來源
+        if self._enabled and self._db is not None:
+            try:
+                coll = self._db[self._metadata_coll]
+                for doc in coll.find({"is_active": True}, {"domain": 1}):
+                    if "domain" in doc:
+                        domains.add(doc["domain"])
+            except Exception as e:
+                logger.warning(f"list_active_domains DB read failed: {e}")
+
+        # Embedded 也加上(確保 fallback 場景也能列)
+        for key in self._embedded.keys():
+            if key[0] == "__metadata__":
+                domains.add(key[1])
+
+        return sorted(domains)
+
+    def save_new_metadata_version(
+        self,
+        domain: str,
+        metadata: dict,
+        notes: str = "",
+        created_by: str = "system",
+        activate: bool = False,
+    ) -> Any:
+        """新增一筆 domain metadata 版本。"""
+        if self._db is None:
+            raise RuntimeError("Cannot save: mongo_db not provided.")
+        coll = self._db[self._metadata_coll]
+        latest = coll.find_one(
+            {"domain": domain},
+            sort=[("version", -1)],
+        )
+        next_version = (latest["version"] + 1) if latest else 1
+
+        import datetime as _dt
+        doc = {
+            "domain": domain,
+            "version": next_version,
+            "is_active": False,
+            "created_at": _dt.datetime.utcnow(),
+            "created_by": created_by,
+            "notes": notes,
+            **metadata,  # schema / kpi_definitions / ... 直接展開
+        }
+        result = coll.insert_one(doc)
+        if activate:
+            self.activate_metadata(result.inserted_id)
+        return result.inserted_id
+
+    def activate_metadata(self, doc_id: Any) -> None:
+        """啟用某 domain metadata 版本,同 domain 其他自動下線。"""
+        if self._db is None:
+            raise RuntimeError("Cannot activate: mongo_db not provided.")
+        coll = self._db[self._metadata_coll]
+        target = coll.find_one({"_id": doc_id})
+        if not target:
+            raise KeyError(f"No metadata doc with _id={doc_id}")
+        coll.update_many(
+            {"domain": target["domain"]},
+            {"$set": {"is_active": False}},
+        )
+        coll.update_one({"_id": doc_id}, {"$set": {"is_active": True}})
+        self.invalidate_all()
+
+    def list_metadata_versions(self, domain: str) -> list[dict]:
+        """列出某 domain 所有 metadata 版本,按 version desc。"""
+        if self._db is None:
+            return []
+        coll = self._db[self._metadata_coll]
+        return list(coll.find({"domain": domain}).sort("version", -1))
+
 
 # ============================================================
 # 工廠函式 — 從 config 建構 repo
