@@ -22,6 +22,22 @@ import os
 
 
 # ============================================================
+# .env loader — v0.3.2 修正(之前 .env 從沒被讀!)
+# ============================================================
+# 在 os.getenv 之前,先把 .env 內容載入 os.environ
+# 若 python-dotenv 沒裝(舊環境)或檔案不存在,silently skip
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    import pathlib as _pl
+    _env_path = _pl.Path(__file__).resolve().parent / ".env"
+    if _env_path.exists():
+        # override=False:shell export 的 env 優先,.env 是備援
+        _load_dotenv(dotenv_path=_env_path, override=False)
+except ImportError:
+    pass
+
+
+# ============================================================
 # Provider 預設值表
 # ============================================================
 _PROVIDER_DEFAULTS = {
