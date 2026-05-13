@@ -131,6 +131,10 @@ def classify_intent(query) -> dict                   # heuristic 分類 (無 met
 def is_dashboard_query(query) -> bool                # dashboard mode 偵測
 def is_followup_query(query, last_analysis) -> bool  # follow-up 偵測
 def is_out_of_scope(query, vocab) -> bool            # 離題偵測
+
+# 結構性防禦 (v0.2.3+ · test_runner / app.py 共用)
+def sanitize_pipeline(pipeline) -> list              # strip 鍵空白 + 補回漏掉的 $
+def rescue_empty_echarts(option, Q) -> tuple        # 偵測空殼 option,自動 pivot 補回 series
 ```
 
 ### `app.py` 結構性 helpers
@@ -248,8 +252,14 @@ mongosh tflex_demo --eval 'db.tflex_applications.countDocuments({})'
 ## 9. 測試指令
 
 ```bash
-# tFlex 18 case 完整回歸 (~9 分鐘)
+# 全部 26 case 完整回歸 (~18-25 分鐘 · 18 原始 case + 8 STK case)
 python test_runner.py
+
+# 只跑 STK 系列 (~6-7 分鐘) — 迭代 stacked bar 用
+python test_runner.py --filter STK
+
+# 只跑指定 case (逗號分隔)
+python test_runner.py --only STK-01,STK-04
 
 # 跨 domain 通用性 (~4 分鐘 each)
 python test_generality.py ecommerce
@@ -264,6 +274,8 @@ python config.py
 # Smoke test classify_intent (沒 LLM call)
 python -c "from llm_service import classify_intent; print(classify_intent('你會做什麼?'))"
 ```
+
+> STK case 規格在 `STACKED_BAR_TEST.md`,7 個 case 共通檢查項(stack 屬性 / xAxis unique / series 長度對齊 / yAxis max / 真實 legend...)。
 
 每次測試會產出:
 - `test_results.md` / `test_results.json` — tFlex 結果
@@ -339,6 +351,9 @@ llm_service = LLMService(**config.llm_service_kwargs(), task_metadata=MY_METADAT
 |---|---|---|
 | `v0.1.0` | 2026-05-12 | Initial Release — 5-phase workflow / domain-agnostic / ECharts+Plotly / structural defenses / multi-provider LLM / cost telemetry |
 | `v0.2.0` | 2026-05-12 | Pre-Phase 0 UX layer — Intent Router (6 intents)、Follow-up Detection、out_of_scope、minimal start screen、Minimal Change Principle for follow-ups、rate KPI skeleton |
+| `v0.2.1` | 2026-05-12 | Docs — AI_CONTEXT.md 單檔自足專案濃縮文件 (此檔) |
+| `v0.2.2` | 2026-05-12 | Fix — Phase C ECharts prompt long-format 對齊 (rule 5.55) |
+| `v0.2.3` | 2026-05-13 | Stacked Bar 結構性防禦 — `sanitize_pipeline` / `rescue_empty_echarts` 兩道 utility,Phase A/C 多條 rule (5.5/5.55/5.58/5.65),STK-01~08 測試套件,test_runner `--filter`/`--only` CLI,follow-up setup 支援,denial_markers 擴大 |
 
 ---
 

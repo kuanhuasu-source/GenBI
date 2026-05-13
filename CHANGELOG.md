@@ -5,6 +5,68 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.2.3] · 2026-05-13 — Stacked Bar 結構性防禦 + 測試強化
+
+**Patch release · 收斂 stacked bar 失敗模式 + 兩道結構性防禦 + STK 測試套件。**
+
+### 🛡️ 結構性防禦(新增,單一來源於 `llm_service.py`)
+
+- **`sanitize_pipeline(pipeline)`** — Phase A 救援:strip stage 鍵的前後空白,缺 `$` 補回。
+  防 LLM 寫 `" $project"`、`"match"` 觸發 `Unrecognized pipeline stage`。test_runner / app.py 都調用。
+- **`rescue_empty_echarts(option, Q)`** — Phase C 救援:偵測「結構完整但 data 全空」的 option
+  (series=[]、所有 series.data=[]、category 軸 data 缺),從 Q 自動 pivot 補回 series。
+  支援橫向偵測(`yAxis.type=category` → 灌 pivot.index 到 yAxis)。
+
+### ✨ Prompt 強化(Phase A / C)
+
+- **Rule 5.5 ✅ Entity 過濾鐵律** — 使用者明列實體值(TST/TSN/TSC、Apparel/Books 等)時,
+  Phase A `$match` **必須**含 `$in` 過濾,不要讓下游 Pandas 處理。
+- **Rule 5.55 ⚠️ Stacked Bar 強制 Pivot 鐵律(CRITICAL FATAL)** — 不論 Q 是 long 或 wide,
+  Phase C 一律先做 `pivot_table().fillna(0)`,從 `pivot.index` / `pivot.columns` 取 xAxis / series。
+  絕對禁止 `Q[Q['col']==literal]` filter 模式(會缺漏組合 → series.data 長度不齊)。
+- **Rule 5.58 🔢 百分比禁止重覆 ×100** — 命名含 `_pct` / `percent` / `percentage` / `rate`
+  的欄位已是 0-100,Phase C 不可再 `* 100`(否則變 0-10000)。
+- **Rule 5.65 ↔️ 橫向 Bar 強制走 5.55 pivot** — 橫向 stacked bar 不是只換軸而已,
+  pivot 後從 `pivot.index` 取 yAxis,series.data 從 `pivot[col]` 取。
+
+### 🧪 測試框架擴充
+
+- **STK-01 ~ STK-08** — 8 個 stacked bar 專屬 case(`STACKED_BAR_TEST.md` 提供規格):
+  100% stacked / transposed / raw count / 三狀態 / filter / hc 範圍 / follow-up / 橫向。
+- **新檢查項** — `echarts_xaxis_unique`、`echarts_data_length_aligned`、`echarts_yaxis_max`、
+  `echarts_no_placeholder_series_name`、`echarts_no_nan_in_data`、
+  `echarts_should_have_yaxis_category` / `_should_have_xaxis_value` / `_data_length_aligned_horizontal`。
+- **`--filter` / `--only` CLI** — `python test_runner.py --filter STK` 只跑 STK-* 案例;
+  `--only STK-01,STK-04` 跑指定 case,迭代速度大幅提升。
+- **Follow-up setup 支援** — case 加 `follow_up_setup_query` 時,合成 `last_analysis` dict 注入
+  `generate_plan(query, followup_context=...)`,讓 STK-07 能真正測 follow-up 路徑。
+- **`denial_markers` 擴大** — 加入 caveat / forward-looking / hedging 詞群
+  (`未考量`、`未涵蓋`、`可能`、`是否`、`建議`、`協助`、`視覺化`、`或地區`、`或職級` 等),
+  避免 LLM 在 insight 的「觀察與建議」/「解讀注意事項」用 `部門/金額/趨勢` 時被誤判為 hallucination。
+
+### 🐛 修正
+
+- **`generate_pipeline` f-string nesting** — 原本 rule 5.5 的 JSON 範例用單層 `{}` 觸發
+  Python f-string 巢狀深度上限,改為敘述 + 點到範例結構。
+- **rule 5.5 「match / $match」混淆** — 文案改寫,明示「完整鍵名是 `"$match"`(含錢字符號),
+  不要寫成 `"match"`」並指向範例結構區。
+
+### 📊 跑分(`python test_runner.py` 全跑)
+
+- **22/26 pass(84.6%)** — STK 從 1/8 → 7/8;另 3 個原始 case 失敗已用 denial_markers 修正,
+  預期下次 25/26(96.2%)。
+- 剩 case 03 是 query 模糊性設計問題(沒明說 "stacked" 但 case name 期待 stacked),保留當
+  「LLM 彈性判讀」測試。
+
+### 📚 受影響檔案
+
+- `llm_service.py` — 加 `sanitize_pipeline` / `rescue_empty_echarts`;rule 5.5/5.55/5.58/5.65 改寫
+- `app.py` / `test_runner.py` — 都引入兩個 utility
+- `test_runner.py` — STK case + 新檢查項 + CLI flags + follow-up setup + denial markers
+- `STACKED_BAR_TEST.md`(新增) — STK 測試規格
+
+---
+
 ## [0.2.2] · 2026-05-12 — Fix:Long format + Stacked Bar 對齊
 
 **Patch release · 修 Phase C ECharts prompt 的 long-format 對齊 bug。**

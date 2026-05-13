@@ -24,6 +24,8 @@ from llm_service import (
     is_dashboard_query,
     classify_intent,
     is_followup_query,
+    sanitize_pipeline,
+    rescue_empty_echarts,
 )
 import config
 
@@ -476,10 +478,11 @@ if query:
                 raise ValueError(f"LLM 未能回傳合法的 JSON 格式:\n{db_json_str}")
 
             start_collection = db_instruction.get("start_collection")
-            pipeline = db_instruction.get("pipeline", [])
+            pipeline = sanitize_pipeline(db_instruction.get("pipeline", []))
 
             with st.expander(f"🛠️ 檢視 MongoDB Pipeline (起點: {start_collection})", expanded=False):
-                st.code(json.dumps(db_instruction, indent=2, ensure_ascii=False), language="json")
+                st.code(json.dumps({"start_collection": start_collection, "pipeline": pipeline},
+                                   indent=2, ensure_ascii=False), language="json")
 
             # === 依資料來源實際撈取 ===
             if data_source.startswith("MongoDB") and mongo_db is not None:
@@ -599,6 +602,10 @@ if query:
                         final_option = workflow_namespace.get("option")
                         if not isinstance(final_option, dict):
                             raise ValueError("執行腳本後,未產生 dict 型別的 `option`。")
+                        # 空殼救援:LLM 偶爾產 series=[] / xAxis.data=[] 的空 option
+                        final_option, _rescued = rescue_empty_echarts(final_option, Q)
+                        if _rescued:
+                            st.toast("🛟 偵測到 Phase C 產出空殼,已自動 pivot 補回 series", icon="🔧")
                         # 表格 fallback 旗標
                         use_table_fallback = bool(final_option.get("_use_table"))
                         # 基本健全性:非表格情境必須有 series

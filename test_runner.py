@@ -15,6 +15,7 @@ tFlex GenBI · Headless Test Runner
   python3 test_runner.py
 """
 
+import argparse
 import json
 import sys
 import time
@@ -25,7 +26,7 @@ from typing import Any
 import pandas as pd
 from pymongo import MongoClient
 
-from llm_service import LLMService, is_dashboard_query
+from llm_service import LLMService, is_dashboard_query, sanitize_pipeline, rescue_empty_echarts
 
 
 # ============================================================
@@ -211,6 +212,125 @@ TEST_CASES = [
             "missing", "限制", "不存在", "無法",
         ],
     },
+    # ──────────────────────────────────────────────────────
+    # Stacked Bar 專屬 case (STK-XX) — 對應 STACKED_BAR_TEST.md
+    # ──────────────────────────────────────────────────────
+    {
+        "id": "STK-01",
+        "name": "100% stacked bar:per company × category",
+        "query": "畫一張 stacked bar:依據 company_code(TST、TSN、TSC),每條 bar 中呈現 application_category 的佔比",
+        "type": "happy_path",
+        "expected_chart": "100% stacked bar",
+        "expected_q_cols_any": ["company_code", "application_category"],
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        # STK 專屬新檢查
+        "echarts_xaxis_unique": True,       # xAxis.data 不可有重複
+        "echarts_data_length_aligned": True, # 每個 series.data 長度 == xAxis.data 長度
+        "echarts_yaxis_max": 100,            # 100% stacked 應該鎖 max=100
+        "echarts_series_count_max": 6,       # 不該超過 6 個 series (4 category + 2 buffer)
+        "echarts_no_placeholder_series_name": True,  # name 不可是「類別 A」「Category 1」之類
+    },
+    {
+        "id": "STK-02",
+        "name": "100% stacked transposed:per category × company",
+        "query": "依據 application_category 畫 stacked bar,每條 bar 中呈現 TST、TSN、TSC 的占比",
+        "type": "happy_path",
+        "expected_chart": "transposed 100% stacked bar",
+        "expected_q_cols_any": ["company_code", "application_category"],
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        "echarts_xaxis_unique": True,
+        "echarts_data_length_aligned": True,
+        "echarts_yaxis_max": 100,
+        "echarts_no_placeholder_series_name": True,
+    },
+    {
+        "id": "STK-03",
+        "name": "Raw count stacked:PAY vs RTN by company",
+        "query": "各公司的 PAY 與 RTN 申請數量比較,用 stacked bar 呈現",
+        "type": "happy_path",
+        "expected_chart": "stacked bar (raw count)",
+        "expected_q_cols_all": ["company_code"],
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        "echarts_xaxis_unique": True,
+        "echarts_data_length_aligned": True,
+        "echarts_no_placeholder_series_name": True,
+    },
+    {
+        "id": "STK-04",
+        "name": "三狀態 100% stacked:per category × (approved/returned/in_progress)",
+        "query": "各申請類別下,核准(完成且 result=Y)/退件(完成且 result=N)/進行中三狀態的占比分佈,用 100% stacked bar",
+        "type": "happy_path",
+        "expected_chart": "3-state 100% stacked",
+        "expected_q_cols_any": ["application_category"],
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 3,
+        "echarts_should_have_stack": True,
+        "echarts_xaxis_unique": True,
+        "echarts_data_length_aligned": True,
+        "echarts_yaxis_max": 100,
+        "echarts_no_placeholder_series_name": True,
+    },
+    {
+        "id": "STK-05",
+        "name": "Stacked + filter:TST/TSC 各類別 AI vs Human",
+        "query": "只看 TST、TSC 兩家,各類別中 AI 審查 vs 人工審查 的數量 stacked",
+        "type": "happy_path",
+        "expected_chart": "stacked bar with filter",
+        "expected_q_cols_any": ["application_category"],
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        "echarts_xaxis_unique": True,
+        "echarts_data_length_aligned": True,
+        "phase_a_must_have_match_in": True,  # Phase A 應含 $match: company_code $in [TST, TSC]
+    },
+    {
+        "id": "STK-06",
+        "name": "Edge:hc 範圍過濾 + 缺漏組合",
+        "query": "依據 hc 介於 100 到 1000 的公司,看 application_category 占比 stacked",
+        "type": "happy_path",
+        "expected_chart": "stacked bar with hc filter",
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        "echarts_xaxis_unique": True,
+        "echarts_data_length_aligned": True,
+        "echarts_no_nan_in_data": True,  # 缺漏組合應 fillna(0),series.data 不可含 NaN
+    },
+    {
+        "id": "STK-07",
+        "name": "Follow-up:基本 bar 改 stacked (需 last_analysis)",
+        "query": "改成 stacked bar 看類別占比",
+        "type": "happy_path",
+        "expected_chart": "follow-up stacked",
+        "follow_up_setup_query": "各公司的申請數量 bar chart",  # 先跑這個建立 last_analysis
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        "echarts_xaxis_unique": True,
+        "echarts_no_placeholder_series_name": True,
+    },
+    {
+        "id": "STK-08",
+        "name": "橫向 100% stacked bar",
+        "query": "各公司申請類別占比分佈,用水平 stacked bar 呈現",
+        "type": "happy_path",
+        "expected_chart": "horizontal 100% stacked bar",
+        "expected_q_cols_any": ["company_code", "application_category"],
+        "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        "echarts_min_series": 2,
+        "echarts_should_have_stack": True,
+        "echarts_should_have_yaxis_category": True,   # 新檢查:橫向必須 yAxis.type=category
+        "echarts_should_have_xaxis_value": True,       # 新檢查:橫向必須 xAxis.type=value
+        "echarts_data_length_aligned_horizontal": True,  # 橫向時 series.data 長度 == yAxis.data 長度
+        "echarts_no_placeholder_series_name": True,
+    },
 ]
 
 
@@ -324,6 +444,16 @@ def is_misused(text: str, term: str) -> bool:
         "謹慎", "需注意", "需考量", "需確認", "建議追蹤", "建議持續",
         "監控", "觀察", "未考慮", "未來", "後續", "持續性",
         "短期", "長期", "暫無", "尚無", "目前無", "受限於",
+        # 未涵蓋 / 未包含 / 排除類 (caveat 用語)
+        "未考量", "未涵蓋", "未包含", "未提供", "未含", "未納入",
+        "不含", "不涵蓋", "不包含", "排除",
+        # 推測 / 假設性 / 探索建議類 (forward-looking suggestion)
+        "可能", "是否", "假設", "若有", "若存在", "若能", "如能",
+        "推測", "推估", "深入分析", "進一步分析", "進一步調查",
+        "進一步研究", "可考慮", "可協助", "可進一步", "可作為",
+        "建議分析", "建議調查", "建議研究", "建議深入", "建議針對",
+        # 廣義 forward-looking 標記(這些詞在 insight 中通常代表「若有資料就能做」)
+        "建議", "協助", "視覺化", "探索", "將來", "或地區", "或職級",
     )
     for pos in _find_all(text, term):
         sentence = _enclosing_sentence(text, pos)
@@ -354,12 +484,30 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
     }
 
     # ----------------------------------------------------------
-    # Phase 0 · Plan
+    # Phase 0 · Plan (含 follow-up 模擬)
     # ----------------------------------------------------------
+    # 若 case 有 follow_up_setup_query,合成 last_analysis 模擬接續
+    followup_context = None
+    setup_q = case.get("follow_up_setup_query")
+    if setup_q:
+        followup_context = {
+            "query": setup_q,
+            "plan_summary": (
+                f"前次需求:{setup_q}\n"
+                f"前次圖型:bar / 表格(以公司或類別為 x 軸)"
+            ),
+            "Q_cols": ["company_code", "application_count"],
+            "chart_engine": "ECharts",
+            "chart_descriptor": "bar",
+            "is_dashboard": False,
+            "was_followup": False,
+        }
+        print(f"🔗 follow-up setup 注入:'{setup_q}'")
+
     print("\n▶︎ Phase 0 · Plan")
     t0 = time.time()
     try:
-        plan_res = llm.generate_plan(case["query"])
+        plan_res = llm.generate_plan(case["query"], followup_context=followup_context)
         elapsed = time.time() - t0
         plan_text = plan_res["message"] if plan_res["status"] == "success" else ""
         result["phases"]["plan"] = {
@@ -411,8 +559,8 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
             return result
 
         start_col = pipeline_obj.get("start_collection")
-        pipeline = pipeline_obj.get("pipeline", [])
-        json_str = json.dumps(pipeline_obj)
+        pipeline = sanitize_pipeline(pipeline_obj.get("pipeline", []))
+        json_str = json.dumps(pipeline)
         forbidden_keys = ["$group", "$count", "$sort", "$limit", "$divide", "$cond", "$out", "$merge"]
         violations = [f for f in forbidden_keys if f in json_str]
 
@@ -587,6 +735,12 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
         try:
             exec(echarts_code, ns2, ns2)
             option = ns2.get("option")
+            # 空殼救援:LLM 偶爾產 series=[] / xAxis.data=[] 的空 option
+            if isinstance(option, dict):
+                option, rescued = rescue_empty_echarts(option, Q)
+                if rescued:
+                    print(f"   🛟 rescue_empty_echarts 啟動,從 Q pivot 補回 series")
+                    c_retry_log.append(f"attempt {c_attempt + 1}: rescued from empty option")
             plot_err = None
             print(f"   attempt {c_attempt + 1} ({c_elapsed:.1f}s) ✅ exec OK")
             break
@@ -685,6 +839,110 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
             if case.get("echarts_should_have_visualmap"):
                 has_vm = "visualMap" in option
                 result["checks"].append(check("含 visualMap (heatmap 用)", has_vm))
+
+            # ───── STK 專屬新檢查 ─────
+            xaxis_data = option.get("xAxis", {}).get("data") if isinstance(option.get("xAxis"), dict) else None
+
+            if case.get("echarts_xaxis_unique"):
+                if isinstance(xaxis_data, list):
+                    has_dup = len(xaxis_data) != len(set(map(str, xaxis_data)))
+                    result["checks"].append(check(
+                        "xAxis.data 無重複",
+                        not has_dup,
+                        f"actual: {xaxis_data}" if has_dup else f"len={len(xaxis_data)}"
+                    ))
+                else:
+                    result["checks"].append(check("xAxis.data 是 list", False, f"type={type(xaxis_data).__name__}"))
+
+            if case.get("echarts_data_length_aligned"):
+                if isinstance(xaxis_data, list):
+                    x_len = len(xaxis_data)
+                    series_lens = [len(s.get("data", [])) for s in option.get("series", [])]
+                    aligned = all(L == x_len for L in series_lens)
+                    result["checks"].append(check(
+                        f"所有 series.data 長度 == xAxis.data 長度 ({x_len})",
+                        aligned,
+                        f"series lens: {series_lens}"
+                    ))
+
+            if case.get("echarts_yaxis_max"):
+                expected_max = case["echarts_yaxis_max"]
+                yaxis = option.get("yAxis", {})
+                actual_max = yaxis.get("max") if isinstance(yaxis, dict) else None
+                result["checks"].append(check(
+                    f"yAxis.max == {expected_max} (100% stacked 應鎖頂)",
+                    actual_max == expected_max,
+                    f"actual: {actual_max}"
+                ))
+
+            if case.get("echarts_series_count_max"):
+                max_s = case["echarts_series_count_max"]
+                actual_s = len(option.get("series", []))
+                result["checks"].append(check(
+                    f"series 數 ≤ {max_s} (避免維度爆炸)",
+                    actual_s <= max_s,
+                    f"actual: {actual_s}"
+                ))
+
+            if case.get("echarts_no_placeholder_series_name"):
+                # 啟發式偵測 placeholder name:單個英文/中文字母 + 數字/字母組合
+                import re as _re
+                placeholder_patterns = [
+                    _re.compile(r"^(類別|category|series|group|item|state)\s*[a-z0-9]$", _re.IGNORECASE),
+                    _re.compile(r"^<\w+>$"),  # angle bracket placeholder
+                ]
+                names = [str(s.get("name", "")) for s in option.get("series", [])]
+                bad = [n for n in names if any(p.match(n) for p in placeholder_patterns)]
+                result["checks"].append(check(
+                    "series.name 非 placeholder (類別 A/Category 1/<col> 等)",
+                    len(bad) == 0,
+                    f"placeholder 名: {bad}" if bad else f"names: {names}"
+                ))
+
+            # 橫向 bar 專屬檢查
+            if case.get("echarts_should_have_yaxis_category"):
+                yax = option.get("yAxis", {})
+                is_cat = isinstance(yax, dict) and yax.get("type") == "category"
+                result["checks"].append(check(
+                    "yAxis.type == 'category' (橫向 bar)",
+                    is_cat,
+                    f"actual yAxis: {yax}" if not is_cat else "✓"
+                ))
+
+            if case.get("echarts_should_have_xaxis_value"):
+                xax = option.get("xAxis", {})
+                is_val = isinstance(xax, dict) and xax.get("type") == "value"
+                result["checks"].append(check(
+                    "xAxis.type == 'value' (橫向 bar)",
+                    is_val,
+                    f"actual xAxis: {xax}" if not is_val else "✓"
+                ))
+
+            if case.get("echarts_data_length_aligned_horizontal"):
+                yax_data = option.get("yAxis", {}).get("data") if isinstance(option.get("yAxis"), dict) else None
+                if isinstance(yax_data, list):
+                    y_len = len(yax_data)
+                    series_lens = [len(s.get("data", [])) for s in option.get("series", [])]
+                    aligned = all(L == y_len for L in series_lens)
+                    result["checks"].append(check(
+                        f"橫向時 series.data 長度 == yAxis.data 長度 ({y_len})",
+                        aligned,
+                        f"series lens: {series_lens}"
+                    ))
+                else:
+                    result["checks"].append(check("yAxis.data 是 list (橫向)", False))
+
+            if case.get("echarts_no_nan_in_data"):
+                import math as _math
+                has_nan = any(
+                    any(isinstance(v, float) and _math.isnan(v) for v in s.get("data", []))
+                    for s in option.get("series", [])
+                )
+                result["checks"].append(check(
+                    "series.data 不含 NaN (應 fillna(0))",
+                    not has_nan,
+                ))
+            # ───── /STK 專屬檢查 ─────
 
             # 檢查是否有禁忌 lambda / function
             code_lower = echarts_code.lower()
@@ -846,12 +1104,38 @@ def format_markdown_report(results: list[dict]) -> str:
 # Main
 # ============================================================
 def main() -> int:
+    parser = argparse.ArgumentParser(description="GenBI headless test runner")
+    parser.add_argument(
+        "--filter",
+        default="",
+        help="只跑 id 前綴符合的 case (例: --filter STK 只跑 STK-* 案例)",
+    )
+    parser.add_argument(
+        "--only",
+        default="",
+        help="只跑指定 id (逗號分隔,例: --only STK-01,STK-04)",
+    )
+    args = parser.parse_args()
+
+    selected_cases = TEST_CASES
+    if args.only:
+        wanted = {x.strip() for x in args.only.split(",") if x.strip()}
+        selected_cases = [c for c in TEST_CASES if c["id"] in wanted]
+    elif args.filter:
+        prefix = args.filter.strip()
+        selected_cases = [c for c in TEST_CASES if c["id"].startswith(prefix)]
+
+    if not selected_cases:
+        print(f"❌ 沒有符合 filter='{args.filter}' only='{args.only}' 的 case")
+        return 1
+
     banner(" tFlex GenBI · Test Runner ", "═")
 
     print(f"LLM       : {OLLAMA_URL}")
     print(f"Model     : {OLLAMA_MODEL}")
     print(f"MongoDB   : {MONGO_URI}{MONGO_DB}")
-    print(f"Cases     : {len(TEST_CASES)} 個")
+    print(f"Cases     : {len(selected_cases)} / {len(TEST_CASES)} 個"
+          + (f"  (filter={args.filter or args.only})" if (args.filter or args.only) else ""))
     print(f"Timeout   : {OLLAMA_TIMEOUT}s\n")
 
     print("⏱️  第一個 case 會包含模型 warm-up (預期 30-90s),後續會快很多。\n")
@@ -876,7 +1160,7 @@ def main() -> int:
 
     results = []
     total_start = time.time()
-    for case in TEST_CASES:
+    for case in selected_cases:
         case_wall_t0 = time.time()
         try:
             llm.reset_call_log()
