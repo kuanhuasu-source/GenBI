@@ -61,7 +61,9 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 全域 6 個 prompt_key
+# 全域 5 個 LLM phase prompt_key
+# meta_response 為 0 LLM call 的 metadata-driven Markdown builder,
+# 直接走 Python code,不需要 prompt template。
 # ============================================================
 PROMPT_KEYS = {
     "phase_0_plan",
@@ -69,7 +71,6 @@ PROMPT_KEYS = {
     "phase_b_preprocess",
     "phase_c_echarts",
     "phase_d_insight",
-    "meta_response",
 }
 
 
