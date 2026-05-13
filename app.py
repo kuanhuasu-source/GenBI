@@ -283,23 +283,112 @@ if "last_analysis" not in st.session_state:
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
 
-# LLMService 用 session_state 快取避免重複建立 OpenAI client
-if "llm_service" not in st.session_state:
-    st.session_state.llm_service = LLMService(
+mongo_db, mongo_err = get_mongo_db()
+
+# ─────────────────────────────────────────────────────────
+# v0.3.0+ Prompt / Metadata Repository(共用,所有 LLM call 走這條)
+# ─────────────────────────────────────────────────────────
+# 1) 啟動時建一次 repo,接 MongoDB(失敗自動 fallback 到 embedded)
+import embedded_metadata  # noqa: F401 — auto-merges metadata into EMBEDDED_PROMPTS
+
+if "prompt_repo" not in st.session_state:
+    from prompt_repository import build_default_repo
+    st.session_state.prompt_repo = build_default_repo(mongo_db=mongo_db)
+
+# 2) 預設 active domain — 第一次啟動取 embedded 列表第一個(通常是 tflex)
+if "active_domain" not in st.session_state:
+    _available = st.session_state.prompt_repo.list_active_domains()
+    st.session_state.active_domain = _available[0] if _available else "tflex"
+
+# 3) 用 active domain 建 LLMService。LLMService 內部會接 prompt_repo 走模板讀取
+def _build_llm_service_for_domain(domain: str) -> LLMService:
+    """為指定 domain 建一個新的 LLMService(切換 domain 時呼叫)。"""
+    try:
+        task_md = st.session_state.prompt_repo.get_metadata(domain)
+    except KeyError:
+        # Fallback to default tflex metadata if domain not found
+        task_md = None
+    return LLMService(
         api_url=LLM_API_URL,
         api_key=LLM_API_KEY,
         model_name=LLM_MODEL,
         timeout_s=LLM_TIMEOUT_S,
         default_temperature=LLM_TEMPERATURE,
+        task_metadata=task_md,
+        prompt_repo=st.session_state.prompt_repo,
+        domain=domain,
+    )
+
+if "llm_service" not in st.session_state:
+    st.session_state.llm_service = _build_llm_service_for_domain(
+        st.session_state.active_domain
     )
 llm_service = st.session_state.llm_service
-
-mongo_db, mongo_err = get_mongo_db()
 
 # ============================================================
 # 🧭 Sidebar:資料源狀態 + 切換
 # ============================================================
 with st.sidebar:
+    # ─────────────────────────────────────────────────────────
+    # 🌐 Active Domain switcher(v0.3.0+)
+    # ─────────────────────────────────────────────────────────
+    st.markdown("### 🌐 Active Domain")
+    _available_domains = (
+        st.session_state.prompt_repo.list_active_domains() or [st.session_state.active_domain]
+    )
+    try:
+        _current_idx = _available_domains.index(st.session_state.active_domain)
+    except ValueError:
+        _current_idx = 0
+
+    _selected_domain = st.selectbox(
+        "選擇要分析的 domain",
+        options=_available_domains,
+        index=_current_idx,
+        key="_domain_selector",
+        label_visibility="collapsed",
+        help="切換 domain 會清空目前對話脈絡並載入該 domain 的 metadata。",
+    )
+
+    # 偵測使用者選了不同 domain → 進入 confirm 流程
+    if _selected_domain != st.session_state.active_domain:
+        st.session_state._pending_domain = _selected_domain
+
+    # Confirm dialog(inline,不用 modal,相容所有 Streamlit 版本)
+    _pending = st.session_state.get("_pending_domain")
+    if _pending and _pending != st.session_state.active_domain:
+        st.warning(
+            f"⚠️ 切換到 **{_pending}** 會:\n"
+            f"- 清空目前對話脈絡({len(st.session_state.messages)} 則訊息 + 接續分析狀態)\n"
+            f"- 重新載入 LLM service 使用 {_pending} 的 schema / KPI 定義"
+        )
+        _c1, _c2 = st.columns(2)
+        if _c1.button("✅ 確認切換", type="primary", use_container_width=True):
+            st.session_state.llm_service = _build_llm_service_for_domain(_pending)
+            llm_service = st.session_state.llm_service
+            st.session_state.active_domain = _pending
+            st.session_state.messages = []
+            st.session_state.last_analysis = None
+            st.session_state.pending_query = None
+            del st.session_state._pending_domain
+            st.toast(f"🌐 已切換到 {_pending}", icon="✅")
+            st.rerun()
+        if _c2.button("✖ 取消", use_container_width=True):
+            del st.session_state._pending_domain
+            st.rerun()
+    else:
+        # 沒有 pending 時顯示當前 domain 的小摘要
+        try:
+            _md = st.session_state.prompt_repo.get_metadata(st.session_state.active_domain)
+            _name = _md.get("dataset_name") or _md.get("dataset_id") or st.session_state.active_domain
+            _n_coll = len((_md.get("collections") or {}))
+            _n_kpi = len((_md.get("kpi_definitions") or {}))
+            st.caption(f"📦 {_name} · {_n_coll} collections · {_n_kpi} KPIs")
+        except Exception:
+            st.caption(f"📦 {st.session_state.active_domain}")
+
+    st.divider()
+
     st.header("🔧 系統狀態")
 
     st.markdown(f"**LLM ({LLM_PROVIDER})**")
@@ -448,12 +537,18 @@ if query:
             "</span>"
             if is_followup else ""
         )
+        _domain_tag = (
+            f"<span style='background:#8B2C2E;color:#FFF7E8;font-size:0.7rem;"
+            f"padding:2px 8px;border-radius:10px;margin-left:8px;font-weight:500'>"
+            f"🌐 {st.session_state.active_domain}"
+            f"</span>"
+        )
         st.markdown(
             f"""<div style='background:#FFF7E8;border-left:4px solid #D9342B;
                            padding:12px 18px;border-radius:6px;margin-bottom:14px;'>
                   <div style='font-size:0.78rem;color:#8B6F4A;font-weight:600;
                               letter-spacing:0.5px;text-transform:uppercase;'>
-                    🍳 Current question{_followup_tag}
+                    🍳 Current question{_domain_tag}{_followup_tag}
                   </div>
                   <div style='font-size:1.08rem;color:#2A1810;margin-top:4px;
                               line-height:1.5;'>{query}</div>
