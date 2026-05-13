@@ -59,18 +59,20 @@ def main():
 
     # 處理 --latest
     if args.latest:
-        query = {}
-        if args.domain:
-            query["domain"] = args.domain
-        latest = db[config.TEST_RUNS_COLLECTION].find_one(
-            query, sort=[("started_at", -1)]
-        )
+        latest = repo.get_latest(domain=args.domain or None)
         if not latest:
             print(f"❌ 找不到任何 run"
                   + (f"(domain={args.domain})" if args.domain else ""))
             return 1
         target_run_id = latest["run_id"]
         print(f"🎯 Latest run = {target_run_id} (domain={latest.get('domain','?')})")
+        # 若有其他 domain 的 baseline,提醒一下
+        target_domain = latest.get("domain")
+        if target_domain and not args.unmark:
+            existing = repo.get_baseline(domain=target_domain)
+            if existing and existing.get("run_id") != target_run_id:
+                print(f"⚠️  注意:domain={target_domain} 已有舊 baseline = "
+                      f"{existing['run_id']},此操作會 implicit 取代它")
     else:
         if not args.run_id:
             print("❌ 請提供 run_id 或 --latest")

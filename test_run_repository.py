@@ -165,16 +165,29 @@ class TestRunRepository:
     def get_by_run_id(self, run_id: str) -> Optional[dict]:
         return self._coll.find_one({"run_id": run_id})
 
-    def get_baseline(self) -> Optional[dict]:
-        """目前的 baseline(可能有多筆,取最新一筆)。"""
-        return self._coll.find_one(
-            {"is_baseline": True},
-            sort=[("started_at", -1)],
-        )
+    def get_baseline(self, domain: Optional[str] = None) -> Optional[dict]:
+        """目前 active baseline(per domain)。
 
-    def get_latest(self) -> Optional[dict]:
-        """最後一次跑(可能不是 baseline)。"""
-        return self._coll.find_one({}, sort=[("started_at", -1)])
+        Args:
+            domain: 若提供,只回該 domain 的 baseline。
+                    None → 回任何 domain 的最新 baseline(向下相容)。
+
+        為什麼要 per-domain:
+            不同 domain(tflex / ecommerce / healthcare)的 cases / metadata / KPI
+            計算邏輯都不同,跨 domain 比 pass rate / token 是沒意義的。
+            每個 domain 應該有自己的 baseline。
+        """
+        query = {"is_baseline": True}
+        if domain:
+            query["domain"] = domain
+        return self._coll.find_one(query, sort=[("started_at", -1)])
+
+    def get_latest(self, domain: Optional[str] = None) -> Optional[dict]:
+        """最後一次跑(可能不是 baseline)。可選 domain 過濾。"""
+        query = {}
+        if domain:
+            query["domain"] = domain
+        return self._coll.find_one(query, sort=[("started_at", -1)])
 
     def mark_as_baseline(self, run_id: str, notes: str = "") -> bool:
         """標某筆為 baseline。同時間可存在多個 baseline(代表不同階段的對照點)。
@@ -257,8 +270,18 @@ class TestRunRepository:
         }
 
     def compare_with_baseline(self, run_id: str) -> Optional[dict]:
-        """指定 run vs 當前 baseline。"""
-        baseline = self.get_baseline()
+        """指定 run vs 該 run 對應 domain 的 baseline。
+
+        自動讀 run.domain 然後找該 domain 的 baseline。
+        若 run 沒記錄 domain(舊資料),fallback 拿任何 baseline。
+        """
+        target = self.get_by_run_id(run_id)
+        if not target:
+            return None
+        baseline = self.get_baseline(domain=target.get("domain"))
+        if not baseline:
+            # Fallback:沒 domain 過濾的 baseline
+            baseline = self.get_baseline()
         if not baseline:
             return None
         return self.compare(baseline["run_id"], run_id)

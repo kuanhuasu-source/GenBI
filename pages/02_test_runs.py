@@ -119,7 +119,9 @@ except Exception as e:
 # ============================================================
 # Top — 概覽 metric
 # ============================================================
-baseline = run_repo.get_baseline()
+# baseline 跟 latest 都按當前過濾的 domain 取(若 "(all)" 則不過濾)
+_domain_filter = None if selected_domain == "(all)" else selected_domain
+baseline = run_repo.get_baseline(domain=_domain_filter)
 latest = runs[0] if runs else None
 
 mc1, mc2, mc3, mc4 = st.columns(4)

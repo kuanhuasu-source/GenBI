@@ -63,26 +63,32 @@ def main():
     from test_run_repository import TestRunRepository
     repo = TestRunRepository(mongo_db=db, collection=config.TEST_RUNS_COLLECTION)
 
-    # 預設 a = baseline, b = latest
-    if not args.a:
-        baseline = repo.get_baseline()
-        if not baseline:
-            print("❌ 沒有設定 baseline,請先 `python admin/mark_baseline.py --latest ...`")
-            return 1
-        args.a = baseline["run_id"]
-
+    # 預設 b = latest (該 domain)
     if not args.b:
-        query = {}
-        if args.domain:
-            query["domain"] = args.domain
-        latest = db[config.TEST_RUNS_COLLECTION].find_one(
-            query, sort=[("started_at", -1)]
-        )
+        latest = repo.get_latest(domain=args.domain or None)
         if not latest:
             print(f"❌ 找不到任何 run"
                   + (f"(domain={args.domain})" if args.domain else ""))
             return 1
         args.b = latest["run_id"]
+        # 若使用者沒指定 domain,從 latest run 自動推斷
+        if not args.domain:
+            args.domain = latest.get("domain") or ""
+
+    # 預設 a = 同 domain 的 baseline
+    if not args.a:
+        baseline = repo.get_baseline(domain=args.domain or None)
+        if not baseline:
+            msg = "❌ 沒有設定 baseline"
+            if args.domain:
+                msg += f" for domain={args.domain}"
+            msg += ",請先 `python admin/mark_baseline.py --latest"
+            if args.domain:
+                msg += f" --domain {args.domain}"
+            msg += '`'
+            print(msg)
+            return 1
+        args.a = baseline["run_id"]
 
     if args.a == args.b:
         print(f"⚠️  a 跟 b 是同一筆 run ({args.a}),沒得比")
