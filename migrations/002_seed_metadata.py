@@ -33,7 +33,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
-from embedded_metadata import EMBEDDED_METADATA, list_embedded_domains
+from embedded_metadata import (
+    EMBEDDED_METADATA, list_embedded_domains, load_test_fixture_metadata,
+)
 
 
 def main():
@@ -43,6 +45,9 @@ def main():
                         help="若已有 active 版本,仍插新版並 activate")
     parser.add_argument("--domain", default="",
                         help="只 seed 此 domain(預設全部)")
+    parser.add_argument("--include-test-fixtures", action="store_true",
+                        help="把 v0.2.x 的 ecommerce / healthcare 測試 fixture metadata "
+                             "也 seed 進 DB(預設只 seed production domains)")
     parser.add_argument("--user", default="migration_002")
     args = parser.parse_args()
 
@@ -50,22 +55,33 @@ def main():
     print(" Migration 002 · Seed metadata into MongoDB")
     print("═" * 60)
 
-    print(f"\n📦 embedded_metadata.py 含有 {len(EMBEDDED_METADATA)} 個 domain:\n")
-    for domain, n_coll in list_embedded_domains():
+    # 組要 seed 的 source dict
+    source = dict(EMBEDDED_METADATA)  # 預設 production
+    if args.include_test_fixtures:
+        fixtures = load_test_fixture_metadata()
+        print(f"\n🧪 --include-test-fixtures: 加入 {len(fixtures)} 個 v0.2.x 測試 metadata")
+        for d in fixtures:
+            print(f"   • {d}")
+        source.update(fixtures)
+
+    print(f"\n📦 將 seed 的 domain 共 {len(source)} 個:\n")
+    for domain in sorted(source.keys()):
+        n_coll = len((source[domain].get("collections") or {}))
         marker = " ← 過濾選中" if args.domain and args.domain == domain else ""
         print(f"   {domain:15s}  {n_coll:>3d} collections{marker}")
 
-    if not EMBEDDED_METADATA:
-        print("\n⚠️  EMBEDDED_METADATA 是空的 — 沒東西可 seed")
+    if not source:
+        print("\n⚠️  沒東西可 seed")
         return 0
 
     # 過濾
     targets = {
-        d: md for d, md in EMBEDDED_METADATA.items()
+        d: md for d, md in source.items()
         if not args.domain or d == args.domain
     }
     if args.domain and not targets:
-        print(f"\n❌ 找不到 domain {args.domain!r}")
+        print(f"\n❌ 找不到 domain {args.domain!r}"
+              f"{' (試試 --include-test-fixtures)' if args.domain in ('ecommerce','healthcare') else ''}")
         return 1
 
     if args.dry_run:

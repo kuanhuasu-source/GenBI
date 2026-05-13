@@ -82,8 +82,11 @@ if mongo_db is None:
 with st.sidebar:
     st.markdown("### 🌐 Domain")
     available = prompt_repo.list_active_domains() or ["tflex"]
+    # tflex 永遠優先 default
     if "metadata_admin_domain" not in st.session_state:
-        st.session_state.metadata_admin_domain = available[0]
+        st.session_state.metadata_admin_domain = (
+            "tflex" if "tflex" in available else available[0]
+        )
 
     domain = st.selectbox(
         "Active domain",

@@ -92,7 +92,10 @@ with st.sidebar:
     st.markdown("### 🌐 Domain")
     _domains = case_repo.list_domains_with_cases() or ["tflex"]
     if "tc_domain" not in st.session_state:
-        st.session_state.tc_domain = _domains[0]
+        # tflex 永遠優先 default(v0.3.1+)
+        st.session_state.tc_domain = (
+            "tflex" if "tflex" in _domains else _domains[0]
+        )
     domain = st.selectbox(
         "Active domain",
         options=_domains,

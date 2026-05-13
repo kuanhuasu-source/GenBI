@@ -295,10 +295,16 @@ if "prompt_repo" not in st.session_state:
     from prompt_repository import build_default_repo
     st.session_state.prompt_repo = build_default_repo(mongo_db=mongo_db)
 
-# 2) 預設 active domain — 第一次啟動取 embedded 列表第一個(通常是 tflex)
+# 2) 預設 active domain — tflex 永遠優先(v0.3.1+)
+#    若 tflex 不存在 → 才退到 list 第一個 → 都沒才 hardcode 'tflex'
 if "active_domain" not in st.session_state:
     _available = st.session_state.prompt_repo.list_active_domains()
-    st.session_state.active_domain = _available[0] if _available else "tflex"
+    if "tflex" in _available:
+        st.session_state.active_domain = "tflex"
+    elif _available:
+        st.session_state.active_domain = _available[0]
+    else:
+        st.session_state.active_domain = "tflex"
 
 # 3) 用 active domain 建 LLMService。LLMService 內部會接 prompt_repo 走模板讀取
 def _build_llm_service_for_domain(domain: str) -> LLMService:
