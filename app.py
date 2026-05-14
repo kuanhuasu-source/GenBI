@@ -687,6 +687,16 @@ if query:
                     exec(prep_code, workflow_namespace, workflow_namespace)
                     if "Q" not in workflow_namespace:
                         raise ValueError("LLM 未在最外層宣告變數 Q!")
+                    # 🛡️ Phase B Series 救援(v0.3.6+):
+                    #   若 LLM 不小心讓 Q 變成 Series(例如 Q = raw_df.groupby(...).size() 沒 reset_index),
+                    #   自動 to_frame() 轉回 DataFrame,避免 'Series has no attribute columns' 等下游崩潰
+                    _Q_obj = workflow_namespace["Q"]
+                    if isinstance(_Q_obj, pd.Series):
+                        st.warning(
+                            f"⚠️ Phase B 安全網:Q 是 Series(name={_Q_obj.name!r}),"
+                            f"自動 to_frame() 轉回 DataFrame。建議 prompt 提醒 `reset_index()`。"
+                        )
+                        workflow_namespace["Q"] = _Q_obj.to_frame().reset_index()
                     # 🛡️ Phase B 安全網:救援忘記終態指派的情況
                     fallback_df, recover_msg = try_recover_Q(workflow_namespace, raw_df)
                     if recover_msg:

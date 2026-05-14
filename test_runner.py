@@ -634,6 +634,13 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
         try:
             exec(prep_code, ns, ns)
             Q = ns.get("Q")
+            # 🛡️ Phase B Series 救援(v0.3.6+):
+            # 若 Q 是 Series(LLM 漏 reset_index),自動 to_frame() 避免下游
+            # 'Series has no attribute columns' 等 AttributeError
+            if isinstance(Q, pd.Series):
+                print(f"   ⚠️ Q 是 Series(name={Q.name!r}),自動 to_frame().reset_index()")
+                Q = Q.to_frame().reset_index()
+                ns["Q"] = Q
             # 🛡️ Phase B 安全網:救援忘記終態指派
             fallback_df, recover_msg = try_recover_Q(ns, raw_df)
             if recover_msg:

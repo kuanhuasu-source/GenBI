@@ -465,6 +465,77 @@ def build_followup_preamble(last_analysis: dict) -> str:
 """
 
 
+def extract_json_block(text: str) -> str:
+    """
+    從 LLM 回應中找出第一個 balanced `{...}` JSON block,跳過任何 preamble。
+
+    為什麼需要這個(v0.3.6+):
+    Phase A 的 LLM 回應有時會夾雜:
+      - 自然語言 preamble(「根據您的需求...」「以下是符合要求的...」)
+      - Markdown headers(「### A. 資料獲取:」)
+      - Code fence(```json ... ```)
+      - 結尾說明(「以上為完整 pipeline...」)
+    `json.loads(raw)` 會在這些 noise 上炸掉。
+
+    這個 utility **不靠 model 行為**,純文字 parsing:
+      1. 跳過所有 `{` 之前的內容
+      2. 用 balanced-brace 演算法找出第一個完整 JSON object
+      3. 處理嵌套 `{}` 跟字串內的 `"`
+
+    Returns:
+        提取到的 JSON 字串(可直接 `json.loads()`)。若找不到合法 block,
+        回傳 stripped 原文(讓 caller 自行錯誤處理,行為跟原本一致)。
+
+    通用性:不 hardcode 任何 model 名稱或 preamble 字眼。所有 model 都適用。
+    """
+    if not text:
+        return ""
+
+    # 先 strip 常見 code fence 開頭(```json 或 ```)
+    s = text.strip()
+    if s.startswith("```"):
+        # 找下一個換行,跳過 fence header
+        nl = s.find("\n")
+        if nl > 0:
+            s = s[nl + 1:]
+        # 如果有結尾 ```,砍掉
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3].rstrip()
+
+    # 找第一個 `{`
+    start = s.find("{")
+    if start < 0:
+        return text  # 沒 JSON object,回原文讓 caller 報錯
+
+    # Balanced-brace 演算法 + 字串感知
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                # 找到 balanced block
+                return s[start:i + 1]
+
+    # 沒找到 balanced(LLM 截斷?),回 partial
+    return s[start:]
+
+
 def sanitize_pipeline(pipeline: list) -> list:
     """
     結構性防禦:strip whitespace + 補回漏掉的 `$` 前綴。
@@ -1202,15 +1273,56 @@ class LLMService:
     # --------------------------------------------------------
     def generate_pipeline(self, query, plan_text="",
                           previous_code: str = "", previous_error: str = ""):
+        """
+        產 MongoDB pipeline JSON。
+
+        v0.3.6+ 改善:
+        - 透過 `extract_json_block` 防衛性 parsing,容忍 LLM 加 preamble / code fence
+        - 加 retry loop:JSON parse 失敗時帶錯誤訊息重生(最多 2 次,共 3 attempts)
+        """
+        import json as _json
         system_prompt = self._render_phase_a_pipeline_prompt()
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error)
-        raw = self._call_llm(
-            [{"role": "system", "content": system_prompt},
-             {"role": "user", "content": user_msg}],
-            phase="pipeline",
-        )
-        return self._strip_code_fence(raw, lang="json")
+
+        last_raw = ""
+        last_err = ""
+        for attempt in range(3):
+            raw = self._call_llm(
+                [{"role": "system", "content": system_prompt},
+                 {"role": "user", "content": user_msg}],
+                phase="pipeline",
+            )
+            last_raw = raw
+            # 第一步:strip code fence
+            stripped = self._strip_code_fence(raw, lang="json")
+            # 第二步:defensive extract balanced {...} block
+            extracted = extract_json_block(stripped)
+            # 第三步:驗證能 parse
+            try:
+                _json.loads(extracted)
+                # OK,回傳清乾淨的 JSON 字串給上層
+                return extracted
+            except _json.JSONDecodeError as e:
+                last_err = (
+                    f"JSONDecodeError: {e}\n"
+                    f"你回覆的前 200 字元:\n{stripped[:200]}"
+                )
+                # 第二三次 attempt:把錯誤訊息 + 嚴格指令塞進 user_msg
+                if attempt < 2:
+                    user_msg = (
+                        f"需求:{query}\n計畫:{plan_text}\n\n"
+                        f"### 🔁 自我修正提示(JSON parse 失敗)\n"
+                        f"你上次回覆無法被 `json.loads()` 解析。錯誤:\n"
+                        f"```\n{last_err}\n```\n\n"
+                        f"⚠️【強制要求】請只輸出純 JSON,**第一個字元必須是 `{{`**。\n"
+                        f"- 不要寫「根據您的需求...」「以下是...」之類前言\n"
+                        f"- 不要寫 `### A. 資料獲取:` 之類 markdown header\n"
+                        f"- 不要包 ```json fence(雖然系統會 strip,但別依賴)\n"
+                        f"- JSON 必須含 `start_collection` (string) 與 `pipeline` (array) 兩 key\n"
+                    )
+        # 3 attempts 都失敗 — 回傳最後一次原文(維持 v0.3.5 行為,讓下游報錯)
+        return last_raw
 
     def _render_phase_a_pipeline_prompt(self) -> str:
         """產生 Phase A pipeline system prompt(repo → inline fallback)。"""
@@ -1229,13 +1341,27 @@ class LLMService:
         return self._inline_phase_a_pipeline_prompt()
 
     def _inline_phase_a_pipeline_prompt(self) -> str:
-        """v0.2.x 行為 inline f-string 副本。"""
+        """v0.3.6+ inline f-string 副本(同步 embedded 模板更新)。"""
         return f"""你是精通 MongoDB 的資料庫工程師,負責【A. 資料獲取】。
 {self.domain_knowledge}
 
 ### 實作守則 (CRITICAL RULES):
-1. 【輸出格式】(CRITICAL FATAL) 必須輸出合法 JSON,包含 `start_collection` (字串) 與 `pipeline` (陣列),
-   除 JSON 外不要包含任何說明文字。
+1. 🚨【輸出格式】(CRITICAL FATAL — 最容易出錯)
+   你的回覆**第一個字元必須是 `{{`**,最後一個字元必須是 `}}`。
+   除 JSON 外不要包含任何說明文字、markdown header、code fence。
+
+   JSON 必須含兩個 top-level keys:
+   - `"start_collection"`: 字串(主表名)
+   - `"pipeline"`: 陣列(aggregation stages)
+
+   ❌ 絕對禁止下列前綴 / 後綴(下游 `json.loads()` 會炸):
+   - 「根據您的需求,以下是 ...」
+   - 「以下是符合要求的 JSON ...」
+   - 「### A. 資料獲取:」 / 「## Phase A」 之類 markdown header
+   - ` ```json ` / ` ``` ` code fence wrapper
+   - 結尾「以上即為完整 pipeline」之類說明
+
+   ✅ 正確結構就是直接 JSON object,從 `{{` 開始,以 `}}` 結束。
 2. 🔗【關聯鐵律】當 KPI 公式需要其他 collection 的欄位 (參照上方 relationships),
    必須 `$lookup` 該表並緊接 `$unwind` (使用 `preserveNullAndEmptyArrays: true`)。
 3. 🚫【禁止寫入】禁止 `$out`、`$merge`。
