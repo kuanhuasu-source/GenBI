@@ -5,6 +5,111 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.4.3] · 2026-05-14 — Phase 0 false positive refusal 防線
+
+**Patch · 修 pie chart H/C query 被誤判為 data_limitations 違規。**
+
+### 🐛 修正
+
+實際例:「請依照 Company Code:TSA,TWT,TSU,TDI,TDC,計算員工數量(H/C),並以圓餅圖呈現」被 Plan LLM 誤拒,理由是「缺少 application date,無法執行 圓餅圖呈現」 — 但實際上 pie chart 跟 application date 完全無關,且 `tflex_company_hc` 表本身就有 `company_code` + `hc` 兩個欄位,可以直接畫圖。
+
+**三層防線**:
+
+- **Step 1 加鐵律**:「圖型詞」(圓餅圖 / pie / bar / line / heatmap / scatter / stacked bar)**完全不參與 refuse 判斷**。明確列出 6 大類圖型詞,避免 LLM 把「pie chart 通常需要時間軸」這種訓練資料偏見帶進來。
+- **新增「拒絕前的最後檢查」**:Step 3 通過後還要驗證引用的 `missing_dimension` / `not_supported_analysis` 是否真的對應 query 中明確提及的需求。引用不一致(只是湊理由)→ 撤回拒絕,走計畫。
+- **新增反例 4**:H/C pie chart query 作為「絕對不可拒絕」的訓練範例,內含完整的三步推理過程,直接呼應實際失敗 case。
+- **軟化「多類別比較禁止 pie chart」**:改成 type-aware 路由:類別數 ≤ 7 + 點名 pie → 走 pie;> 7 → 建議改 bar 但仍走計畫;明確標註「pie chart 適不適合」是視覺化建議、不是拒絕理由。
+
+### 📐 改動範圍
+
+- `embedded_prompts.py` · `_PHASE_0_PLAN_TEMPLATE`(rule 加固 + 反例 4)
+- `llm_service.py` · `_inline_phase_0_plan_prompt()`(byte-equal 同步 3,247 chars)
+- 三個 prompt(Phase 0 / Phase A / Phase C)的 embedded vs inline 全部 byte-equal
+
+---
+
+## [0.4.2] · 2026-05-14 — Phase C 雙軸 bar+line 強制路由
+
+**Patch · 修 case 01 失敗(雙軸 query 走錯成 KPI 卡片)。**
+
+### 🐛 修正
+
+- **Phase C rule 5.9 新增**:當 query 同時含「絕對量(件數/數量)」+「比率(率/比例/%)」+「比較性副詞(比較/同時看到/vs)」,**必須**走 dual-axis bar+line。完整配方含 `yAxisIndex=0/1` / `min:0,max:100` 比率軸 / smart 0-1 偵測 `* 100`。
+- **Phase C rule 8 收緊**:`_use_table` 嚴禁清單加上「絕對量 + 比率/率/比例」,並明確標 case 01 query 作反例。
+- **`_inline_phase_c_echarts_prompt()` 同步**(byte-equal 21,712 chars,含先前漏接的 v0.3.5 句型擴充)。
+
+### 🎯 預期效果
+
+- case 01「比較各公司的退單率與申請數,我想同時看到絕對量與比率」 → 走 bar+line 雙軸,**不再**走 KPI cards。
+
+---
+
+## [0.4.1] · 2026-05-14 — Phase A `$cond` blacklist
+
+**Patch · 修 case 01 secondary issue($cond 在 `$project` 違規)。**
+
+### 🐛 修正
+
+- **`sanitize_pipeline()` 升級**:回傳改為 `(pipeline, warnings)` tuple。偵測 `$project` / `$addFields` / `$set` 內含派生表達式(`$cond` / `$switch` / `$ifNull` / `$divide` / `$multiply` / `$add` / `$subtract` 等)的欄位 → **自動移除**,讓 Phase B 用 pandas 重算。產生 warning list 給 app 端 toast / runner 端 log。
+- **Phase A prompt 加 rule 5 反例**:派生 operator 完整黑名單(條件類 / 算術類 / 字串類 / 聚合類)+ 「Phase A 撈,Phase B 算」口訣 + JSON 反例 + Python 正解。
+- **`app.py` / `test_runner.py` 接 warnings**:app 走 `st.toast(icon="🧹")`,runner 走 print + 記到 `phases.pipeline.sanitize_warnings`。
+- **`_inline_phase_a_pipeline_prompt()` byte-equal 同步**(2,972 chars)。
+- **新增 4 個 sanitize_pipeline unit test**:`$cond+$divide` strip、clean pipeline 不誤殺、missing `$` 修補、巢狀 `$cond` 偵測。
+
+### 🛠️ Breaking change(內部 API)
+
+- `sanitize_pipeline(pipeline) -> list` → `sanitize_pipeline(pipeline) -> tuple[list, list[str]]`。
+- 所有 caller(app.py / test_runner.py)已同步更新。
+
+---
+
+## [0.4.0] · 2026-05-14 — Export Insight → PPTX
+
+**Minor · 新增「一鍵將分析結果導成單頁 PPTX 報告」功能。**
+
+### ✨ 新功能
+
+- **Phase D 結束後出現 `📤 Export Insight → PPTX` 按鈕**
+  - 點擊後產出單張投影片(16:9):左半為圖表 / 右半為商業洞察
+  - 投影片含品牌條(HR 紅 + 話圖黑)、查詢字串、領域、資料來源、生成時間
+- **支援 6+ 種圖型 → matplotlib 渲染**
+  - Bar(single / grouped / stacked / horizontal)
+  - Line(支援雙軸 twinx)
+  - Pie
+  - Heatmap(imshow + colorbar)
+  - KPI cards(textbox grid 排版)
+  - Table fallback(python-pptx 原生表格 + 斑馬條)
+- **Insight markdown 解析器**:把 Phase D 的 markdown 轉成 python-pptx 段落
+  - 支援 `#` heading、`-/*/+/數字.` bullet、`**bold**` run
+  - bullet 縮排層級依 markdown 縮排自動推斷
+- **跨平台 CJK 字體偵測**(`_pick_font_stack`):
+  - macOS:PingFang TC / Heiti TC / Hiragino Sans GB → Latin+CJK 一次到位
+  - Linux:Noto Sans CJK / Source Han Sans / WenQuanYi
+  - Windows:Microsoft JhengHei / YaHei
+  - 失敗 fallback 到 DejaVu Sans(Latin only)
+
+### 🗂️ 新檔案
+
+- `export_pptx.py` — 全部對外只有兩個函式
+  - `render_chart_to_image(option, Q, chart_engine, fig=None) -> bytes`
+  - `build_report_pptx(query, plan_text, Q, final_option, final_fig, insight_text, ...) -> bytes`
+- `scripts/smoke_export_pptx.py` — 7 個場景 × 人造 Q 的端到端驗證腳本
+
+### 🔧 修改
+
+- `app.py`:
+  - Phase D 後寫 `st.session_state.last_export_payload`
+  - chat 歷史下方新增 Export / Download 按鈕(只在有 payload 時出現)
+- `requirements.txt`:加 `python-pptx>=0.6.21` / `matplotlib>=3.5.0`
+
+### 📐 設計取捨
+
+- **matplotlib 為共通分母**:ECharts option 在 PPTX 端逆向萃取為 matplotlib;Plotly 走 `fig.to_image()`(若 kaleido 缺則 graceful fallback 到表格)。
+- **不依賴 headless browser**:整個 export 是純 Python 程式,啟動 < 0.5s。
+- **section header 用 `▎` 而非 emoji**:emoji 跨平台字體覆蓋差,改用 Latin1 thick bar 視覺等價。
+
+---
+
 ## [0.3.3] · 2026-05-14 — CLI display fix + docs refresh
 
 **Patch · 修正 admin CLI 顯示讓 baseline 對比直觀。**

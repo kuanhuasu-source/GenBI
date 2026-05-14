@@ -32,6 +32,11 @@ test_runner*.log
 test_generality*.log
 test_runner_v*.log
 
+# v0.4.0+: Export PPTX smoke / scratch / dump artifacts
+outputs/
+*.pptx
+!assets/**/*.pptx
+
 # Streamlit
 .streamlit/secrets.toml
 

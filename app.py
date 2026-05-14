@@ -11,6 +11,7 @@ Phase D → Insight    (LLM 產商業洞察文字)
 import os
 import json
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -348,6 +349,10 @@ if "messages" not in st.session_state:
 if "last_analysis" not in st.session_state:
     st.session_state.last_analysis = None
 
+# v0.4.0:Export Insight → 保留最後一次成功跑完的素材(query / Q / option / fig / insight)
+if "last_export_payload" not in st.session_state:
+    st.session_state.last_export_payload = None
+
 # 用於 sample question 按鈕注入到 chat input
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
@@ -552,6 +557,52 @@ for idx, msg in enumerate(st.session_state.messages):
                 st.markdown(msg["insight"])
 
 # ============================================================
+# 📤 v0.4.0 · Export Insight 按鈕 — 只在 last_export_payload 存在時出現
+# ============================================================
+if st.session_state.get("last_export_payload"):
+    _payload = st.session_state.last_export_payload
+    _cols = st.columns([1, 1, 4])
+    with _cols[0]:
+        if st.button("📤 Export Insight → PPTX",
+                     help="將最近一次分析的圖表 + 商業洞察打包成一頁 .pptx 報告",
+                     key="export_insight_btn"):
+            try:
+                from export_pptx import build_report_pptx
+                with st.spinner("📦 正在生成 PPTX 報告..."):
+                    _pptx_bytes = build_report_pptx(
+                        query=_payload["query"],
+                        plan_text=_payload.get("plan_text", ""),
+                        Q=_payload["Q"],
+                        final_option=_payload.get("final_option"),
+                        final_fig=_payload.get("final_fig"),
+                        insight_text=_payload.get("insight_text"),
+                        chart_engine=_payload.get("chart_engine", "ECharts"),
+                        source_label=_payload.get("source_label", ""),
+                        domain=_payload.get("domain", ""),
+                        use_table_fallback=_payload.get("use_table_fallback", False),
+                    )
+                # 把生成的 bytes 暫存到 session 供下方 download_button 取用
+                st.session_state._pptx_bytes = _pptx_bytes
+                st.session_state._pptx_filename = (
+                    f"HR_ChatChart_{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d_%H%M%S')}.pptx"
+                )
+                st.toast("✅ PPTX 已備好,按右側 ⬇️ 下載", icon="📤")
+            except Exception as _exc:
+                st.error(f"❌ 生成 PPTX 失敗:{type(_exc).__name__}: {_exc}")
+                with st.expander("🔍 展開 Traceback"):
+                    st.code(traceback.format_exc(), language="bash")
+    with _cols[1]:
+        if st.session_state.get("_pptx_bytes"):
+            st.download_button(
+                "⬇️ Download PPTX",
+                data=st.session_state._pptx_bytes,
+                file_name=st.session_state.get("_pptx_filename",
+                                                "HR_ChatChart_report.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key="export_insight_download",
+            )
+
+# ============================================================
 # 🚀 核心執行引擎 (Agentic Workflow)
 # ============================================================
 # 極簡開場 — 不顯示預設範例 / 按鈕,引導資訊在使用者主動問時才出現
@@ -695,7 +746,9 @@ if query:
                 raise ValueError(f"LLM 未能回傳合法的 JSON 格式:\n{db_json_str}")
 
             start_collection = db_instruction.get("start_collection")
-            pipeline = sanitize_pipeline(db_instruction.get("pipeline", []))
+            pipeline, _sanitize_warnings = sanitize_pipeline(db_instruction.get("pipeline", []))
+            for _w in _sanitize_warnings:
+                st.toast(_w, icon="🧹")
 
             with st.expander(f"🛠️ 檢視 MongoDB Pipeline (起點: {start_collection})", expanded=False):
                 st.code(json.dumps({"start_collection": start_collection, "pipeline": pipeline},
@@ -945,6 +998,22 @@ if query:
                 "chart_descriptor": chart_descriptor,
                 "is_dashboard": dashboard_mode,
                 "was_followup": is_followup,
+            }
+
+            # ============================================================
+            # 📤 v0.4.0 · Export Insight payload(保留素材,讓使用者按鈕觸發下載)
+            # ============================================================
+            st.session_state.last_export_payload = {
+                "query": query,
+                "plan_text": plan_text,
+                "Q": Q.copy() if isinstance(Q, pd.DataFrame) else Q,
+                "final_option": final_option,
+                "final_fig": final_fig,
+                "insight_text": insight_text,
+                "chart_engine": chart_engine,
+                "source_label": source_label,
+                "domain": st.session_state.get("active_domain", ""),
+                "use_table_fallback": use_table_fallback,
             }
 
         except Exception as e:

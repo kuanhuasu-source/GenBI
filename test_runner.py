@@ -559,7 +559,7 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
             return result
 
         start_col = pipeline_obj.get("start_collection")
-        pipeline = sanitize_pipeline(pipeline_obj.get("pipeline", []))
+        pipeline, sanitize_warnings = sanitize_pipeline(pipeline_obj.get("pipeline", []))
         json_str = json.dumps(pipeline)
         forbidden_keys = ["$group", "$count", "$sort", "$limit", "$divide", "$cond", "$out", "$merge"]
         violations = [f for f in forbidden_keys if f in json_str]
@@ -570,8 +570,13 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
             "pipeline_len": len(pipeline),
             "pipeline_json": pipeline_obj,
             "forbidden_violations": violations,
+            "sanitize_warnings": sanitize_warnings,
         }
         print(f"   ({elapsed:.1f}s) start={start_col}, stages={len(pipeline)}")
+        if sanitize_warnings:
+            print(f"      🧹 sanitize_pipeline 自動清理 {len(sanitize_warnings)} 項:")
+            for _w in sanitize_warnings:
+                print(f"         - {_w}")
         if violations:
             print(f"      ⚠️ DB 端違規 stages: {violations}")
 
