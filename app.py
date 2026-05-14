@@ -557,86 +557,6 @@ for idx, msg in enumerate(st.session_state.messages):
                 st.markdown(msg["insight"])
 
 # ============================================================
-# 📤 v0.4.0 · Export Insight 按鈕 — 永遠顯示,空狀態用 disabled 區隔
-# ============================================================
-_payload = st.session_state.get("last_export_payload")
-_has_payload = bool(_payload)
-
-# 只在使用者已經跟系統互動過(有 messages)時才顯示這個區塊,
-# 避免一進首頁就先看到一坨 button 太擾人
-if st.session_state.messages:
-    st.divider()
-    _cols = st.columns([1.2, 1.2, 3.6])
-
-    with _cols[0]:
-        _gen_clicked = st.button(
-            "📤 Export Insight → PPTX",
-            help=("將最近一次分析的圖表 + 商業洞察打包成一頁 .pptx 報告"
-                  if _has_payload else
-                  "請先跑一次完整分析(Phase A→D 全部成功),按鈕才會啟用"),
-            key="export_insight_btn",
-            disabled=not _has_payload,
-            use_container_width=True,
-        )
-        if _gen_clicked and _has_payload:
-            try:
-                from export_pptx import build_report_pptx
-                with st.spinner("📦 正在生成 PPTX 報告..."):
-                    _pptx_bytes = build_report_pptx(
-                        query=_payload["query"],
-                        plan_text=_payload.get("plan_text", ""),
-                        Q=_payload["Q"],
-                        final_option=_payload.get("final_option"),
-                        final_fig=_payload.get("final_fig"),
-                        insight_text=_payload.get("insight_text"),
-                        chart_engine=_payload.get("chart_engine", "ECharts"),
-                        source_label=_payload.get("source_label", ""),
-                        domain=_payload.get("domain", ""),
-                        use_table_fallback=_payload.get("use_table_fallback", False),
-                    )
-                st.session_state._pptx_bytes = _pptx_bytes
-                st.session_state._pptx_filename = (
-                    f"HR_ChatChart_{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d_%H%M%S')}.pptx"
-                )
-                st.toast("✅ PPTX 已備好,按右側 ⬇️ 下載", icon="📤")
-            except Exception as _exc:
-                st.error(f"❌ 生成 PPTX 失敗:{type(_exc).__name__}: {_exc}")
-                with st.expander("🔍 展開 Traceback"):
-                    st.code(traceback.format_exc(), language="bash")
-
-    with _cols[1]:
-        if st.session_state.get("_pptx_bytes"):
-            st.download_button(
-                "⬇️ Download PPTX",
-                data=st.session_state._pptx_bytes,
-                file_name=st.session_state.get("_pptx_filename",
-                                                "HR_ChatChart_report.pptx"),
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                key="export_insight_download",
-                use_container_width=True,
-            )
-        else:
-            st.button(
-                "⬇️ Download PPTX",
-                disabled=True,
-                help="先按左側 📤 Export Insight 生成 PPTX,這顆按鈕才會啟用",
-                key="export_insight_download_disabled",
-                use_container_width=True,
-            )
-
-    with _cols[2]:
-        if not _has_payload:
-            st.caption(
-                "💡 跑完一次成功的分析(Phase A→D 全綠)後,左邊按鈕會啟用,"
-                "可以匯出單頁 PPTX 報告。"
-            )
-        else:
-            st.caption(
-                f"📊 已備好上次分析:**{(_payload.get('query') or '')[:40]}…** "
-                f"({_payload.get('chart_engine', '?')},領域:{_payload.get('domain', '?')})"
-            )
-
-# ============================================================
 # 🚀 核心執行引擎 (Agentic Workflow)
 # ============================================================
 # 極簡開場 — 不顯示預設範例 / 按鈕,引導資訊在使用者主動問時才出現
@@ -1036,6 +956,8 @@ if query:
 
             # ============================================================
             # 📤 v0.4.0 · Export Insight payload(保留素材,讓使用者按鈕觸發下載)
+            # 注意:實際的 Export / Download button 統一在 script 尾端 render
+            # (見檔尾「📤 Export Insight 區塊」),確保 button click rerun 後仍能進到 handler。
             # ============================================================
             st.session_state.last_export_payload = {
                 "query": query,
@@ -1055,3 +977,83 @@ if query:
             st.error(f"發生系統級錯誤:\n{str(e)}")
             with st.expander("🔍 展開 Traceback"):
                 st.code(traceback.format_exc(), language="bash")
+
+
+# ============================================================
+# 📤 v0.4.0+ · Export Insight 區塊(script 尾端統一渲染)
+# 重要:必須放在所有 if 分支【之外】,任何 rerun(送訊息 / 按 button)都會走到這裡。
+# ============================================================
+_payload = st.session_state.get("last_export_payload")
+_has_payload = bool(_payload)
+
+if st.session_state.messages:
+    st.divider()
+    _cols = st.columns([1.2, 1.2, 3.6])
+
+    with _cols[0]:
+        _gen_clicked = st.button(
+            "📤 Export Insight → PPTX",
+            help=("將最近一次分析的圖表 + 商業洞察打包成一頁 .pptx 報告"
+                  if _has_payload else
+                  "請先跑一次完整分析(Phase A→D 全部成功),按鈕才會啟用"),
+            key="export_insight_btn",
+            disabled=not _has_payload,
+            use_container_width=True,
+        )
+        if _gen_clicked and _has_payload:
+            try:
+                from export_pptx import build_report_pptx
+                with st.spinner("📦 正在生成 PPTX 報告..."):
+                    _pptx_bytes = build_report_pptx(
+                        query=_payload["query"],
+                        plan_text=_payload.get("plan_text", ""),
+                        Q=_payload["Q"],
+                        final_option=_payload.get("final_option"),
+                        final_fig=_payload.get("final_fig"),
+                        insight_text=_payload.get("insight_text"),
+                        chart_engine=_payload.get("chart_engine", "ECharts"),
+                        source_label=_payload.get("source_label", ""),
+                        domain=_payload.get("domain", ""),
+                        use_table_fallback=_payload.get("use_table_fallback", False),
+                    )
+                st.session_state._pptx_bytes = _pptx_bytes
+                st.session_state._pptx_filename = (
+                    f"HR_ChatChart_{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d_%H%M%S')}.pptx"
+                )
+                st.toast("✅ PPTX 已備好,按右邊 ⬇️ 下載", icon="📤")
+                st.rerun()  # 讓 download button 變 enabled
+            except Exception as _exc:
+                st.error(f"❌ 生成 PPTX 失敗:{type(_exc).__name__}: {_exc}")
+                with st.expander("🔍 展開 Traceback"):
+                    st.code(traceback.format_exc(), language="bash")
+
+    with _cols[1]:
+        if st.session_state.get("_pptx_bytes"):
+            st.download_button(
+                "⬇️ Download PPTX",
+                data=st.session_state._pptx_bytes,
+                file_name=st.session_state.get("_pptx_filename",
+                                                "HR_ChatChart_report.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key="export_insight_download",
+                use_container_width=True,
+            )
+        else:
+            st.button(
+                "⬇️ Download PPTX",
+                disabled=True,
+                help="先按左邊 📤 Export Insight 生成 PPTX,這顆按鈕才會啟用",
+                key="export_insight_download_disabled",
+                use_container_width=True,
+            )
+
+    with _cols[2]:
+        if not _has_payload:
+            st.caption(
+                "💡 跑完一次成功的分析(Phase A→D 全綠)後,左邊按鈕會啟用,可匯出單頁 PPTX 報告。"
+            )
+        else:
+            st.caption(
+                f"📊 已備好上次分析:**{(_payload.get('query') or '')[:40]}…** "
+                f"({_payload.get('chart_engine', '?')},領域:{_payload.get('domain', '?')})"
+            )
