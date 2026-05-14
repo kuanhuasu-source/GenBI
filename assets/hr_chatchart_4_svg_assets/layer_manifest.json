@@ -1,0 +1,110 @@
+[
+  {
+    "file": "01_round_speech_arrow.svg",
+    "format": "SVG 1.1 editable vector",
+    "layers": [
+      "background",
+      "logo-symbol",
+      "bilingual-wordmark",
+      "icon-only-app-tile"
+    ],
+    "text": {
+      "chinese": "HR 話圖",
+      "english": "HR ChatChart"
+    },
+    "color_rule": {
+      "chinese_HR": "#D71920",
+      "chinese_話圖": "#1F1F1F",
+      "english_HR": "#1F1F1F",
+      "english_ChatChart": "#D71920"
+    },
+    "palette": {
+      "TSMC-inspired red": "#D71920",
+      "charcoal": "#1F1F1F",
+      "gray-light": "#B8B8B8",
+      "gray-mid": "#777777",
+      "white": "#FFFFFF"
+    }
+  },
+  {
+    "file": "02_soft_app_icon.svg",
+    "format": "SVG 1.1 editable vector",
+    "layers": [
+      "background",
+      "logo-symbol",
+      "bilingual-wordmark",
+      "icon-only-app-tile"
+    ],
+    "text": {
+      "chinese": "HR 話圖",
+      "english": "HR ChatChart"
+    },
+    "color_rule": {
+      "chinese_HR": "#D71920",
+      "chinese_話圖": "#1F1F1F",
+      "english_HR": "#1F1F1F",
+      "english_ChatChart": "#D71920"
+    },
+    "palette": {
+      "TSMC-inspired red": "#D71920",
+      "charcoal": "#1F1F1F",
+      "gray-light": "#B8B8B8",
+      "gray-mid": "#777777",
+      "white": "#FFFFFF"
+    }
+  },
+  {
+    "file": "03_waveform_to_chart.svg",
+    "format": "SVG 1.1 editable vector",
+    "layers": [
+      "background",
+      "logo-symbol",
+      "bilingual-wordmark",
+      "icon-only-app-tile"
+    ],
+    "text": {
+      "chinese": "HR 話圖",
+      "english": "HR ChatChart"
+    },
+    "color_rule": {
+      "chinese_HR": "#D71920",
+      "chinese_話圖": "#1F1F1F",
+      "english_HR": "#1F1F1F",
+      "english_ChatChart": "#D71920"
+    },
+    "palette": {
+      "TSMC-inspired red": "#D71920",
+      "charcoal": "#1F1F1F",
+      "gray-light": "#B8B8B8",
+      "gray-mid": "#777777",
+      "white": "#FFFFFF"
+    }
+  },
+  {
+    "file": "04_geometric_box_chart.svg",
+    "format": "SVG 1.1 editable vector",
+    "layers": [
+      "background",
+      "logo-symbol",
+      "bilingual-wordmark",
+      "icon-only-app-tile"
+    ],
+    "text": {
+      "chinese": "HR 話圖",
+      "english": "HR ChatChart"
+    },
+    "color_rule": {
+      "chinese_HR": "#D71920",
+      "chinese_話圖": "#1F1F1F",
+      "english_HR": "#1F1F1F",
+      "english_ChatChart": "#D71920"
+    },
+    "palette": {
+      "TSMC-inspired red": "#D71920",
+      "charcoal": "#1F1F1F",
+      "gray-light": "#B8B8B8",
+      "gray-mid": "#777777",
+      "white": "#FFFFFF"
+    }
+  }
+]

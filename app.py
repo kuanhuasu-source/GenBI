@@ -246,31 +246,100 @@ def render_pretty_table(Q: pd.DataFrame, option: dict | None = None, key_prefix:
 # ============================================================
 # 🚀 系統初始化
 # ============================================================
-_LOGO_PATH = Path(__file__).parent / "assets" / "genbi_logo.svg"
+# HR 話圖 · HR ChatChart logo(v0.3.7+)
+# SVG 已含 wordmark(中文「話圖」+ 英文「HR ChatChart」),整張當 header
+# 想換設計只要改 _LOGO_FILE 檔名:01/02/03/04 任選
+_LOGO_FILE = "02_soft_app_icon.svg"  # ← 想換就改這裡
+_LOGO_PATH = (
+    Path(__file__).parent / "assets" / "hr_chatchart_4_svg_assets" / _LOGO_FILE
+)
 _LOGO_EXISTS = _LOGO_PATH.exists()
 
+
+@st.cache_data(show_spinner=False)
+def _load_logo_svg_main_only(svg_path: str) -> str:
+    """
+    讀 HR 話圖 SVG,移除底下的 `icon-only-app-tile` layer(App tile 重複小圖),
+    只保留主 logo + wordmark 區。
+
+    用 depth-counter 找匹配的 `<g id="icon-only-app-tile">...</g>`(會嵌套 6 層 g)。
+    回傳 **inline SVG 字串**(給 `st.markdown` 用,不能用 `st.image` — Streamlit
+    把 bytes 解成 raster 失敗)。失敗時 fallback 回原始檔案內容。
+    """
+    try:
+        src = Path(svg_path).read_text(encoding="utf-8")
+        start = src.find('<g id="icon-only-app-tile"')
+        if start < 0:
+            return src
+        # depth counter 找對應的閉合 </g>
+        depth = 0
+        i = start
+        end = -1
+        while i < len(src):
+            if src[i:i + 3] == "<g ":
+                depth += 1
+                i += 3
+            elif src[i:i + 4] == "</g>":
+                depth -= 1
+                i += 4
+                if depth == 0:
+                    end = i
+                    break
+            else:
+                i += 1
+        if end < 0:
+            return src
+        # 把 icon-only-app-tile 區塊整段砍掉
+        return src[:start] + src[end:]
+    except Exception:
+        try:
+            return Path(svg_path).read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+
+def _render_inline_svg(svg_text: str, width_px: int) -> None:
+    """把 inline SVG 用指定寬度渲染進 Streamlit。"""
+    # 把 SVG root 的 width/height 屬性砍掉,改用 wrapper div 控寬
+    import re as _re
+    svg_text = _re.sub(r'\swidth="[^"]+"', '', svg_text, count=1)
+    svg_text = _re.sub(r'\sheight="[^"]+"', '', svg_text, count=1)
+    st.markdown(
+        f'<div style="width:{width_px}px;max-width:100%">{svg_text}</div>',
+        unsafe_allow_html=True,
+    )
+# 舊 genbi logo 當 fallback(若新 logo 路徑找不到)
+_FALLBACK_LOGO = Path(__file__).parent / "assets" / "genbi_logo.svg"
+
 st.set_page_config(
-    page_title="GenBI",
-    page_icon=str(_LOGO_PATH) if _LOGO_EXISTS else "👨‍🍳",
+    page_title="HR 話圖 · HR ChatChart",
+    page_icon=str(_LOGO_PATH if _LOGO_EXISTS else _FALLBACK_LOGO)
+    if (_LOGO_EXISTS or _FALLBACK_LOGO.exists()) else "📊",
     layout="wide",
 )
 
-# 標題 + logo 並排呈現
-_title_col1, _title_col2 = st.columns([1, 6])
-with _title_col1:
-    if _LOGO_EXISTS:
-        st.image(str(_LOGO_PATH), width=110)
-    else:
-        st.markdown("<div style='font-size:96px;line-height:1'>👨‍🍳</div>",
-                    unsafe_allow_html=True)
-with _title_col2:
+# 整張 SVG 當 header(內含 logo + 「HR 話圖」+「HR ChatChart」雙語 wordmark)
+# 處理過的 SVG 已移除底下 App tile 小圖,只留主 logo + wordmark
+# 用 inline SVG via st.markdown(`st.image` 對 SVG bytes 會 raster decode 失敗)
+if _LOGO_EXISTS:
+    _render_inline_svg(_load_logo_svg_main_only(str(_LOGO_PATH)), width_px=480)
+elif _FALLBACK_LOGO.exists():
+    # 路徑找錯也不破:fallback 到舊 genbi logo + 文字 wordmark
+    st.image(str(_FALLBACK_LOGO), width=110)
     st.markdown(
-        "<h1 style='font-size:2.6rem;margin:0 0 .2rem 0;line-height:1.1'>"
-        "GenBI · From question to chart in seconds"
+        "<h1 style='font-size:2.4rem;margin:0;line-height:1.1'>"
+        "<span style='color:#D71920'>HR</span> "
+        "<span style='color:#1F1F1F'>話圖</span> · "
+        "<span style='color:#1F1F1F'>HR</span>"
+        "<span style='color:#D71920'>ChatChart</span>"
         "</h1>",
         unsafe_allow_html=True,
     )
-    st.caption(f"Powered by `{LLM_MODEL}` via OpenAI-compatible endpoint")
+else:
+    st.markdown("# HR 話圖 · HR ChatChart")
+
+# 模型資訊隱藏(若需 debug,改開下行)
+# st.caption(f"Powered by `{LLM_MODEL}` via OpenAI-compatible endpoint")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []

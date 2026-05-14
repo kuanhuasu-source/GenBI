@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1448" height="1086" viewBox="0 0 1448 1086" role="img" aria-labelledby="title desc">
+  <title>HR ChatChart SVG Concept - 01_round_speech_arrow</title>
+  <desc>Editable vector recreation of the HR ChatChart / HR 話圖 logo concept. All major elements are separated into named groups.</desc>
+  <defs>
+    <filter id="softShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#000000" flood-opacity="0.12"/>
+    </filter>
+    <linearGradient id="barGray" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#C9C9C9"/><stop offset="1" stop-color="#777777"/>
+    </linearGradient>
+    <linearGradient id="redGrad" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#F02027"/><stop offset="1" stop-color="#C8101A"/>
+    </linearGradient>
+    <style><![CDATA[
+      .wordmark { font-family: "Aptos Display", "Segoe UI", "Noto Sans", Arial, sans-serif; font-weight: 650; letter-spacing: .5px; }
+      .zhmark { font-family: "Noto Sans TC", "Microsoft JhengHei", "PingFang TC", sans-serif; font-weight: 700; letter-spacing: 10px; }
+      .stroke-round { stroke-linecap: round; stroke-linejoin: round; }
+      .no-fill { fill: none; }
+    ]]></style>
+  </defs>
+  <rect width="1448" height="1086" fill="#FFFFFF"/>
+
+  <g id="main-logo" transform="translate(195,260)">
+    <g id="logo-symbol" data-layer="speech bubble + chart">
+      <g id="speech-bubble-outline" class="stroke-round" fill="none" stroke="#1F1F1F" stroke-width="20">
+        <path d="M38 142 C38 62 105 20 190 20 C285 20 342 68 342 142 C342 219 281 256 191 256 L103 256 L42 298 L55 230 C44 205 38 177 38 142 Z"/>
+      </g>
+      <g id="chart-bars">
+        <rect x="126" y="155" width="38" height="78" rx="7" fill="url(#barGray)"/>
+        <rect x="184" y="123" width="38" height="110" rx="7" fill="url(#barGray)"/>
+        <rect x="245" y="84" width="40" height="149" rx="7" fill="url(#barGray)"/>
+      </g>
+      <g id="rising-line-arrow" class="stroke-round" fill="none" stroke="#D71920" stroke-width="16">
+        <path d="M90 137 L159 76 L211 113 L290 43"/>
+        <path d="M266 42 L294 42 L294 70"/>
+      </g></g>
+    
+  <g id="bilingual-wordmark" data-layer="editable text">
+    <text id="chinese-name-red-hr" class="wordmark" x="455" y="140" font-size="128" fill="#D71920">HR</text>
+    <text id="chinese-name-black-huatu" class="zhmark" x="670" y="140" font-size="110" fill="#1F1F1F">話圖</text>
+    <text id="english-name-black-hr" class="wordmark" x="455" y="275" font-size="88" fill="#1F1F1F">HR</text>
+    <text id="english-name-red-chatchart" class="wordmark" x="615" y="275" font-size="88" fill="#D71920">ChatChart</text>
+  </g>
+  </g>
+
+  <g id="icon-only-app-tile" transform="translate(620,770)" data-layer="icon-only version">
+    <rect x="0" y="0" width="205" height="205" rx="38" fill="#FFFFFF" filter="url(#softShadow)"/>
+    <g transform="translate(28,28) scale(0.43)">
+
+      <g id="speech-bubble-outline" class="stroke-round" fill="none" stroke="#1F1F1F" stroke-width="20">
+        <path d="M38 142 C38 62 105 20 190 20 C285 20 342 68 342 142 C342 219 281 256 191 256 L103 256 L42 298 L55 230 C44 205 38 177 38 142 Z"/>
+      </g>
+      <g id="chart-bars">
+        <rect x="126" y="155" width="38" height="78" rx="7" fill="url(#barGray)"/>
+        <rect x="184" y="123" width="38" height="110" rx="7" fill="url(#barGray)"/>
+        <rect x="245" y="84" width="40" height="149" rx="7" fill="url(#barGray)"/>
+      </g>
+      <g id="rising-line-arrow" class="stroke-round" fill="none" stroke="#D71920" stroke-width="16">
+        <path d="M90 137 L159 76 L211 113 L290 43"/>
+        <path d="M266 42 L294 42 L294 70"/>
+      </g>
+    </g>
+  </g>
+
+</svg>

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1448" height="1086" viewBox="0 0 1448 1086" role="img" aria-labelledby="title desc">
+  <title>HR ChatChart SVG Concept - 03_waveform_to_chart</title>
+  <desc>Editable vector recreation of the HR ChatChart / HR 話圖 logo concept. All major elements are separated into named groups.</desc>
+  <defs>
+    <filter id="softShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#000000" flood-opacity="0.12"/>
+    </filter>
+    <linearGradient id="barGray" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#C9C9C9"/><stop offset="1" stop-color="#777777"/>
+    </linearGradient>
+    <linearGradient id="redGrad" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#F02027"/><stop offset="1" stop-color="#C8101A"/>
+    </linearGradient>
+    <style><![CDATA[
+      .wordmark { font-family: "Aptos Display", "Segoe UI", "Noto Sans", Arial, sans-serif; font-weight: 650; letter-spacing: .5px; }
+      .zhmark { font-family: "Noto Sans TC", "Microsoft JhengHei", "PingFang TC", sans-serif; font-weight: 700; letter-spacing: 10px; }
+      .stroke-round { stroke-linecap: round; stroke-linejoin: round; }
+      .no-fill { fill: none; }
+    ]]></style>
+  </defs>
+  <rect width="1448" height="1086" fill="#FFFFFF"/>
+
+  <g id="main-logo" transform="translate(205,280)">
+    <g id="logo-symbol-waveform" data-layer="voice waveform to chart">
+      <g id="speech-bubble-waveform" class="stroke-round" fill="none" stroke="#1F1F1F" stroke-width="16">
+        <path d="M70 52 C112 16 277 15 318 53 C349 82 354 188 318 221 C286 250 134 247 95 226 L45 260 L52 208 C31 178 32 84 70 52 Z"/>
+      </g>
+      <g id="voice-waveform" class="stroke-round" fill="none" stroke="#777777" stroke-width="13">
+        <path d="M-12 151 C8 151 5 116 23 116 C40 116 34 187 54 187 C72 187 65 108 84 108 C103 108 99 167 118 167 C132 167 132 145 146 145"/>
+        <path d="M160 145 H168 M184 145 H192 M208 145 H216" stroke-width="10"/>
+      </g>
+      <g id="chart-bars" fill="#D71920">
+        <rect x="235" y="152" width="25" height="62" rx="4"/>
+        <rect x="274" y="120" width="25" height="94" rx="4"/>
+        <rect x="312" y="85" width="25" height="129" rx="4"/>
+      </g></g>
+    
+  <g id="bilingual-wordmark" data-layer="editable text">
+    <text id="chinese-name-red-hr" class="wordmark" x="455" y="125" font-size="128" fill="#D71920">HR</text>
+    <text id="chinese-name-black-huatu" class="zhmark" x="670" y="125" font-size="110" fill="#1F1F1F">話圖</text>
+    <text id="english-name-black-hr" class="wordmark" x="455" y="260" font-size="88" fill="#1F1F1F">HR</text>
+    <text id="english-name-red-chatchart" class="wordmark" x="615" y="260" font-size="88" fill="#D71920">ChatChart</text>
+  </g>
+  </g>
+
+  <g id="icon-only-app-tile" transform="translate(622,760)" data-layer="icon-only version">
+    <rect x="0" y="0" width="205" height="205" rx="38" fill="#FFFFFF" filter="url(#softShadow)"/>
+    <g transform="translate(28,28) scale(0.43)">
+
+      <g id="speech-bubble-waveform" class="stroke-round" fill="none" stroke="#1F1F1F" stroke-width="16">
+        <path d="M70 52 C112 16 277 15 318 53 C349 82 354 188 318 221 C286 250 134 247 95 226 L45 260 L52 208 C31 178 32 84 70 52 Z"/>
+      </g>
+      <g id="voice-waveform" class="stroke-round" fill="none" stroke="#777777" stroke-width="13">
+        <path d="M-12 151 C8 151 5 116 23 116 C40 116 34 187 54 187 C72 187 65 108 84 108 C103 108 99 167 118 167 C132 167 132 145 146 145"/>
+        <path d="M160 145 H168 M184 145 H192 M208 145 H216" stroke-width="10"/>
+      </g>
+      <g id="chart-bars" fill="#D71920">
+        <rect x="235" y="152" width="25" height="62" rx="4"/>
+        <rect x="274" y="120" width="25" height="94" rx="4"/>
+        <rect x="312" y="85" width="25" height="129" rx="4"/>
+      </g>
+    </g>
+  </g>
+
+</svg>
