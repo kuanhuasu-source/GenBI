@@ -26,7 +26,7 @@ from typing import Any
 import pandas as pd
 from pymongo import MongoClient
 
-from llm_service import LLMService, is_dashboard_query, sanitize_pipeline, rescue_empty_echarts, ensure_default_styling
+from llm_service import LLMService, is_dashboard_query, sanitize_pipeline, rescue_empty_echarts, ensure_default_styling, coerce_option_native_types
 
 
 # ============================================================
@@ -757,6 +757,8 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                 option, styled = ensure_default_styling(option, case["query"])
                 if styled:
                     print(f"   🎨 ensure_default_styling 啟動,補上預設 legend")
+                # v0.4.6 安全網:numpy/pandas scalar → Python native(防 BidiComponent JS 炸)
+                option = coerce_option_native_types(option)
             plot_err = None
             print(f"   attempt {c_attempt + 1} ({c_elapsed:.1f}s) ✅ exec OK")
             break

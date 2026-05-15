@@ -28,6 +28,7 @@ from llm_service import (
     sanitize_pipeline,
     rescue_empty_echarts,
     ensure_default_styling,
+    coerce_option_native_types,
 )
 import config
 
@@ -846,6 +847,10 @@ if query:
                         final_option, _styled = ensure_default_styling(final_option, query)
                         if _styled:
                             st.toast("🎨 自動補上預設 legend(若想關閉,query 加「精簡」即可)", icon="🎨")
+                        # v0.4.6:numpy/pandas scalar 強制 cast 成 Python native,
+                        # 避免 streamlit-echarts BidiComponent serializer 把 numpy.int64
+                        # 序列化成 null → JS Object.keys(null) 炸
+                        final_option = coerce_option_native_types(final_option)
                         # 表格 fallback 旗標
                         use_table_fallback = bool(final_option.get("_use_table"))
                         # 基本健全性:非表格情境必須有 series

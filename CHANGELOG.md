@@ -5,6 +5,42 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.4.6] · 2026-05-14 — Phase C numpy scalar coercion(BidiComponent JS error fix)
+
+**Patch · 修 streamlit-echarts `Cannot convert undefined or null to object` JS 錯誤。**
+
+實際 case:「請幫忙依照不同的 Company Code,計算員工數量(H/C),並以圓餅圖呈現」 — LLM Phase C 寫 `{"value": Q['total_hc'].iloc[i], "name": Q['company_code'].iloc[i]}`,這些是 `numpy.int64` / `numpy.str_`,streamlit-echarts BidiComponent serializer 序列化為 JS `null`,JS 端 `Object.keys(null)` 直接炸。LLM stochasticity 造成第二次重問常壞。
+
+**雙層防護**:
+- **App 端 structural sanitizer** `coerce_option_native_types`:遞迴走 `final_option`,把所有 `numpy.generic` / `pandas.Timestamp` / `pandas.Timedelta` / NaN / Inf 轉成 Python native。Wire 在 `app.py` 與 `test_runner.py`,緊跟在 `ensure_default_styling` 之後。
+- **Phase C prompt rule 3.3 新增**:把「numpy/pandas scalar 必須 cast 為 native」從 rule 5.7H(heatmap-only)拉到**全圖型通用鐵律**。給三種正解(顯式 cast / `.tolist()` / `to_dict('records')`)+ 反例 + 口訣。
+
+byte-equal:Phase 0/A/C 三個 prompt 全部維持 byte-equal。export_pptx smoke 7/7 綠。
+
+---
+
+## [0.4.5] · 2026-05-14 — Export button moved to script tail(rerun race fix)
+
+**Patch · 修 Export Insight button 跑完成功分析後仍然看不見的 bug。**
+
+v0.4.4 雖然讓 button 「always visible」,但仍放在 chat history 之後、`chat_input` 之前的位置 — Streamlit 是 top-down 一次跑完的腳本,這個區塊在「messages 還沒被 append、payload 還沒被 set」的時候就先評估完了 → button block 跳過 → 直到 user 主動觸發下一次 rerun 才會看到。
+
+把整個 Export / Download button block 搬到 `app.py` 最尾端(在 `if query:` 的 `try/except` 之後),這樣不管走什麼 rerun 路徑(初始載入、chat 送出、button click),button 區塊都會在 query handler 跑完之後才評估,看到的就是最新的 `messages` 跟 `last_export_payload` 狀態。內部加 `st.rerun()` 讓 Download button 在生成完 PPTX 後即時 enabled。
+
+已知限制(可接受):4 個 `st.stop()` 路徑(meta_response / [REFUSE] Plan / Phase B 3-retry fail / fatal exception)會中斷腳本、跳過尾端 button block。但這 4 種情境本來就「沒有成功分析可匯出」,button 隱藏在語意上正確。
+
+---
+
+## [0.4.4] · 2026-05-14 — Export Insight button always visible(disabled when no payload)
+
+**Patch · 修 Export button 在「沒成功跑過分析」時完全不出現、讓使用者以為 feature 沒安裝的 UX bug。**
+
+v0.4.0 的 Export button 條件 gating 在 `st.session_state.last_export_payload`,只有 Phase A→D 全部成功才會 set。若使用者只跑過被 refuse 的 query(例如 v0.4.3 修好前的 pie chart 假拒絕),button 不會 render → 視覺上 feature 不存在。
+
+UX 修正:button 區塊改成「`st.session_state.messages` 非空就 render」,空狀態用 `disabled=True` 區隔。3-column layout `[Export | Download | caption]`,搭配 `st.divider()` 跟條件 caption(「請先跑一次成功分析」或「📊 已備好上次分析:...」)。Download 也用 disabled placeholder 維持版面完整。
+
+---
+
 ## [0.4.3] · 2026-05-14 — Phase 0 false positive refusal 防線
 
 **Patch · 修 pie chart H/C query 被誤判為 data_limitations 違規。**
