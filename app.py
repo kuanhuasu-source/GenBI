@@ -866,6 +866,27 @@ if query:
                     break
                 except Exception:
                     plot_err = traceback.format_exc()
+                    # 🛟 v0.4.7:exec 失敗時也試著從半殘 namespace 救空殼
+                    # 場景:LLM 寫 `option = {空殼}` 然後接著 Phase B 該做的事,
+                    # 後段 KeyError → exec raise,但 option 已在 namespace 中
+                    if chart_engine == "ECharts":
+                        _partial = workflow_namespace.get("option")
+                        if isinstance(_partial, dict):
+                            _partial, _rescued = rescue_empty_echarts(_partial, Q)
+                            if _rescued:
+                                _partial, _ = ensure_default_styling(_partial, query)
+                                _partial = coerce_option_native_types(_partial)
+                                final_option = _partial
+                                use_table_fallback = bool(final_option.get("_use_table"))
+                                st.toast(
+                                    f"🛟 Phase C 第 {attempt + 1} 次 exec 失敗,但從半殘空殼救回 ({chart_engine})",
+                                    icon="🔧",
+                                )
+                                with st.expander(f"🎨 檢視 {chart_engine} 繪圖腳本(失敗版本 + 結構救援)", expanded=False):
+                                    st.code(plot_code, language="python")
+                                    st.caption("⚠️ 上面 code exec 失敗(下面 traceback),但 option 殼有救回 → 用 Q 自動 pivot")
+                                    st.code(plot_err, language="bash")
+                                break
                     if attempt < 2:
                         st.toast(
                             f"⚠️ Phase C ({chart_engine}) 第 {attempt + 1} 次失敗,帶錯誤回饋重生...",

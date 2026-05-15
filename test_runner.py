@@ -767,6 +767,20 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
             last_line = plot_err.strip().split("\n")[-1][:120]
             c_retry_log.append(f"attempt {c_attempt + 1}: {last_line}")
             print(f"   attempt {c_attempt + 1} ({c_elapsed:.1f}s) ❌ {last_line}")
+            # 🛟 v0.4.7:exec 失敗時也試著從半殘 namespace 救空殼
+            _partial = ns2.get("option")
+            if isinstance(_partial, dict):
+                _partial, _rescued = rescue_empty_echarts(_partial, Q)
+                if _rescued:
+                    _partial, _ = ensure_default_styling(_partial, case["query"])
+                    _partial = coerce_option_native_types(_partial)
+                    option = _partial
+                    plot_err = None
+                    c_retry_log.append(
+                        f"attempt {c_attempt + 1}: 🛟 rescued from partial option after exec fail"
+                    )
+                    print(f"      🛟 從半殘空殼救回,跳出 retry")
+                    break
             if c_attempt < 2:
                 print(f"      🔁 重生中...")
 

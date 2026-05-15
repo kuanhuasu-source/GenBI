@@ -5,6 +5,31 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.4.7] · 2026-05-15 — STK-04 / STK-05 phaseC_fallback 救援 + 防呆
+
+**Patch · 修「100% stacked 空殼陷阱」第二代，救回兩個長期 fallback。**
+
+### 🐛 修正
+
+歷史問題：STK-04（三狀態 100% stacked，Q wide format）與 STK-05（TST/TSC AI vs Human stacked，Q long format）在 baseline 跑時連續 3 次都產出 `xAxis.data=[] + series=[]` 空殼，最終降表格。實際 root cause 不是「rescue 沒救」，而是兩個獨立問題：
+
+1. **LLM exec-fail 於 rescue**：LLM 寫 `option = {empty shell}` 後接著重做 Phase B 該做的事（`Q['review_status'/'review_result']`），但 Q 已被 Phase B 處理過、底層欄位不存在 → KeyError → exec 整個煸，`rescue_empty_echarts` 根本沒機會跑。
+2. **`rescue_empty_echarts` 不支援 wide format**：原本只接受 `≥2 dim + ≥1 numeric` 走 pivot 路徑，STK-04 的 `1 dim + 3 numerics`（每個百分比一欄）被拒。
+
+**三層修正**：
+
+- **`rescue_empty_echarts` 加 wide format 路徑**：1 dim + N numerics → 每個 numeric 當一條 series，沿用同一個 stack 名（預設 `stack`）。橫向 / 直向 axis 自動偵測。STK-04 直接救回。
+- **retry loop 在 exec 失敗時也試 rescue**（app.py + test_runner.py）：exec 拋例外時，先檢查 `namespace['option']` 是否仍是 dict，若是就送 rescue。救得回就跳出 retry、視為成功（toast 提示「從半殘空殼救回」）。STK-05 跟 STK-04 都吃這條。
+- **Phase C prompt rule 3.1 新增**：明文禁止「空殼 + dynamic fill」 anti-pattern，給 Q 已是 Phase B 終態的提醒（不要再算 `Q['review_status']`），口訣「option literal 寫完就是完整的」。降低 LLM 一開始就寫錯的機率。
+
+### ✅ 測試
+
+- 4 個 unit test：STK-04 wide / STK-05 long / 完整 option 不誤觸 / 空 Q 不 crash。
+- byte-equal：Phase 0/A/C 三個 prompt 全部維持 byte-equal（2 spaces drift 修正）。
+- export_pptx smoke 7/7 仍綠。
+
+---
+
 ## [0.4.6] · 2026-05-14 — Phase C numpy scalar coercion(BidiComponent JS error fix)
 
 **Patch · 修 streamlit-echarts `Cannot convert undefined or null to object` JS 錯誤。**
