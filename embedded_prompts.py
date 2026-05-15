@@ -633,7 +633,7 @@ _PHASE_C_BLOCK_STACKED_RAW = """
 _PHASE_C_BLOCK_LINE_DUAL = """
 ### 🎯 雙軸 bar+line 強制配方(query 含「絕對量 + 比率 + 比較」三件)
 
-5.9 ✅【標準配方】(case 01 原型:「比較各公司的退單率與申請數,同時看到絕對量與比率」)
+5.9 ✅【標準配方】(原型:「比較各 <實體>,同時看到 <絕對量> 與 <比率>」 — 任何 domain 通用)
 ```python
 option = {
     "title": {"text": "<左軸名> vs <右軸名>"},

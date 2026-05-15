@@ -5,6 +5,45 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.5.1] · 2026-05-15 — Domain-generic intent detector(regex-based rate / count)
+
+**Patch · 補 v0.5.0 兩個 domain-specific leak,確保新 domain 進來不用改 code。**
+
+### 🐛 修正
+
+v0.5.0 audit 發現兩處 tflex 殘留:
+
+1. **`_CHART_RATE_WORDS` 列舉「通過率/退單率/達成率/完成率」**:任何新 domain 的「X 率」compound(健保「再入院率」/「住院率」、電商「轉換率」/「跳出率」、HR「離職率」/「升遷率」)都不會命中。
+2. **`_PHASE_C_BLOCK_LINE_DUAL` 帶 case 01 註解**:「比較各公司的退單率與申請數,同時看到絕對量與比率」這條 tflex-specific 範例會讓 LLM 偏向 tflex 思考。
+
+跨 domain 測試也意外發現 **`_CHART_COUNT_WORDS` 同樣漏接**:「員工數」「人次」「訂單筆」等通用詞被列舉式列表漏掉。
+
+### ✨ 修法 — 一致用 regex pattern(non-enumeration)
+
+- **`_has_rate(query)`**:universal 短詞 quick path + `[一-鿿]+率` regex 抓任何 domain 的 X 率。
+- **`_has_count(query)`**:universal 短詞 + `[一-鿿]+(?:數|量|次|筆|件)(?!率)` regex 抓「X 數」「X 量」「X 次」compound。`(?!率)` 負向後查避免「成功率」誤觸 count。
+- **line_dual block 註解抽象化**:「case 01 原型:比較各公司的退單率與申請數」改「比較各 <實體>,同時看到 <絕對量> 與 <比率>」placeholder。
+
+### ✅ 驗證
+
+22 cases × 3 fictitious domain + 10 tflex regression = **32/32 全綠**:
+- Healthcare:`再入院率 vs 出院人次,比較各醫院` → `line_dual` ✅
+- E-commerce:`跳出率 vs 訪問量,比較各 landing page` → `line_dual` ✅
+- HR:`離職率 vs 員工數,比較各部門` → `line_dual` ✅
+- tflex(10/10):全部 regression 通過,沒退步
+
+### 📐 設計原則(per CLAUDE.md Rule 2 / Rule 8)
+
+| 原則 | 例子 |
+|---|---|
+| Pattern-based,不 enumeration | ✅ regex `[一-鿿]+率` / ❌ list `('通過率','退單率',...)` |
+| Negative lookahead 避免重疊 | `(?:數\|量\|次\|筆\|件)(?!率)` 排除「成功率」 |
+| 註解抽象化 | `<實體>` / `<絕對量>` / `<比率>`,不用「公司」/「退單率」/「申請數」 |
+
+未來新 domain 進來 → metadata 自行 seed,detector / blocks 不需改。
+
+---
+
 ## [0.5.0] · 2026-05-15 — Phase C prompt modular routing(-80% prompt size)
 
 **Minor · 主目標是加速 Phase C(echarts 那一站很慢的問題)。**

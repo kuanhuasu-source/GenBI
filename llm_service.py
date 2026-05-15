@@ -1036,10 +1036,18 @@ def ensure_default_styling(option, query: str = ""):
 # 判斷順序:複合條件 (多關鍵字 AND) 優先於單關鍵字。
 # ============================================================
 
-_CHART_COUNT_WORDS = ('絕對量', '件數', '數量', '總數', '人數',
-                       'count', 'volume', '量')
-_CHART_RATE_WORDS = ('比率', '比例', '佔比', '占比', '通過率', '退單率',
-                      '達成率', '完成率', 'rate', 'ratio', '%', '百分比')
+# v0.5.1:count + rate 都改 regex-based,跨 domain 通用
+# count:universal 短詞 + regex 抓「X 數 / X 量 / X 次 / X 筆」compound
+#   (健保「人次」/「病例數」、電商「訂單數」、HR「員工數」都吃得到)
+_CHART_COUNT_WORDS = ('絕對量', 'count', 'volume')  # universal 純詞,具體 compound 留給 regex
+_COUNT_REGEX = __import__('re').compile(r"[一-鿿]+(?:數|量|次|筆|件)(?!率)")
+# (?!率) 避免「率」結尾(「百分率」/「成功率」)誤觸 count
+
+# rate:universal 短詞 + regex 抓「X 率」compound
+#   (健保「再入院率」、電商「轉換率」、HR「離職率」都吃得到)
+_CHART_RATE_WORDS = ('比率', '比例', '佔比', '占比', '百分比',
+                      'rate', 'ratio', '%')
+_RATE_REGEX = __import__('re').compile(r"[一-鿿]+率")
 _CHART_COMPARE_WORDS = ('比較', '同時看到', '同時', 'vs', '對比', 'compared',
                          '對照')
 _CHART_PIE_WORDS = ('圓餅圖', 'pie chart', 'pie', '餅圖', '圓形圖', '派圖',
@@ -1071,6 +1079,31 @@ def _has_any(haystack: str, needles: tuple) -> bool:
     return False
 
 
+def _has_rate(query: str) -> bool:
+    """偵測 query 含「比率/比例」類詞 — domain-generic 設計。
+    快路徑用 universal 短詞;慢路徑用 regex `[CJK]+率` 抓任何 domain 的「X 率」
+    (例:健保「再入院率」/「住院率」、電商「轉換率」/「跳出率」、HR「離職率」)。
+    """
+    if not query:
+        return False
+    if _has_any(query, _CHART_RATE_WORDS):
+        return True
+    return bool(_RATE_REGEX.search(query))
+
+
+def _has_count(query: str) -> bool:
+    """偵測 query 含「絕對量/計數」類詞 — domain-generic 設計。
+    快路徑用 universal 短詞;慢路徑用 regex `[CJK]+(?:數|量|次|筆|件)` 抓
+    「X 數」「X 量」「X 次」compound(健保「人次」、電商「訂單數」、HR「員工數」)。
+    `(?!率)` 排除「X 率」誤觸(它是 rate 不是 count)。
+    """
+    if not query:
+        return False
+    if _has_any(query, _CHART_COUNT_WORDS):
+        return True
+    return bool(_COUNT_REGEX.search(query))
+
+
 def _detect_chart_intent(query: str) -> str:
     """
     從 query 偵測 Phase C 應該注入哪組 chart-specific rules。
@@ -1093,8 +1126,8 @@ def _detect_chart_intent(query: str) -> str:
     if not query:
         return "bar_basic"
 
-    has_count = _has_any(query, _CHART_COUNT_WORDS)
-    has_rate = _has_any(query, _CHART_RATE_WORDS)
+    has_count = _has_count(query)  # v0.5.1:regex-based,跨 domain
+    has_rate = _has_rate(query)    # v0.5.1:regex-based,跨 domain
     has_compare = _has_any(query, _CHART_COMPARE_WORDS)
     has_stack = _has_any(query, _CHART_STACK_WORDS)
     has_100pct = _has_any(query, _CHART_100PCT_WORDS)
