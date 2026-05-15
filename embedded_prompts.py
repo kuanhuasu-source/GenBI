@@ -430,7 +430,530 @@ _PHASE_D_INSIGHT_TEMPLATE = """你是資深商業分析師,負責撰寫【D. 商
 
 
 # ============================================================
-# Phase C · ECharts(視覺化繪圖)
+# Phase C · ECharts(視覺化繪圖)— v0.5.0 modular 版
+# ============================================================
+# 將原本 24K 的 monolithic template 拆成 header + intent blocks + footer。
+# 由 `_detect_chart_intent(query)`(在 llm_service.py)決定注入哪個 intent block。
+# 預期 prompt size 從 ~24K 降到 9-12K per call(視 intent 而定)。
+#
+# Variables:
+#   - cols_info (Python 端預組:Q 實際欄位)
+#   - {ECHARTS_FEW_SHOT}(literal placeholder,Python .replace 注入,不走 Jinja)
+# ============================================================
+
+_PHASE_C_HEADER_TEMPLATE = """你是精通 Apache ECharts 5 的資深前端工程師,負責【C. 視覺化繪圖 (ECharts)】。
+{{ cols_info }}
+
+### 任務說明
+請輸出名為 `option` 的 Python dict literal,內容符合 ECharts 5 option 規範。
+app 端會把這個 dict 直接餵給 `st_echarts(option, height="520px")` 渲染。
+
+### 實作守則 (CRITICAL RULES):
+0. 🚨【欄位名鎖死】(CRITICAL FATAL — 最常犯錯) 你只能用上方 `Q 實際欄位` 中列出的欄位名。
+   即使 Domain Knowledge 提到某個 KPI(如 `total_applications`、`average_return_rate`),
+   只要該名稱不在 `q_columns` 中,**絕對禁止引用**,會炸 KeyError。
+   寫前在心裡跑一遍:每個 `Q['<name>']` 的 `<name>` 都要在 q_columns 中。
+
+1. 🎯【變數產出】(CRITICAL FATAL) 最外層必須宣告 `option` (dict)。
+   禁止包在 function/class 內;禁止 `print`;不要再 import 任何套件。
+
+2. 🚫【禁止函式 formatter】(CRITICAL) ECharts 透過 JSON 傳遞,formatter 只能用字串模板
+   (如 '{value}%'、'{b}: {c}'),不能放 Python lambda / def。
+
+3. 🚫【禁止二次處理 Q】`Q` 已完美,只允許 `Q['col'].tolist()`、`Q['col'].round(N).tolist()`、
+   `(Q['col'] * 100).round(2).tolist()` 這類取值,不可再 groupby/filter。
+
+3.1 🚫【禁止「空殼 + dynamic fill」pattern】(CRITICAL FATAL)
+    Q 是 Phase B 終態,**raw_df 級的欄位(review_status / company_code filter)已不存在**。
+    ❌ `option = {"xAxis":{"data":[]}, "series":[]}` 後接 `Q['review_status'] == 'Y'` → KeyError 必炸。
+    ✅ 一次寫完 option literal,xAxis/series 直接用 q_columns 取:
+    `"data": Q['<dim_col>'].astype(str).tolist()`、`"data": Q['<value_col>'].round(2).tolist()`。
+    口訣:**option literal 寫完就是完整的,不允許先空再填**。
+
+3.3 🔢【numpy / pandas 型別必須 cast 為 Python native】(CRITICAL FATAL — 適用所有圖型)
+    `Q['col'].iloc[i]` / `row['col']` 是 `numpy.int64` / `numpy.float64`,塞進 option 會炸
+    `BidiComponent Error: Cannot convert undefined or null to object`。
+    ✅ 三種正解:
+    - `int(Q['col'].iloc[i])` / `str(Q['col'].iloc[i])` 顯式 cast
+    - `Q['col'].tolist()` 整 column 轉 native list
+    - `Q.to_dict('records')` 然後逐 row cast
+    口訣:**進 option 的每個值都必須是 `int`/`float`/`str`/`bool`/`None`**。
+
+3.5 🔢【數值精度鐵律】series.data 進 ECharts 前必須 `.round(N)`,否則 label 顯示 16 位浮點:
+    - 整數類(count、人數):維持 int,不需 round
+    - 比率類(已 * 100,0-100 範圍):`.round(2)` → 28.57
+    - 大數金額:`.round(0).astype(int).tolist()` 取整,formatter 加千分位
+
+4. 🎯【必備 keys】title、tooltip、xAxis、yAxis、series。bar/line 類請用
+   `tooltip: {"trigger": "axis", "axisPointer": {"type": "cross"}}`。
+
+5.3 ⚠️【formatter vs data 語義分離】(CRITICAL — 常見誤用)
+   `axisLabel.formatter = "{value}%"` 只是把 % 加在 label 顯示上,**不會把資料 / 100**!
+   - ❌ data 是 raw count(28000)+ formatter `{value}%` → 軸顯示 "28000%"
+   - ✅ data 必須先在 Phase B 轉成 0-100 範圍,formatter `{value}%` 才會顯示正確「28%」
+
+5.7 🎨【預設樣式 — label + legend 自動帶上】(CRITICAL — 使用者很少明示但很在意)
+   除非 query 明說「不要 label / 不要 legend / 精簡 / minimal」,否則:
+   - 每筆 series 加 `"label": {"show": True, "position": "top", "formatter": "{c}"}`
+     (橫向 bar → position="right";stacked → position="inside";pie 用 `{b}: {c} ({d}%)`)
+   - option 加 `"legend": {"show": True, "top": 30}`
+   - **智慧抑制**:類別數 > 15 → `label.show = False`(legend 保留);單一 series → legend 可省
+
+6. 🎁【色盤】(CRITICAL — 預設 20 色,避免 series 多時顏色重複)
+   ```python
+   "color": [
+       "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de",
+       "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#5b9bd5",
+       "#a5a5a5", "#ffc000", "#7b78de", "#27a39d", "#e15759",
+       "#f28e2c", "#76b7b2", "#59a14f", "#edc949", "#b07aa1"
+   ]
+   ```
+
+7. 📐【grid 留白】`grid: {"left": 60, "right": 60, "top": 60, "bottom": 40}` 起手。
+   若有 legend 在 `top: 30`,grid.top 改 `70` 避免重疊。
+"""
+
+
+_PHASE_C_FOOTER_TEMPLATE = """
+### 套用此 domain 的圖表範例 (由 metadata.charting_guidance 自動產生,以實際欄位名為準):
+{ECHARTS_FEW_SHOT}
+
+請只輸出 python code,不要前言不要說明。"""
+
+
+# ============================================================
+# Intent-specific blocks(只在偵測到該 intent 時注入)
+# ============================================================
+
+_PHASE_C_BLOCK_PIE = """
+### 🥧 Pie chart 配方(query 點名圓餅 / pie)
+
+**標準骨架:**
+```python
+option = {
+    "title": {"text": "<圖標題>", "left": "center"},
+    "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+    "legend": {"orient": "vertical", "right": 10, "top": "center"},
+    "series": [{
+        "name": "<value 中文名>",
+        "type": "pie",
+        "radius": "55%",
+        "center": ["40%", "50%"],
+        "data": [
+            {"value": int(v), "name": str(n)}
+            for n, v in zip(Q['<dim_col>'].tolist(), Q['<value_col>'].tolist())
+        ],
+        "label": {"show": True, "formatter": "{b}: {c} ({d}%)"},
+        "labelLine": {"show": True},
+        "emphasis": {"itemStyle": {"shadowBlur": 10, "shadowOffsetX": 0,
+                                     "shadowColor": "rgba(0, 0, 0, 0.3)"}}
+    }],
+    "color": [<20 色色盤>]
+}
+```
+
+**鐵律:**
+- `data` 列表中每個 `value` 必須 `int()` 或 `float()` cast(rule 3.3)
+- `name` 必須 `str()` cast
+- pie 不需要 xAxis / yAxis(刪掉,否則某些版本誤判方向)
+- 類別數 > 7 時建議改 bar(query 沒明說 pie 就走 bar);query 明說 pie 就照走
+"""
+
+
+_PHASE_C_BLOCK_STACKED_100 = """
+### 📚 100% Stacked Bar 完整配方(query 含「100%」或「百分比 + 堆疊」)
+
+5.54 ⚠️【維度方向辨識】「**用 / 依據 / 以 X 為**」介系詞後面 → xAxis;「呈現 / 內含」後面 → series。
+    口訣:不要被「公司」「類別」字眼影響直覺,看的是介系詞句法。
+
+5.55 ⚠️【強制 Pivot 鐵律】不論 Q 是 long 或 wide format,Phase C **一律先 pivot 成 wide**,
+    xAxis 從 pivot.index 取,series 從 pivot.columns 迭代。
+
+    ```python
+    x_dim, series_dim, value_col = '<...>', '<...>', '<...>'
+    if value_col in Q.columns:
+        pivot = (Q.pivot_table(index=x_dim, columns=series_dim,
+                                values=value_col, aggfunc='sum').fillna(0))
+    else:
+        pivot = Q.set_index(x_dim).fillna(0)
+    ```
+    ❌ 嚴禁 `Q[Q['col']==k]` filter 取 series.data(缺漏組合 → 長度不對齊)
+    ❌ 嚴禁 series.name 用 literal 字串(必須來自 `pivot.columns` 迭代)
+
+5.58 🔢【百分比欄位禁止重覆 * 100】Phase B 已 normalize 的 *_pct/percentage 欄是 0-100,
+    Phase C 直接用 `pivot[col].round(2).tolist()`,不要再 `* 100`。
+
+5.6 ✅【100% 配方】每柱加總 = 100%,鎖住 yAxis 範圍:
+    ```python
+    "yAxis": {"type": "value", "max": 100, "axisLabel": {"formatter": "{value}%"}},
+    "series": [
+        {"name": str(col), "type": "bar", "stack": "pct",
+          "data": pivot[col].round(2).tolist(),
+          "label": {"show": True, "position": "inside", "formatter": "{c}%"}}
+        for col in pivot.columns
+    ],
+    ```
+    所有 series 同名 `stack`(例如 `"pct"`),才會堆疊。
+"""
+
+
+_PHASE_C_BLOCK_STACKED_RAW = """
+### 📚 一般 Stacked Bar 配方(query 含「堆疊 / stacked」但沒 100% 信號)
+
+**預設走 raw count**(yAxis 不鎖 100、formatter 不加 %),讓 ECharts 自動算高度。
+
+5.54 ⚠️【維度方向辨識】「**用 / 依據 / 以 X 為**」介系詞後面 → xAxis;
+    「呈現 / 內含」後面 → series。
+
+5.55 ⚠️【強制 Pivot 鐵律】不論 Q 是 long 或 wide,**一律先 pivot 成 wide**,
+    xAxis 從 pivot.index 取,series 從 pivot.columns 迭代:
+    ```python
+    x_dim, series_dim, value_col = '<...>', '<...>', '<...>'
+    if value_col in Q.columns:
+        pivot = (Q.pivot_table(index=x_dim, columns=series_dim,
+                                values=value_col, aggfunc='sum').fillna(0))
+    else:
+        pivot = Q.set_index(x_dim).fillna(0)
+
+    option = {
+        "xAxis": {"type": "category", "data": pivot.index.astype(str).tolist()},
+        "yAxis": {"type": "value"},
+        "series": [
+            {"name": str(col), "type": "bar", "stack": "total",
+              "data": [int(v) for v in pivot[col].tolist()],
+              "label": {"show": True, "position": "inside", "formatter": "{c}"}}
+            for col in pivot.columns
+        ],
+    }
+    ```
+    ❌ 嚴禁 `Q[Q['col']==k]` filter long-format Q 取 series.data(缺漏組合會錯)
+"""
+
+
+_PHASE_C_BLOCK_LINE_DUAL = """
+### 🎯 雙軸 bar+line 強制配方(query 含「絕對量 + 比率 + 比較」三件)
+
+5.9 ✅【標準配方】(case 01 原型:「比較各公司的退單率與申請數,同時看到絕對量與比率」)
+```python
+option = {
+    "title": {"text": "<左軸名> vs <右軸名>"},
+    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+    "legend": {"show": True, "top": 30},
+    "grid": {"left": 60, "right": 60, "top": 70, "bottom": 40},
+    "xAxis": {
+        "type": "category",
+        "data": Q['<entity_col>'].astype(str).tolist(),
+    },
+    "yAxis": [
+        {"type": "value", "name": "<絕對量 axis 名>",
+          "axisLabel": {"formatter": "{value}"}},
+        {"type": "value", "name": "<比率 axis 名>",
+          "min": 0, "max": 100,
+          "axisLabel": {"formatter": "{value}%"}},
+    ],
+    "series": [
+        {"name": "<絕對量名>", "type": "bar", "yAxisIndex": 0,
+          "data": [int(v) for v in Q['<count_col>'].tolist()],
+          "label": {"show": True, "position": "top", "formatter": "{c}"}},
+        {"name": "<比率名>", "type": "line", "yAxisIndex": 1,
+          "data": ((Q['<rate_col>'] * 100).round(2).tolist()
+                   if Q['<rate_col>'].max() <= 1 else
+                   Q['<rate_col>'].round(2).tolist()),
+          "label": {"show": True, "position": "top", "formatter": "{c}%"}},
+    ],
+}
+```
+
+**鐵律:**
+- yAxis 必須是 **list of 2 dicts**(不是單一 dict)
+- bar 走 `yAxisIndex: 0`(左軸),line 走 `yAxisIndex: 1`(右軸)
+- 比率類軸建議 `min: 0, max: 100` + `formatter: "{value}%"`
+- ❌ 嚴禁走 `_use_table` + `_kpi_cards`(會丟掉各公司之間的差異)
+"""
+
+
+_PHASE_C_BLOCK_HEATMAP = """
+### 🔥 Heatmap 完整配方(query 含「熱力圖 / heatmap / 熱度」)
+
+5.7H ⚠️ **必須避開 3 個雷,否則畫面空白:**
+
+【雷 1 · numpy 型別 JSON 序列化失敗】最常見死法
+每個值都必須顯式 cast 成 Python 原生型別:
+```python
+"data": [
+    [str(row["<x_dim>"]), str(row["<y_dim>"]), float(row["<value_col>"])]
+    for _, row in Q.iterrows()
+],
+"visualMap": {
+    "min": float(Q["<value_col>"].min()),
+    "max": float(Q["<value_col>"].max()),
+}
+```
+
+【雷 2 · tooltip.trigger 必須是 "item"】
+- ❌ `"trigger": "cell"`(非法值)
+- ❌ `"trigger": "axis"`(不適用 heatmap)
+- ✅ `"trigger": "item"`
+
+【雷 3 · visualMap 必須帶 inRange.color】否則 cell 顏色差異看不出來。
+
+**完整配方:**
+```python
+x_values = Q["<x_dim>"].unique().tolist()
+y_values = Q["<y_dim>"].unique().tolist()
+option = {
+    "title": {"text": "..."},
+    "tooltip": {"trigger": "item"},
+    "grid": {"left": 80, "right": 80, "top": 60, "bottom": 80},
+    "xAxis": {"type": "category", "data": [str(v) for v in x_values],
+               "splitArea": {"show": True}},
+    "yAxis": {"type": "category", "data": [str(v) for v in y_values],
+               "splitArea": {"show": True}},
+    "visualMap": {
+        "min": float(Q["<value_col>"].min()),
+        "max": float(Q["<value_col>"].max()),
+        "calculable": True,
+        "orient": "horizontal", "left": "center", "bottom": 20,
+        "inRange": {"color": ["#e6f1fb", "#85b7eb", "#185fa5", "#0c447c"]}
+    },
+    "series": [{
+        "name": "<value 中文名>",
+        "type": "heatmap",
+        "data": [
+            [str(row["<x_dim>"]), str(row["<y_dim>"]), float(row["<value_col>"])]
+            for _, row in Q.iterrows()
+        ],
+        "label": {"show": True, "formatter": "{c}"},
+        "emphasis": {"itemStyle": {"shadowBlur": 10, "shadowColor": "rgba(0,0,0,0.5)"}}
+    }]
+}
+```
+"""
+
+
+_PHASE_C_BLOCK_HORIZONTAL = """
+### ↔️ 橫向 Bar 配方(query 含「橫向 / horizontal / 排名 / Top N」)
+
+5.65 軸角色互換:
+
+| 預設(縱向) | 觸發橫向後 |
+|---|---|
+| `xAxis.type = "category"` + `xAxis.data = [類別]` | `xAxis.type = "value"`,xAxis 不放 data |
+| `yAxis.type = "value"` | `yAxis.type = "category"` + `yAxis.data = [類別]` |
+| label `position: "top"` | label `position: "right"` |
+
+**series.data 的值順序完全不變** — ECharts 看到哪個軸是 category 自己會旋轉繪製。
+
+5.55 橫向也必須走強制 pivot(若是 stacked):
+```python
+pivot = Q.pivot_table(index=y_dim, columns=series_dim,
+                      values=value_col, aggfunc='sum').fillna(0)
+option = {
+    "xAxis": {"type": "value"},
+    "yAxis": {"type": "category", "data": pivot.index.astype(str).tolist()},
+    "series": [
+        {"name": str(col), "type": "bar", "stack": "total",
+          "data": [int(v) for v in pivot[col].tolist()],
+          "label": {"show": True, "position": "right", "formatter": "{c}"}}
+        for col in pivot.columns
+    ],
+}
+```
+
+5.8 📏 偏態分佈 auto log scale(若數值跨越 > 100 倍):
+- 設 `xAxis.type = "log"`(橫向時 log 在 x)
+- 或 `data.sort_values(ascending=True)` 讓最大值在頂端
+- log 要求所有值 > 0(0 / 負值會炸)
+"""
+
+
+_PHASE_C_BLOCK_LINE_SINGLE = """
+### 📈 折線圖配方(query 含「趨勢 / line / 折線」,單軸)
+
+**標準骨架:**
+```python
+option = {
+    "title": {"text": "..."},
+    "tooltip": {"trigger": "axis", "axisPointer": {"type": "cross"}},
+    "legend": {"show": True, "top": 30},
+    "grid": {"left": 60, "right": 40, "top": 70, "bottom": 40},
+    "xAxis": {"type": "category", "data": Q['<dim_col>'].astype(str).tolist()},
+    "yAxis": {"type": "value"},
+    "series": [{
+        "name": "<value 中文名>",
+        "type": "line",
+        "data": Q['<value_col>'].round(2).tolist(),
+        "smooth": True,
+        "symbol": "circle", "symbolSize": 8,
+        "label": {"show": True, "position": "top", "formatter": "{c}"},
+    }],
+}
+```
+
+5.8 📏 若數值跨越 > 100 倍 → `yAxis.type = "log"`(注意 log 不接受 0 / 負值)
+"""
+
+
+_PHASE_C_BLOCK_SCATTER = """
+### 🎯 Scatter 散布圖配方(query 含「散布 / scatter / 相關」)
+
+```python
+option = {
+    "title": {"text": "..."},
+    "tooltip": {"trigger": "item",
+                 "formatter": "{a}<br/>{b}: ({c[0]}, {c[1]})"},
+    "xAxis": {"type": "value", "name": "<x 軸名>"},
+    "yAxis": {"type": "value", "name": "<y 軸名>"},
+    "series": [{
+        "name": "<series 中文名>",
+        "type": "scatter",
+        "symbolSize": 12,
+        "data": [
+            [float(Q['<x_col>'].iloc[i]),
+             float(Q['<y_col>'].iloc[i]),
+             str(Q['<label_col>'].iloc[i]) if '<label_col>' in Q.columns else ""]
+            for i in range(len(Q))
+        ],
+    }],
+}
+```
+
+**鐵律:** scatter 的 `data` 是 `[[x, y, label], ...]` 嵌套 list,**每個值必須 `float()` / `str()` cast**(rule 3.3)。
+"""
+
+
+_PHASE_C_BLOCK_KPI_TABLE = """
+### 📋 KPI Table + Cards 配方(query 含「KPI / dashboard / 一覽 / 執行摘要」)
+
+走 `_use_table + _kpi_cards`(app 端會渲染精美表格 + 上方 KPI 卡片):
+
+⚠️【數學鐵律 — 比率類 KPI】**絕對禁止用 `Q['rate_col'].mean()`**(小組會把大組的真實率拉偏)。
+正確:**加權平均** = `sum(分子) / sum(分母)`
+```python
+total_rate = Q['<numerator>'].sum() / Q['<denominator>'].sum()
+```
+
+⚠️【防 TOTAL 列雙倍計算】若 Q 含 TOTAL / 合計 等聚合摘要列,計算前過濾:
+```python
+_df = Q[~Q['<dim_col>'].astype(str).str.upper().isin(['TOTAL','SUMMARY','合計','總計'])]
+total = int(_df['<count_col>'].sum())
+```
+
+**完整 KPI 卡片範例:**
+```python
+option = {
+    "_use_table": True,
+    "_kpi_cards": [
+        {"label": "<總量類>", "value": f"{int(Q['<count_col>'].sum()):,}"},
+        {"label": "<品質比率>",
+          "value": f"{(Q['<num>'].sum() / Q['<den>'].sum() * 100):.2f}%"},
+        {"label": "<效率比率>",
+          "value": f"{(Q['<ai>'].sum() / Q['<base>'].sum() * 100):.1f}%"},
+        {"label": "<維度計數>", "value": f"{len(Q)}"},
+    ],
+    "_table_caption": f"共 {len(Q)} 筆"
+}
+```
+- 卡片數建議 3-4 張(總量 / 品質 / 效率 / 維度計數)
+- value 用 f-string,不要硬編魔法數字
+- label 控制在 8 字以內
+- app 會自動把含 `rate`/`率` 的欄位渲染成漸層進度條
+"""
+
+
+_PHASE_C_BLOCK_BAR_GROUPED = """
+### 📊 Grouped Bar(並排)配方(query 含「並排 / grouped / 分別看」)
+
+```python
+option = {
+    "title": {"text": "..."},
+    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+    "legend": {"show": True, "top": 30},
+    "xAxis": {"type": "category", "data": Q['<x_dim>'].astype(str).unique().tolist()},
+    "yAxis": {"type": "value"},
+    "series": [
+        # 每個 series 不加 "stack"(grouped 的關鍵)
+        {"name": str(k), "type": "bar",
+          "data": Q[Q['<series_dim>'] == k]['<value_col>'].round(2).tolist(),
+          "label": {"show": True, "position": "top", "formatter": "{c}"}}
+        for k in Q['<series_dim>'].unique()
+    ],
+}
+```
+
+**鐵律:** grouped 跟 stacked 唯一差別 = `series[].stack` 有沒有設。grouped **不要**設 stack。
+"""
+
+
+_PHASE_C_BLOCK_BAR_BASIC = """
+### 📊 Bar Chart(預設 / fallback)
+
+```python
+option = {
+    "title": {"text": "..."},
+    "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+    "xAxis": {"type": "category", "data": Q['<dim_col>'].astype(str).tolist()},
+    "yAxis": {"type": "value"},
+    "series": [{
+        "name": "<value 中文名>",
+        "type": "bar",
+        "data": [int(v) for v in Q['<value_col>'].tolist()],
+        "label": {"show": True, "position": "top", "formatter": "{c}"},
+    }],
+}
+```
+類別數 > 15 → label 自動關;單一 series 可省 legend。
+"""
+
+
+# Intent → Block mapping
+_PHASE_C_INTENT_BLOCKS: dict[str, str] = {
+    "pie": _PHASE_C_BLOCK_PIE,
+    "stacked_100": _PHASE_C_BLOCK_STACKED_100,
+    "stacked_raw": _PHASE_C_BLOCK_STACKED_RAW,
+    "line_dual": _PHASE_C_BLOCK_LINE_DUAL,
+    "heatmap": _PHASE_C_BLOCK_HEATMAP,
+    "bar_horizontal": _PHASE_C_BLOCK_HORIZONTAL,
+    "line_single": _PHASE_C_BLOCK_LINE_SINGLE,
+    "scatter": _PHASE_C_BLOCK_SCATTER,
+    "kpi_table": _PHASE_C_BLOCK_KPI_TABLE,
+    "bar_grouped": _PHASE_C_BLOCK_BAR_GROUPED,
+    "bar_basic": _PHASE_C_BLOCK_BAR_BASIC,
+}
+
+
+def compose_phase_c_prompt_modular(intent: str, cols_info: str,
+                                     echarts_few_shot: str = "") -> str:
+    """
+    v0.5.0:依 chart intent 組裝 slim Phase C prompt。
+
+    Args:
+        intent: `_detect_chart_intent(query)` 回傳的 intent string
+        cols_info: Q 實際欄位描述(Python 端預組)
+        echarts_few_shot: domain-specific few-shot 範例(從 metadata 產出)
+
+    Returns:
+        組裝後的完整 prompt(string)
+
+    為什麼比 monolithic 快:
+        Universal header(~5K)+ Intent block(0.5-2.5K)+ Footer(~0.5K)
+        = 6-8K(原 24K 的 ~30%),LLM 處理 prompt 時間大降。
+    """
+    from jinja2 import Template
+    header = Template(_PHASE_C_HEADER_TEMPLATE).render(cols_info=cols_info)
+    intent_block = _PHASE_C_INTENT_BLOCKS.get(
+        intent, _PHASE_C_INTENT_BLOCKS["bar_basic"]
+    )
+    footer = _PHASE_C_FOOTER_TEMPLATE
+    composed = header + intent_block + footer
+    # ECHARTS_FEW_SHOT 走 literal substitution(對齊原 Phase C 處理方式)
+    return composed.replace("{ECHARTS_FEW_SHOT}", echarts_few_shot or "")
+
+
+# ============================================================
+# Legacy monolithic template(v0.4.x 之前)
+# v0.5.0 之後 inline path 改用 compose_phase_c_prompt_modular,
+# DB repo path 仍 fetch 這個 key,所以保留(v0.5.1 migration 才會 deprecate)。
 # ============================================================
 # Variables:
 #   - cols_info (Python 端預組:Q 實際欄位)

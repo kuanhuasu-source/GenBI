@@ -1022,6 +1022,119 @@ def ensure_default_styling(option, query: str = ""):
     return option, injected_any
 
 
+# ============================================================
+# v0.5.0:Phase C chart-intent detector
+#
+# 從 query 偵測該注入哪一組 chart-specific rules,讓 Phase C prompt 從
+# ~24K(all-in-one)降到 ~9-10K(只注入相關規則)。
+#
+# Intent 列表(11 個):
+#   pie / stacked_100 / stacked_raw / line_dual / heatmap /
+#   bar_horizontal / line_single / scatter / kpi_table / bar_grouped /
+#   bar_basic(default fallback)
+#
+# 判斷順序:複合條件 (多關鍵字 AND) 優先於單關鍵字。
+# ============================================================
+
+_CHART_COUNT_WORDS = ('絕對量', '件數', '數量', '總數', '人數',
+                       'count', 'volume', '量')
+_CHART_RATE_WORDS = ('比率', '比例', '佔比', '占比', '通過率', '退單率',
+                      '達成率', '完成率', 'rate', 'ratio', '%', '百分比')
+_CHART_COMPARE_WORDS = ('比較', '同時看到', '同時', 'vs', '對比', 'compared',
+                         '對照')
+_CHART_PIE_WORDS = ('圓餅圖', 'pie chart', 'pie', '餅圖', '圓形圖', '派圖',
+                     'donut')
+_CHART_HEATMAP_WORDS = ('熱力圖', 'heatmap', 'heat map', '熱度', '熱圖')
+_CHART_STACK_WORDS = ('stacked', 'stack', '堆疊', '堆積')
+_CHART_100PCT_WORDS = ('100%', '100 %', '百分比堆疊', '占比分佈',
+                        '比例分佈', 'percentage stack')
+_CHART_HORIZONTAL_WORDS = ('橫向', '水平', 'horizontal', '排名', 'ranking',
+                            'rank', 'top n', 'top 10', 'top 5', 'top 3')
+_CHART_SCATTER_WORDS = ('散布圖', '散點圖', 'scatter', '相關性', 'correlation')
+_CHART_LINE_WORDS = ('趨勢', 'trend', '折線', 'line chart', '時間序列',
+                      'time series', '走勢')
+_CHART_KPI_TABLE_WORDS = ('kpi 一覽', 'dashboard', '儀表板', '執行摘要',
+                            '一覽', '匯總', '摘要報表', 'kpi overview',
+                            'executive summary')
+_CHART_GROUPED_WORDS = ('並排', 'grouped', 'side-by-side', '分別看',
+                         '分組比較')
+
+
+def _has_any(haystack: str, needles: tuple) -> bool:
+    """大小寫不敏感檢查 haystack 是否含 needles 中任一字串。"""
+    if not haystack:
+        return False
+    low = haystack.lower()
+    for n in needles:
+        if n.lower() in low or n in haystack:
+            return True
+    return False
+
+
+def _detect_chart_intent(query: str) -> str:
+    """
+    從 query 偵測 Phase C 應該注入哪組 chart-specific rules。
+
+    回傳 11 種 intent 之一:
+      pie / stacked_100 / stacked_raw / line_dual / heatmap /
+      bar_horizontal / line_single / scatter / kpi_table /
+      bar_grouped / bar_basic(default)
+
+    判斷順序(從特異到通用):
+      1. 複合條件(雙軸 = count + rate + compare 三件齊)
+      2. 強單關鍵字(pie / heatmap / scatter / kpi_table)
+      3. 100% stacked 變體(必須有 stack 詞 + 100%/百分比)
+      4. 一般 stacked
+      5. 橫向 bar / 折線 / 並排
+      6. fallback: bar_basic
+
+    純 heuristic,零 LLM call。
+    """
+    if not query:
+        return "bar_basic"
+
+    has_count = _has_any(query, _CHART_COUNT_WORDS)
+    has_rate = _has_any(query, _CHART_RATE_WORDS)
+    has_compare = _has_any(query, _CHART_COMPARE_WORDS)
+    has_stack = _has_any(query, _CHART_STACK_WORDS)
+    has_100pct = _has_any(query, _CHART_100PCT_WORDS)
+
+    # ━━━ Tier 1:複合條件 ━━━
+    # 雙軸 bar+line:三件齊(絕對量 + 比率 + 比較)
+    if has_count and has_rate and has_compare:
+        return "line_dual"
+
+    # ━━━ Tier 2:強單關鍵字(明示圖型)━━━
+    if _has_any(query, _CHART_HEATMAP_WORDS):
+        return "heatmap"
+    if _has_any(query, _CHART_PIE_WORDS):
+        return "pie"
+    if _has_any(query, _CHART_SCATTER_WORDS):
+        return "scatter"
+
+    # ━━━ Tier 3:stacked 變體 ━━━
+    if has_stack and (has_100pct or '百分比' in query):
+        return "stacked_100"
+    if has_stack:
+        return "stacked_raw"
+
+    # 100% / 百分比 + 占比/比例分佈 等強信號,即使沒明說 stacked 也走 100%
+    if has_100pct and (has_rate or '分佈' in query or '結構' in query):
+        return "stacked_100"
+
+    # ━━━ Tier 4:其他圖型 ━━━
+    if _has_any(query, _CHART_HORIZONTAL_WORDS):
+        return "bar_horizontal"
+    if _has_any(query, _CHART_KPI_TABLE_WORDS):
+        return "kpi_table"
+    if _has_any(query, _CHART_LINE_WORDS):
+        return "line_single"
+    if _has_any(query, _CHART_GROUPED_WORDS):
+        return "bar_grouped"
+
+    return "bar_basic"
+
+
 def is_dashboard_query(query: str) -> bool:
     """
     啟發式偵測:此查詢是否為「dashboard / 執行摘要」場景。
@@ -1895,7 +2008,11 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
     # --------------------------------------------------------
     def generate_echarts_option(self, query, plan_text="", q_columns=None,
                                  previous_code: str = "", previous_error: str = ""):
-        """產生 ECharts 5 option Python dict literal,變數名 `option`。"""
+        """產生 ECharts 5 option Python dict literal,變數名 `option`。
+
+        v0.5.0+:依 query 偵測 chart intent → 只注入相關 chart-specific block,
+        prompt size 從 ~24K 降到 6-9K per call。
+        """
         cols_info = (
             f"`Q` 實際欄位 (THE ONLY SOURCE OF TRUTH): {q_columns}\n"
             "⚠️ 上面這份 q_columns 是 Phase B 實際產出的欄位。\n"
@@ -1903,7 +2020,8 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
             "⚠️ 若你想引用的 KPI 在 q_columns 中沒對應欄位,改用最接近的、或直接放棄該指標。"
             if q_columns else "`Q` 欄位未知。"
         )
-        system_prompt = self._render_phase_c_echarts_prompt(cols_info)
+        intent = _detect_chart_intent(query)
+        system_prompt = self._render_phase_c_echarts_prompt(cols_info, intent=intent)
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error)
         raw = self._call_llm(
@@ -1913,31 +2031,25 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         )
         return self._strip_code_fence(raw, lang="python")
 
-    def _render_phase_c_echarts_prompt(self, cols_info: str) -> str:
-        """產生 Phase C echarts system prompt(repo → inline fallback)。
+    def _render_phase_c_echarts_prompt(self, cols_info: str,
+                                         intent: str = "bar_basic") -> str:
+        """產生 Phase C echarts system prompt。
 
-        ⚠️ v0.3.0 byte-equal 保留說明:
-        原 inline f-string 版本最後有 `.replace("{{ECHARTS_FEW_SHOT}}", ...)`
-        但 f-string `{{ECHARTS_FEW_SHOT}}` 已被解析成 `{ECHARTS_FEW_SHOT}`(單括號),
-        所以雙括號的 replace 從未 match → few_shot 一直沒被注入(silent bug)。
-        repo / inline 兩條路徑都保持這個既存行為,bug fix 留 v0.3.1。
+        v0.5.0 變更(per Option A 設計案):
+        - 直接走 embedded_prompts.compose_phase_c_prompt_modular(intent)
+        - **跳過 DB repo path**(repo 仍有 phase_c_echarts 24K 老版,但 v0.5.0 不用它)
+        - DB 端 migration deferred 到 v0.5.1
+
+        為什麼跳過 repo:repo 的 `phase_c_echarts` 是 v0.4.x 的 monolithic 24K,
+        和新的 modular composition 不相容。v0.5.0 先讓 inline 走 modular 拿到 -60%
+        prompt size 的好處,production migration 留 v0.5.1。
         """
-        if self.prompt_repo is not None:
-            try:
-                rendered = self.prompt_repo.render(
-                    "phase_c_echarts",
-                    domain=self.domain,
-                    cols_info=cols_info,
-                )
-                # Byte-equal:replace 對單括號的 placeholder 做 no-op replace
-                # (原 inline 是對雙括號 replace,也是 no-op;統一行為)
-                return rendered.replace("{{ECHARTS_FEW_SHOT}}", self.echarts_few_shot)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"Phase C prompt repo render 失敗,fallback to inline: {e}"
-                )
-        return self._inline_phase_c_echarts_prompt(cols_info)
+        from embedded_prompts import compose_phase_c_prompt_modular
+        return compose_phase_c_prompt_modular(
+            intent=intent,
+            cols_info=cols_info,
+            echarts_few_shot=self.echarts_few_shot,
+        )
 
     def _inline_phase_c_echarts_prompt(self, cols_info: str) -> str:
         """v0.2.x inline f-string 副本(byte-equal 保持原 bug 行為)。"""

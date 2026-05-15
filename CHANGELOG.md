@@ -5,6 +5,65 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.5.0] · 2026-05-15 — Phase C prompt modular routing(-80% prompt size)
+
+**Minor · 主目標是加速 Phase C(echarts 那一站很慢的問題)。**
+
+### 🎯 動機
+
+baseline 量測:Phase C prompt 21.7K chars,佔每個 case 5 個 phase 總長度的 ~46%。Phase C 還會 retry,造成本輪 baseline 60%+ 的 prompt_tokens 都耗在重複送這個 24K 的 prompt。
+
+### ✨ 主要改動
+
+- **`_detect_chart_intent(query)` 新增**(`llm_service.py`,純 Python heuristic,零 LLM call):從 query 偵測 chart intent → 11 種 intent(`pie` / `stacked_100` / `stacked_raw` / `line_dual` / `heatmap` / `bar_horizontal` / `line_single` / `scatter` / `kpi_table` / `bar_grouped` / `bar_basic` default)。26 個 unit test 全綠。
+- **Phase C template 拆 modular**(`embedded_prompts.py`):
+  - `_PHASE_C_HEADER_TEMPLATE`(~3.5K,universal rules:0/1/2/3/3.1/3.3/3.5/4/5.3/5.7/6/7)
+  - `_PHASE_C_INTENT_BLOCKS` dict(11 個 block,每個 0.3-1.5K)
+  - `_PHASE_C_FOOTER_TEMPLATE`(few_shot + 結尾)
+  - `compose_phase_c_prompt_modular(intent, cols_info, echarts_few_shot)` 組裝函式
+- **`generate_echarts_option` 走 router**:`_detect_chart_intent(query)` → 對應 block → `_render_phase_c_echarts_prompt(cols_info, intent)` 注入只需要的規則。
+- **legacy `_PHASE_C_ECHARTS_TEMPLATE` 保留**:DB repo 仍有舊 24K 版,v0.5.0 inline path 跳過它直接 modular(per 設計案 Option A)。v0.5.1 migration 才會 deprecate DB 端。
+
+### 📊 量測結果(sandbox 驗證)
+
+| Intent | Prompt size | vs 舊 21.7K |
+|---|---:|---:|
+| pie | 4,344 | **-80.0%** |
+| stacked_100 | 4,607 | -78.8% |
+| stacked_raw | 4,429 | -79.6% |
+| line_dual | 4,764 | -78.1% |
+| heatmap | 5,019 | -76.9% |
+| bar_horizontal | 4,401 | -79.7% |
+| line_single | 4,055 | -81.3% |
+| scatter | 4,074 | -81.2% |
+| kpi_table | 4,389 | -79.8% |
+| bar_grouped | 4,048 | -81.4% |
+| bar_basic | 3,850 | -82.3% |
+
+**平均 -80%**,預期對應 wall time -40~50%(LLM 處理 prompt 時間約線性,但 completion time 不變)。
+
+### ⚠️ 已知風險
+
+- prompt 砍得比預估激進(原預估 60%,實際 80%),**品質可能掉**:
+  - rule 5.53 完整版被精簡(Series 動態產出鐵律的詳盡反例消失)
+  - rule 5.54 完整句型表被壓成口訣
+  - rule 5.55 的 hardcode 反例細節砍掉
+- **需要真實 baseline 驗證**:wall time -30%+ + OK rate ≥ 22/26 才算合格;若任一不達標,須回頭加 rules 回 universal header
+
+### ✅ Sandbox 測試
+
+- Detector:26/26 unit test 全綠
+- Compose:11 個 intent 全部 < 5.1K
+- Router 端到端 dispatch:3/3 正確
+- export_pptx smoke 7/7 仍綠
+
+### 🚧 後續(v0.5.1 規劃)
+
+- DB migration 003:把 modular template seed 進 MongoDB
+- 視 v0.5.0 baseline 結果決定是否要把某些 rule 拉回 universal
+
+---
+
 ## [0.4.7] · 2026-05-15 — STK-04 / STK-05 phaseC_fallback 救援 + 防呆
 
 **Patch · 修「100% stacked 空殼陷阱」第二代，救回兩個長期 fallback。**
