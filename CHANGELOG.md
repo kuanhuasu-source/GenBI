@@ -5,6 +5,102 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.9.1] · 2026-05-16 — Horizontal stacked bar + Phase B 0-100 normalize
+
+**Patch · user 截圖回報 2 個 bug:「橫向」被忽略 + percentage 顯示成 0.26%(實際是 26%)。**
+
+### 🔴 user 截圖 bug report
+
+Query「請協助整理**橫向**堆疊百分圖,依據 company_code: TST,TSN,TSC 畫出多條 bar, 每條 bar 中呈現 application_category 的佔比」
+
+**Bug 1**: 圖出來是 vertical(縱向)stacked bar,user 的「橫向」被忽略。
+
+**Bug 2**: 圖上顯示「0.26% / 0.34% / 0.25%」之類,實際應是「26% / 34% / 25%」。Phase B 把 percentage normalize 成 **0-1 decimal**,Phase C 套 `{value}%` formatter → 顯示「0.26%」。
+
+### ✨ P1:`_detect_chart_intent` 加 horizontal × stacked 正交組合
+
+`llm_service.py · _detect_chart_intent`:orientation 跟 chart type 本來就是兩個正交維度,user 明說「橫向 / 水平 / horizontal」是強信號,優先級高於 stack 組合詞。
+
+新邏輯(Tier 3 內判 horizontal):
+
+```python
+has_horizontal = _has_any(query, _CHART_HORIZONTAL_WORDS)
+if has_stack and (has_100pct or '百分比' in query or intra_bar_proportion):
+    return "stacked_100_horizontal" if has_horizontal else "stacked_100"
+if has_stack:
+    return "stacked_raw_horizontal" if has_horizontal else "stacked_raw"
+```
+
+### ✨ P2:加 2 個 Phase C blocks(`stacked_100_horizontal` / `stacked_raw_horizontal`)
+
+跟 vertical 版本的 delta:
+
+- **xAxis / yAxis 對調**:xAxis=value, yAxis=category
+- **xAxis max=100**(原本是 yAxis max=100)
+- **formatter** 移到 xAxis.axisLabel
+- **label position="inside"**(原本 `inside` 對 vertical 是垂直內部,對 horizontal 變水平內部,自然合理)
+- **grid.left=100** 留 category label 空間(原本 60)
+
+註冊進 `_PHASE_C_INTENT_BLOCKS` map。
+
+### ✨ P3:Plan prompt — orientation 詞優先於 chart type
+
+`_PHASE_0_PLAN_TEMPLATE · C 段視覺化建議` 加 **「orientation 鐵律」**:
+
+```
+若 query 明說「橫向 / 水平 / horizontal」,這是強信號,優先級高於組合詞
+(stacked / 100% / 占比 / 比例)。必須保留 orientation 在視覺化建議裡,
+讓下游 Phase C router 偵測得到。
+
+❌ 反例:user 說「橫向堆疊百分圖」,Plan 寫「堆疊長條圖」(掉了橫向)
+✅ 正解:寫「橫向堆疊百分長條圖(horizontal 100% stacked bar)」
+```
+
+### ✨ P4:Phase B `stacked_long_pct` 加 CRITICAL FATAL 0-100 normalize 警告
+
+`_PHASE_B_BLOCK_STACKED_LONG_PCT` 加新區塊:
+
+```
+🚨 CRITICAL FATAL:percentage 欄絕對必須乘以 100 表達成 0-100 範圍!
+   若你算完 count / total 沒乘 100,留 0-1 decimal,下游 Phase C 套
+   formatter "{value}%" 會把 0.26 顯示成「0.26%」(意思:約四分之一個
+   百分點),完全不是 user 要的「26%」。永遠記得 *100。
+
+❌ 反例(baseline 截圖實際發生):
+   counts['percentage'] = counts['count'] / counts['_total_per_group']
+   → 結果 0~1,Phase C 渲染顯示 0.26%
+
+✅ 正解:永遠 * 100
+   counts['percentage'] = (counts['count'] / counts['_total_per_group'] * 100).round(2)
+
+驗證心法:寫完看 Q.head(),若 percentage 欄值都 < 1 → 幾乎一定漏 *100。
+```
+
+### ✨ P5(順手)keyword 補強
+
+- `_CHART_100PCT_WORDS` 加「百分圖 / 百分比圖 / 百分百」
+- `_CHART_INTRA_BAR_WORDS` 補無空格變體(`每條bar` / `每個bar` / `每一條bar` 對齊原本有空格的版本 — 中文輸入習慣不一定加空格)
+
+### ✅ 驗證
+
+- 2 檔 AST OK(embedded_prompts 2277 行 / llm_service 3330 行)
+- `scripts/check_prompt_invariants.py` 17 prompts × 52 sentinels 全綠
+- **10 個 `_detect_chart_intent` + `_detect_preprocess_intent` 單元測試全綠**:
+  - actual screenshot query → `stacked_100_horizontal`(原 `stacked_100`)+ Phase B `stacked_long_pct` ✓
+  - 多種「橫向 / 水平」+ stacked 組合都正確 route
+  - 沒「橫向」字眼的維持原 vertical 行為(STK-01 / 既有 stacked_100 case 不破)
+  - 純 `橫向 bar`(無 stacked)維持 `bar_horizontal`
+
+### 📋 預期成果
+
+下次重跑 baseline 預期:
+- 截圖 query 走 `stacked_100_horizontal` → 出來是橫向圖
+- Phase B percentage 是 0-100 範圍,Phase C 顯示「26%」不是「0.26%」
+- 既有 STK-01 / STK-02 維持 vertical(沒「橫向」字眼)
+- 既有 STK-08(橫向 100% stacked,本來就過)維持 OK
+
+---
+
 ## [0.9.0] · 2026-05-16 — Self-Learning MVP Week 6:Dashboard + Human Review UI 🎉
 
 **Minor · self-learning MVP 6 週 milestone 完整達成。**

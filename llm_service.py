@@ -1086,14 +1086,22 @@ _CHART_PIE_WORDS = ('圓餅圖', 'pie chart', 'pie', '餅圖', '圓形圖', '派
 _CHART_HEATMAP_WORDS = ('熱力圖', 'heatmap', 'heat map', '熱度', '熱圖')
 _CHART_STACK_WORDS = ('stacked', 'stack', '堆疊', '堆積')
 _CHART_100PCT_WORDS = ('100%', '100 %', '百分比堆疊', '占比分佈',
-                        '比例分佈', 'percentage stack')
-# v0.8.8:「在每柱/每條 bar 內」+「占比/佔比/比例」= 強信號,等同 100% normalize。
-# STK-01/02 baseline 失敗根因:LLM 把這個 phrase 走 raw count,但 user 明顯
-# 要的是 per-bar 內部歸一化(每柱加總 = 100)。
+                        '比例分佈', 'percentage stack',
+                        # v0.9.1:「百分圖」「百分比圖」「百分百」等變體
+                        '百分圖', '百分比圖', '百分百')
+# v0.8.8 / v0.9.1:「在每柱/每條 bar 內」+「占比/佔比/比例」= 強信號,
+# 等同 100% normalize。
+# v0.9.1 補無空格變體 (中文輸入習慣不一定加空格):
+# 「每條bar」「每個bar」對齊「每條 bar」「每個 bar」。
 _CHART_INTRA_BAR_WORDS = (
-    '每條 bar', '每個 bar', '每一條 bar', '每條柱', '每柱', '每根',
+    # 有空格
+    '每條 bar', '每個 bar', '每一條 bar',
     'each bar', 'per bar', 'within each bar', 'per category bar',
     'inside each bar',
+    # 無空格(v0.9.1)
+    '每條bar', '每個bar', '每一條bar',
+    # 中文純漢字(原來就有)
+    '每條柱', '每柱', '每根',
 )
 _CHART_PROPORTION_WORDS = ('占比', '佔比', '比例', 'proportion', 'share')
 _CHART_HORIZONTAL_WORDS = ('橫向', '水平', 'horizontal', '排名', 'ranking',
@@ -1172,11 +1180,13 @@ def _detect_chart_intent(query: str) -> str:
     has_stack = _has_any(query, _CHART_STACK_WORDS)
     has_100pct = _has_any(query, _CHART_100PCT_WORDS)
     # v0.8.9:跟 _detect_preprocess_intent 同步 — intra-bar proportion 也算 100%。
-    # 不對齊會讓 STK-01/02 type case:Phase B 正確 normalize 但 Phase C 沒走
-    # stacked_100 block,結果 yAxis.max=100 沒寫。
     has_intra_bar = _has_any(query, _CHART_INTRA_BAR_WORDS)
     has_proportion = _has_any(query, _CHART_PROPORTION_WORDS)
     intra_bar_proportion = has_intra_bar and has_proportion
+    # v0.9.1:orientation 是與 chart type 正交的維度。user 明說「橫向 / 水平 /
+    # horizontal」時,優先級高於 stack 組合詞 → stacked+horizontal 不該被
+    # vertical stacked block 攔走(否則 user 看到的是 vertical bar)。
+    has_horizontal = _has_any(query, _CHART_HORIZONTAL_WORDS)
 
     # ━━━ Tier 1:複合條件 ━━━
     # 雙軸 bar+line:三件齊(絕對量 + 比率 + 比較)
@@ -1191,11 +1201,11 @@ def _detect_chart_intent(query: str) -> str:
     if _has_any(query, _CHART_SCATTER_WORDS):
         return "scatter"
 
-    # ━━━ Tier 3:stacked 變體 ━━━
+    # ━━━ Tier 3:stacked 變體(orientation 正交,優先檢查 horizontal)━━━
     if has_stack and (has_100pct or '百分比' in query or intra_bar_proportion):
-        return "stacked_100"
+        return "stacked_100_horizontal" if has_horizontal else "stacked_100"
     if has_stack:
-        return "stacked_raw"
+        return "stacked_raw_horizontal" if has_horizontal else "stacked_raw"
 
     # 100% / 百分比 + 占比/比例分佈 等強信號,即使沒明說 stacked 也走 100%
     if has_100pct and (has_rate or '分佈' in query or '結構' in query):

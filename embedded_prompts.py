@@ -128,6 +128,13 @@ _PHASE_0_PLAN_TEMPLATE = """你是專業的 AI 商業智慧助理。請以上方
    - 類別數 > 7 → 建議改 bar(可讀性較好),但仍走計畫不拒絕
    - 「dashboard / 執行摘要」場景 → 表格 + KPI 卡片
    ⚠️ 「pie chart 適不適合」是視覺化建議,**不是拒絕理由**;Step 3 已通過就一律走計畫。
+
+   🎯【orientation 鐵律】(v0.9.1)若 query 明說「**橫向 / 水平 / horizontal**」,
+   這是**強信號**,優先級高於組合詞(stacked / 100% / 占比 / 比例)。**必須**
+   保留 orientation 在你的視覺化建議裡,例如「橫向 100% 堆疊長條圖」「水平堆疊
+   bar」,讓下游 Phase C router 偵測得到。
+   ❌ 反例:user 說「**橫向**堆疊百分圖」,你寫「堆疊長條圖」(掉了橫向)→ Phase C 走 vertical
+   ✅ 正解:寫「**橫向**堆疊百分長條圖(horizontal 100% stacked bar)」
 """
 
 
@@ -533,10 +540,30 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
 
 
 _PHASE_B_BLOCK_STACKED_LONG_PCT = """
-### 📚 100% Stacked Bar 標準骨架(query 含 100% / 百分比 + stacked)
+### 📚 100% Stacked Bar 標準骨架(query 含 100% / 百分比 / 每條 bar 占比 + stacked)
 
 Phase B 必須產出 long-format `[dim_x, dim_series, percentage]` 三欄 Q,
-每組 dim_x 內所有 dim_series 的 percentage 加總 = 100。
+**每組 dim_x 內所有 dim_series 的 percentage 加總 = 100**(不是 1.0)。
+
+🚨【CRITICAL FATAL — v0.9.1】`percentage` 欄**絕對必須**乘以 100 表達成 **0-100 範圍**!
+   若你算完 `count / total` 沒乘 100,留 0.0-1.0 decimal,下游 Phase C 套
+   `axisLabel.formatter = "{value}%"` 會把 0.26 顯示成「0.26%」(意思:約四分之一個百分點),
+   完全不是 user 要的「26%」。**永遠記得 `* 100`**。
+
+   ❌ 反例(baseline 截圖實際發生):
+   ```python
+   counts['percentage'] = counts['count'] / counts['_total_per_group']  # ❌ 結果 0~1
+   # → Phase C 渲染顯示 0.26%(實際是 26%),整張圖看起來「全部都不到 1%」
+   ```
+
+   ✅ 正解:**永遠 `* 100`**。
+   ```python
+   counts['percentage'] = (counts['count'] / counts['_total_per_group'] * 100).round(2)
+   #                       ←──────── 必須 ────────────────────── ↑ ←─ 多 2 位小數 ──┘
+   ```
+
+   驗證心法:寫完看 Q.head(),如果 `percentage` 欄值都 < 1,**幾乎一定漏 *100**。
+   合理值是 5.0 / 28.57 / 67.3 等 0-100 範圍。
 
 ✅ 標準骨架:
 ```python
@@ -554,6 +581,7 @@ Q = counts[['<x_dim>', '<series_dim>', 'percentage']]
 ```
 
 🚫 嚴禁:
+- 算 `count / total` **不乘 100**(留 0-1 decimal — Phase C 顯示 0.26% 看起來只有四分之一個百分點)
 - pivot 後再 melt(`melt` 的 `var_name` 欄會帶 `_pct` 後綴,Phase C filter 對不上)
 - 在 Q 中保留 wide format(Phase C 5.55 強制 pivot 鐵律,wide 反而 confused)
 - 算完 percentage 後忘了 reset_index
@@ -1362,11 +1390,95 @@ option = {
 """
 
 
+# v0.9.1:Horizontal stacked variants(orientation 與 chart type 正交,
+# 用戶明說「橫向 / 水平」時應該優先,即使同時有 stack)
+_PHASE_C_BLOCK_STACKED_100_HORIZONTAL = """
+### 📚 橫向 100% Stacked Bar 配方(query 含「橫向 / 水平」+ stacked + 100%/百分比/每條 bar 占比)
+
+跟 vertical `stacked_100` block 的差異:**xAxis / yAxis 對調 + label position 改 inside-right**。
+
+5.54 ⚠️【維度方向辨識】橫向 stacked 100% 下:**dim_x 變 yAxis (category)**,**percentage 變 xAxis (value)**。
+    口訣:橫向 = 「類別在左、數值在下」翻轉成「類別在左、數值在右」,bar 從左往右伸展。
+
+5.6H ✅【橫向 100% 配方】每柱(現在是橫條)加總 = 100%,鎖住 xAxis(value)max=100:
+    ```python
+    x_dim, series_dim, value_col = '<...>', '<...>', '<percentage>'  # Phase B 已 0-100 normalize
+    if value_col in Q.columns:
+        pivot = (Q.pivot_table(index=x_dim, columns=series_dim,
+                                values=value_col, aggfunc='sum').fillna(0))
+    else:
+        pivot = Q.set_index(x_dim).fillna(0)
+
+    option = {
+        "title": {"text": "..."},
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "legend": {"show": True, "top": 30},
+        # ⭐ 橫向:xAxis = value (0~100),yAxis = category
+        "xAxis": {"type": "value", "max": 100,
+                   "axisLabel": {"formatter": "{value}%"}},
+        "yAxis": {"type": "category",
+                   "data": pivot.index.astype(str).tolist()},
+        "series": [
+            {"name": str(col), "type": "bar", "stack": "pct",
+              "data": pivot[col].round(2).tolist(),
+              "label": {"show": True, "position": "inside",
+                         "formatter": "{c}%"}}
+            for col in pivot.columns
+        ],
+        "grid": {"left": 100, "right": 30, "top": 70, "bottom": 40},  # left 留長 label
+    }
+    ```
+
+5.58 🔢【百分比欄位禁止重覆 * 100】Phase B 已 normalize 的 *_pct/percentage 欄是 0-100,
+    Phase C 直接用 `pivot[col].round(2).tolist()`,不要再 `* 100`。
+    若 Phase B 漏 *100 留 0-1 → xAxis 會顯示 "0%"~"1%"(看起來很小),這時要改回 Phase B 補上。
+"""
+
+
+_PHASE_C_BLOCK_STACKED_RAW_HORIZONTAL = """
+### 📚 橫向 Raw count Stacked Bar 配方(query 含「橫向 / 水平」+ stacked,沒 100% 信號)
+
+預設走 raw count(xAxis 不鎖、formatter 不加 %),讓 ECharts 自動算 bar 長度。
+
+5.54 ⚠️【維度方向辨識】橫向 raw stack:**dim_x → yAxis (category)**,**value_col → xAxis (value)**。
+
+5.6RH ✅【橫向 raw 配方】:
+    ```python
+    x_dim, series_dim, value_col = '<...>', '<...>', '<count>'
+    if value_col in Q.columns:
+        pivot = Q.pivot_table(index=x_dim, columns=series_dim,
+                               values=value_col, aggfunc='sum').fillna(0)
+    else:
+        pivot = Q.set_index(x_dim).fillna(0)
+
+    option = {
+        "title": {"text": "..."},
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "legend": {"show": True, "top": 30},
+        "xAxis": {"type": "value"},  # 無 max,讓 ECharts 自動算
+        "yAxis": {"type": "category",
+                   "data": pivot.index.astype(str).tolist()},
+        "series": [
+            {"name": str(col), "type": "bar", "stack": "total",
+              "data": [int(v) for v in pivot[col].tolist()],
+              "label": {"show": True, "position": "inside", "formatter": "{c}"}}
+            for col in pivot.columns
+        ],
+        "grid": {"left": 100, "right": 30, "top": 70, "bottom": 40},
+    }
+    ```
+
+🚫 所有 series 同 stack key(`"total"`)才會堆疊。
+"""
+
+
 # Intent → Block mapping
 _PHASE_C_INTENT_BLOCKS: dict[str, str] = {
     "pie": _PHASE_C_BLOCK_PIE,
     "stacked_100": _PHASE_C_BLOCK_STACKED_100,
+    "stacked_100_horizontal": _PHASE_C_BLOCK_STACKED_100_HORIZONTAL,   # v0.9.1
     "stacked_raw": _PHASE_C_BLOCK_STACKED_RAW,
+    "stacked_raw_horizontal": _PHASE_C_BLOCK_STACKED_RAW_HORIZONTAL,   # v0.9.1
     "line_dual": _PHASE_C_BLOCK_LINE_DUAL,
     "heatmap": _PHASE_C_BLOCK_HEATMAP,
     "bar_horizontal": _PHASE_C_BLOCK_HORIZONTAL,
