@@ -5,6 +5,49 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.7.2] · 2026-05-15 — Sentinel-based prompt invariants check
+
+**Patch · 防止 v0.7.1 那種「重構漏接 critical rule」未來再發生。**
+
+### 🎯 動機
+
+v0.6.0 重構 Phase B 為 modular 時,universal header rule 1 漏掉「禁止 import」這條關鍵 rule,導致 Case 03 連續 3 次失敗。Code review 沒抓到。需要一個自動化機制來保證:**所有歷次 hotfix 沉澱下來的 critical rules 都還在,沒有被後續重構漏掉。**
+
+### ✨ 新檔 `scripts/check_prompt_invariants.py`
+
+Sentinel-based 不變式檢查:
+- 對每個 phase prompt + intent 變體(共 **17 prompts**)
+- 檢查 **52 個 sentinels**(critical 字眼,缺一即視為 regression)
+- 用 `or` 邏輯(多個變體任一命中即過,避免綁死特定措辭)
+
+### 涵蓋的 invariants
+
+**Phase 0**:拒絕協定 / REFUSE 格式 / 圖型詞鐵律(v0.4.3)/ 最後檢查 / 三步推理
+**Phase A**:禁 `$group`/`$cond` / `$project` 鐵律 / Entity 過濾 / 「Phase A 撈,Phase B 算」口訣
+**Phase B universal**:Q 變數產出 / 禁 `print` / **禁 `import`**(v0.7.1) / 禁 self-merge / Series.first 禁區
+**Phase B 5 個 intent blocks**:row-level pass-through / transform / weighted avg / to_datetime / groupby+agg
+**Phase C universal**:option 變數 / formatter 限制 / 空殼禁(v0.4.7)/ numpy cast(v0.4.6)/ 色盤
+**Phase C 7 個 intent blocks**:pie / stacked_100(max=100)/ stacked_raw(pivot)/ line_dual(yAxisIndex)/ heatmap(3 雷)/ horizontal / kpi_table
+**Phase D**:KPI definitions / data_limitations / Markdown 格式
+
+### ✅ 初次跑結果
+
+```
+Total: 17 prompts, 52 sentinels
+Passed: 52 / 52
+Failed: 0
+```
+
+所有歷史 hotfix 累積的 critical rules 都在(包含剛補回的 v0.7.1 禁 import)。
+
+### 🚧 後續整合(留 v0.7.3+)
+
+- 加進 smoke 流程(以後 CI 自動跑)
+- pre-commit hook(commit 時自動 check)
+- 加新 hotfix 時順手加新 sentinel(防止 hotfix 補的 rule 之後又被砍)
+
+---
+
 ## [0.7.1] · 2026-05-15 — Phase B 禁 import 缺失補回 + retry hint 強化
 
 **Patch · 修 v0.6.0 重構時漏接的「禁止 import」rule;順手強化 retry hint。**
