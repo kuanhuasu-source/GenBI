@@ -50,7 +50,13 @@ EMBEDDED_TEST_CASES: dict[str, list[dict]] = {
             'query': '畫出各公司的 PAY 與 RTN 申請數量,我想看哪家公司退件量最大',
             'type': 'happy_path',
             'expected_chart': 'stacked bar',
-            'expected_q_cols_all': ['pay_count', 'return_count', 'company_code'],
+            # v0.7.3:user query 用 PAY/RTN 簡寫,LLM 可能忠於 user 字眼 → 用 synonym
+            # 接受 canonical(pay_count/return_count) 或 user 字眼(PAY/RTN)
+            'expected_q_cols_all': [
+                ['pay_count', 'PAY', 'pay'],
+                ['return_count', 'RTN', 'rtn', 'RET'],
+                'company_code',
+            ],
             'echarts_min_series': 2,
             'echarts_required_keys': ['title', 'xAxis', 'yAxis', 'series'],
             'echarts_should_have_stack': True,
@@ -109,6 +115,11 @@ EMBEDDED_TEST_CASES: dict[str, list[dict]] = {
             'expected_chart': 'scatter',
             'expected_q_cols_all': ['company_code'],
             'echarts_required_keys': ['title', 'xAxis', 'yAxis', 'series'],
+            # v0.8.3:抓「跑得起來但答錯」silent failure(baseline 出現過全 0)
+            'q_numeric_must_vary': [
+                ['ai_review_rate', 'ai_rate', 'AI 審查率'],
+                ['average_return_rate', 'return_rate', '退單率', 'rtn_rate'],
+            ],
         },
         {
             'case_id': '10',
@@ -116,7 +127,11 @@ EMBEDDED_TEST_CASES: dict[str, list[dict]] = {
             'query': '列出退件數量最多的前 5 名公司,搭配柱狀圖',
             'type': 'happy_path',
             'expected_chart': 'sorted bar',
-            'expected_q_cols_all': ['company_code', 'return_count'],
+            # v0.7.3:query 用「退件數量」,LLM 可能產 return_count / 退件數 / RTN
+            'expected_q_cols_all': [
+                'company_code',
+                ['return_count', '退件數', '退件數量', 'RTN', 'rtn', 'rtn_count', 'ret_count'],
+            ],
             'echarts_required_keys': ['title', 'xAxis', 'yAxis', 'series'],
             'phase_a_forbidden_strict': True,
             'phase_b_top_n': 5,
