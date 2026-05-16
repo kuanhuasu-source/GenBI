@@ -1624,33 +1624,21 @@ class LLMService:
 
 【判斷練習(以當前 metadata 為準,LLM 自行推理)】
 
-範例 1:「畫一張熱力圖,看不同公司在四個申請類別的分佈差異」
-- Step 1:需要 company 維度 + category 維度,「熱力圖」「分佈」只是分析操作
-- Step 2:`company_code` 與 `application_category` 都在 schema 中
-- ✅ 走計畫
-
-範例 2:「我想看過去三個月的申請趨勢」
-- Step 1:需要時間維度(「過去三個月」+「趨勢」明確要求時間軸)
-- Step 2:查 schema 是否有 date/timestamp 類欄位 → 沒有
-- Step 3:`data_limitations.not_supported_analysis` 是否含 "trend" 或 "time" → 是
-- 最後檢查:query 確實要 trend,引用一致 → ✅
+範例 1(REFUSE 經典 — 時間/金額類缺欄位):
+   「我想看過去三個月的申請趨勢」(或「平均申請金額」)
+- Step 1:需要時間維度(或金額/價格欄位)
+- Step 2:查 schema → 沒有對應欄位
+- Step 3:`data_limitations.not_supported_analysis` 含 "trend"/"time"(或金額) → 是
+- 最後檢查:query 確實要 trend / 金額,引用一致 → ✅
 - ❌ `[REFUSE]`
 
-範例 3:「平均申請金額」
-- Step 1:需要金額/價格類數值欄位
-- Step 2:查 schema 是否有 amount/price 類欄位 → 沒有
-- Step 3:`data_limitations` 是否明示金額不支援 → 是
-- 最後檢查:query 確實要算金額,引用一致 → ✅
-- ❌ `[REFUSE]`
-
-範例 4(反例 · 絕對不可拒絕!):
-   「請依照 Company Code:TSA,TWT,TSU,TDI,TDC,計算員工數量(H/C),並以圓餅圖呈現」
-- Step 1:需要 company 維度(已點名 5 家)+ 員工數量(H/C)指標。
+範例 2(反例 · 絕對不可拒絕):
+   「請依照 <實體列表>,計算 <某指標>,並以圓餅圖呈現」
+- Step 1:需要該實體維度 + 該指標欄位。
   「圓餅圖」是圖型詞 → 鐵律已交代:**不參與判斷**。
-- Step 2:`company_code` 在 schema、`hc` 在 schema(`tflex_company_hc.hc`)→ 兩個都有
-- ✅ Step 2 通過 → **直接走 A/B/C 計畫,Step 3 跳過**
-- 即使有人「直覺」想引用 `No application date` 來拒絕 → 最後檢查會發現 query
-  根本沒提「時間/趨勢/月份」,引用不一致 → **撤回拒絕,走計畫**
+- Step 2:兩個欄位都在 schema → ✅ 直接走計畫,Step 3 跳過
+- 即使有人「直覺」想引用 missing dimension(例 `No application date`)來拒絕 →
+  最後檢查會發現 query 根本沒提「時間/趨勢/月份」,引用不一致 → **撤回拒絕,走計畫**
 
 ⚠️ 注意:**今天的 metadata 可能下個月變**(domain expert 新增欄位後,以前不支援的分析變成支援)。
 你的推理必須**完全基於 prompt 上方提供的當前 metadata 內容**,不要對某 domain 預設「永遠不支援 X」。
@@ -1777,26 +1765,16 @@ class LLMService:
 4. 🚫【嚴禁在 DB 端聚合】(CRITICAL FATAL) 任務是撈「明細」交給 Pandas。
    禁止 `$group`、`$count`、`$sort`、`$limit`,只能用 `$match`、`$lookup`、`$unwind`、`$project`。
 5. 🚫【禁止在 DB 端做派生欄位】(CRITICAL FATAL)
-   **派生欄位 = 用任何「計算表達式」算出的新欄位**,一律交給 Phase B(Pandas)做,
-   在 `$project` / `$addFields` / `$set` 內【絕對禁止】出現以下 operator:
-     - 條件類:`$cond`、`$switch`、`$ifNull`
-     - 算術類:`$divide`、`$multiply`、`$add`、`$subtract`、`$mod`、`$round`、`$abs`
-     - 字串類:`$concat`、`$concatArrays`
-     - 聚合類:`$sum`(`$group` 內合法、但 `$project` 內非法)
+   `$project` / `$addFields` / `$set` 內【絕對禁止】出現以下 operator:
+   - 條件類:`$cond` / `$switch` / `$ifNull`
+   - 算術類:`$divide` / `$multiply` / `$add` / `$subtract` / `$mod` / `$round`
+   - 字串/聚合類:`$concat` / `$sum`(`$project` 內)
 
-   ❌ 反例(會被 sanitize_pipeline 自動移除 + test 標 fail):
-   ```json
-   {{"$project": {{
-       "is_returned": {{"$cond": [{{"$eq": ["$review_result", "N"]}}, 1, 0]}},
-       "return_rate": {{"$divide": ["$return_count", "$total_count"]}}
-   }}}}
-   ```
-   ✅ 正解:`$project` 只保留原始欄位,讓 Phase B 用 pandas 算:
-   ```python
-   Q['is_returned'] = (Q['review_result'] == 'N').astype(int)
-   Q['return_rate'] = Q['return_count'] / Q['total_count']
-   ```
+   ❌ 反例:`{{"$project": {{"is_returned": {{"$cond": [...]}}, "rate": {{"$divide": [...]}}}}}}`
+   ✅ 正解:`$project` 只保留原始欄位,讓 Phase B 用 pandas 算:`Q['rate'] = Q['<num>'] / Q['<den>']`
+
    口訣:**「Phase A 撈,Phase B 算」** — 凡是「新名字 = 某個運算」就是派生,留給 Phase B。
+   違規會被 sanitize_pipeline 自動移除 + test 標 fail。
 
 5.5 ✅【Entity 過濾鐵律】(CRITICAL — 容易漏)
    若使用者查詢中明確列出**特定實體值**(例如:「TST、TSN、TSC」「Apparel、Books 類別」

@@ -5,6 +5,39 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.6.1] · 2026-05-15 — Phase 0 + Phase A 範例壓縮(邊際改善)
+
+**Patch · 收尾型瘦身,範例濃縮但不破壞語意。**
+
+### ✨ 改動
+
+- **Phase 0 範例 4 → 2**:
+  - 砍 範例 1(heatmap → 走計畫,跟 範例 4 性質重疊)
+  - 砍 範例 3(平均金額 → REFUSE,跟 範例 2 性質重疊)
+  - 留 範例 1(時間/金額類 REFUSE 經典)+ 範例 2(反 false positive,圖型詞不可拒)
+  - 範例 2 也順手抽象化為 `<實體列表>` / `<某指標>` placeholder(per v0.5.1 通用化紀律)
+- **Phase A rule 5 反例壓縮**:
+  - operator 黑名單收成 3 條(原 4 條)
+  - JSON 反例 + Python 正解從多行範例縮成 1 行
+  - 口訣保留(「Phase A 撈,Phase B 算」)
+
+### 📊 量測結果
+
+| Phase | Template baseline | v0.6.1 | 改善 |
+|---|---:|---:|---:|
+| Phase 0 | 3,247 | 2,837 | -12.6% |
+| Phase A | 2,972 | 2,675 | -10.0% |
+
+**Per Rule 12 老實說**:這比 v0.5.0(Phase C -80%)、v0.6.0(Phase B -46%)是**邊際改善**(per call 只省 ~700 chars)。但風險低、byte-equal 維持、smoke OK,屬於收尾。
+
+### ✅ 驗證
+
+- Phase 0 / Phase A / Phase C 三個 prompt embedded vs inline 全部 byte-equal
+- Phase 0 critical sentinels 全在(圖型詞 / 完全不參與 / 撤回拒絕 / 最後檢查 / 範例 2)
+- export_pptx smoke 7/7 仍綠
+
+---
+
 ## [0.6.0] · 2026-05-15 — Phase B preprocess modular routing(-40~49% prompt size)
 
 **Minor · 把 v0.5.0 的 Phase C 套路套到 Phase B,再砍一筆 prompt token。**
