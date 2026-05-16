@@ -5,6 +5,109 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.9.0] · 2026-05-16 — Self-Learning MVP Week 6:Dashboard + Human Review UI 🎉
+
+**Minor · self-learning MVP 6 週 milestone 完整達成。**
+
+對齊 spec §15.5 Manual Review Notification + §20 Human Approval Workflow + §25 Learning Dashboard Metrics。
+
+### ✨ D1:`pages/06_learning_review.py`(366 行)— Streamlit admin page
+
+**4 個 section**:
+
+1. **📊 Dashboard Metrics** — 4 個 metric card 一覽:
+   - Observations · verified(+ candidate 數)
+   - Instincts · active(+ candidate 數)
+   - Candidates · approved(+ pending 數)
+   - Baseline pass rate(從最新 `is_baseline=True` test_run 算)
+   - Expander 展開看 quality details(retry rate / fallback rate / window)+ full operational JSON
+
+2. **📝 Pending Prompt Rule Candidates** — 待審 candidate 列表:
+   - 每筆展開看 source instinct / proposed_rule / supporting observations
+   - 3 個按鈕:**✅ Approve / ❌ Reject / 🧪 Mark testing**
+   - 點下去**直接寫 DB**(`prompt_rule_candidates.status`),配 `approved_at` / `rejected_at` 時戳 + `approved_by='manual_review'` audit。
+
+3. **⚠️ Contradiction Review Queue** — auto-degrade 偵測到的潛在矛盾:
+   - 顯示 obs vs instinct 兩邊內容對照
+   - **✅ Confirm degrade** — 接受 degrade,標 `review_decision='confirmed'`
+   - **↩️ Dismiss (revert)** — 認為是 false positive,把 instinct 的 `confidence +0.05` + `contradiction_count -1` + `status='active'` 全部 revert
+
+4. **🔍 Recent Observations Browser** — filter + drill-down:
+   - 3 個 filter:status / phase / limit
+   - Dataframe 顯示(id / phase / status / conf / tags / rec preview / created_at)
+   - 選某 obs_id 看完整 JSON(含 cause / recommendation / verifier_decision / dedupe_key)
+
+### ✨ D2:`learning/dashboard_metrics.py`(303 行)— 共用 metric 計算
+
+對齊 spec §25 三個指標分類:
+
+| 分類 | 函式 | 內容 |
+|---|---|---|
+| **Operational** | `operational_metrics(db, window_days=None)` | observations / instincts 各 status 計數,可選時間窗 |
+| **Quality** | `quality_metrics(db, window_days=7)` | retry_rate / fallback_rate(從 task_traces 算)+ latest_baseline_pass_rate |
+| **Impact** | `impact_metrics(db)` | candidates pending / testing / approved / rejected 計數 |
+
+加 `needs_review_queue(db, limit=20)` 撈 `learning_jobs.job_type='contradiction_review'` + `status='needs_review'`,給 page 用。
+
+`full_snapshot(db, window_days)` 一次拉所有區段,給 page 渲染 + CLI snapshot 共用。
+
+**CLI**:
+
+```bash
+# Human-readable snapshot
+python -m learning.dashboard_metrics --days 7
+
+# JSON output (給 API / 監控用)
+python -m learning.dashboard_metrics --days 7 --json
+```
+
+### ✅ 驗證
+
+- 2 檔 AST OK(`dashboard_metrics.py` 303 行 / `06_learning_review.py` 366 行)
+- 4 個 unit test 全綠(mocked DB):
+  - `operational_metrics` 各 status 計數正確
+  - `impact_metrics` candidate status breakdown 正確
+  - `needs_review_queue` 回 list 不 crash
+  - `full_snapshot` 含 4 個 top-level keys
+
+### 🎉 Self-Learning MVP 6 週全部達成 (spec §28 Roadmap)
+
+| Week | 模組 | tag |
+|---|---|---|
+| 1 | bootstrap + collections + failure_filter | v0.8.0 / v0.8.1 |
+| 2 | observation_extractor + dedupe | v0.8.2 |
+| 3 | verifier + confidence | v0.8.4 |
+| 4 | consolidator + contradiction | v0.8.5 |
+| 5 | resolution + candidate + gate | v0.8.10 |
+| 6 | **dashboard + human review UI** | **v0.9.0** |
+
+**End-to-end self-learning loop 第一版上線,可以開始放在 production 累積實際資料、跑 nightly job、用 dashboard 觀察 instinct 演化。**
+
+### 📋 用法總覽
+
+```bash
+# Streamlit 直接打開 admin page(假設 app.py 已在跑)
+# http://localhost:8501/learning_review
+
+# 或單獨跑這頁
+streamlit run pages/06_learning_review.py
+
+# CLI snapshot(假設一天結束 ops 看一眼)
+python -m learning.dashboard_metrics --days 7
+```
+
+### 🚧 Beyond MVP(spec §31 Future Scope)
+
+留作 v1.0+ 的事:
+
+- L3 Skills(多步驟 workflow learned pattern)
+- L4 Strategic Rules(domain knowledge level)
+- Cross-domain promotion(instinct 從 tflex 升 global)
+- Autonomous curation(AI 直接 promote,免人類)
+- HyperAgents self-modification
+
+---
+
 ## [0.8.10] · 2026-05-16 — Self-Learning MVP Week 5:Resolution → TestCase → Candidate → Gate
 
 **Patch · self-learning MVP Week 5 完成 — 3 個新模組,把 self-learning loop 從「觀察 + 聚合 instinct」延伸到「自動產 regression test + 升 prompt candidate + benchmark gate 把關」。**
