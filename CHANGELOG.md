@@ -5,6 +5,138 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.4] · 2026-05-16 — Self-Learning MVP Week 3:Verifier + Confidence
+
+**Patch · self-learning MVP Week 3 D1+D2 完成。**
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` §12 + §13 + §13.5。
+
+### ✨ D1:`learning/confidence.py`(299 行)
+
+對齊 spec §13 的 4 sub-component composite。Pure Python,**沒 LLM、沒 DB 也能跑**(consistency / novelty 在 db=None 時保守給 1.0,代表「沒撞既有」)。
+
+```python
+confidence =
+    0.40 * evidence_support
+  + 0.30 * specificity
+  + 0.20 * consistency
+  + 0.10 * novelty
+```
+
+**Sub-components**:
+
+| Component | 範圍 | 計算 |
+|---|---|---|
+| evidence_support | 0–1 | `min(trace_quotes_count / 3.0, 1.0)` |
+| specificity | 0–1 | 0.5 if 含 column name / operator (snake_case identifier、反引號、`Q['col']`、ALL_CAPS enum、`==`/`!=`...);+0.3 if 含數字閾值;+0.2 if 含 "if X" / "add rule" / "必須/禁止" 等可測試語言 |
+| consistency | 0–1 | 查 learning_observations 同 phase+tags 有交集者,Jaccard token 相似度 ≥ 0.4 算「相似」,≥ 0.7 算「同意」,回 agree / similar |
+| novelty | 0–1 | `1 - max(Jaccard(obs vs each active instinct))`(spec 寫 cosine,MVP 沒 embedding model 用 Jaccard 替代) |
+
+**對外 API**:
+
+```python
+from learning.confidence import compute_confidence
+
+scores = compute_confidence(
+    observation,        # 含 phase / tags / cause / recommendation
+    trace_quotes_count=3,
+    db=db,              # 可 None
+)
+# {confidence, evidence_support, specificity, consistency, novelty}
+```
+
+### ✨ D2:`learning/verifier.py`(485 行)
+
+對齊 spec §12 Verifier Agent + §7.2 verifier_results schema。
+
+**核心 API**:
+
+```python
+from learning.verifier import verify_observation, run_verification
+
+# 單筆 verify(LLM 跑判決 + confidence 算 numeric score)
+result = verify_observation(observation, trace, llm_service, db=db)
+
+# 批次(撈 candidate observations 一次驗)
+stats = run_verification(db, llm_service, run_id=None, limit=10)
+```
+
+**Verifier LLM prompt**(獨立於 extractor)— 給 observation + trace digest,要求回 JSON:
+
+```json
+{
+  "decision": "accept|revise|reject",
+  "reasoning": "<one paragraph, refer to trace evidence>",
+  "issues": ["<concrete problems>"],
+  "trace_quotes_count": <0..10 — how many distinct trace pieces support cause>
+}
+```
+
+**Final decision matrix**(綜合 LLM 判 + numeric confidence):
+
+| LLM decision | confidence | Final |
+|---|---|---|
+| reject | * | **reject** |
+| * | < 0.60 | **reject** |
+| revise | ≥ 0.60 | **revise** |
+| accept | 0.60–0.74 | **revise** |
+| accept | ≥ 0.75 | **accept** |
+
+**狀態同步**(verifier 跑完後):
+
+- `accept` → observation.status = `verified`
+- `reject` → observation.status = `rejected`
+- `revise` → 保持 `candidate`,但 verifier_results 已寫,dashboard 看得到 issues
+
+**`verifier_results` schema**(對齊 spec §7.2):
+
+| 欄位 | 來源 |
+|---|---|
+| observation_id | obs.observation_id |
+| decision | accept / revise / reject |
+| confidence | composite 0–1 |
+| reasoning | LLM 一段話 |
+| issues | LLM 找到的具體問題 list |
+| sub_scores | 4 個 component 分數(額外存,讓 dashboard 拆解) |
+| llm_decision | LLM 原始判決(在 final 之前) |
+| llm_trace_quotes_count | LLM 自報引了幾條 trace evidence |
+| created_at | UTC now |
+
+**CLI**:
+
+```bash
+python -m learning.verifier --limit 5 --dry-run         # 跑 LLM 不寫 DB
+python -m learning.verifier --limit 10                  # 寫 verifier_results + 更新 obs.status
+python -m learning.verifier --run-id <uuid> --limit 5   # 只驗某批 extraction
+```
+
+### ✅ 驗證
+
+- 2 個檔 AST OK(confidence.py 299 行 / verifier.py 485 行)
+- `compute_specificity` 8 種 edge case 全綠(vague / col-only / col+num / full spec / underscore-prefix `_pct` 都正確判別)
+- `compute_confidence` composite 上下界正確(全綠 → 1.0,空 obs → 0.30)
+- `_normalize_decision` 9 種輸入(accept/Accept/approved/reject/rejected/revise/revision/garbage/None/int)正確收斂
+- `_final_decision` 10 種 decision matrix 全綠(含 boundary `0.75/0.74/0.60/0.59`)
+
+### 🚧 Week 3 完成 → Week 4 啟動條件
+
+✅ End-to-end self-learning loop 第一版可跑了:
+
+```
+failed task_trace
+    ↓ failure_filter
+    ↓ observation_extractor  (LLM 抽 5+1 欄位)
+    ↓ dedupe_key             (sha256 防重)
+learning_observations (status=candidate)
+    ↓ verifier              (LLM 獨立判 + confidence 4 sub-component)
+    ↓ status: verified / rejected / candidate(revise)
+verifier_results
+```
+
+Next:Week 4 — `instinct_consolidator` + contradiction handling。
+
+---
+
 ## [0.8.3] · 2026-05-16 — Case 09 4 連修:Plan/Phase A/Cheatsheet/test_runner
 
 **Patch · 從 Case 09 baseline 找到 4 個獨立 bug,一起修。**
