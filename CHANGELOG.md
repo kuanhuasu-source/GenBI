@@ -5,6 +5,109 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.9] · 2026-05-16 — v0.8.8 baseline iteration:4 連修(STK-01/02 + STK-03 + T1/T2)
+
+**Patch · 從 v0.8.8 baseline 結果(18/26 = 69%)dig 4 個 case 實際 Phase C code,定位每個 root cause 並批次修。**
+
+### 🔴 v0.8.8 baseline 分析
+
+| Case | Phase C 實際 code 問題 |
+|---|---|
+| STK-01/02 | Phase C 正確 dedupe + filter,但 `yAxis.max=100` 沒寫(走進 `stacked_raw` block 而非 `stacked_100`) |
+| STK-03 | LLM 把 long format Q = `[company_code, review_result, count]` 誤判為 wide,只做 1 series 並 `Q['count'].tolist()` |
+| T2 | 第 6 次 `.round()` — `(rate * 100).round(2)` 在 list comp 內,每個 rate 是 scalar |
+| T1 | LLM 幻覺 `Q['application_count'].sum()` 但 Q 是 row-level pass-through 含 `is_X` bool flags |
+
+### ✨ P1:`_detect_chart_intent` 同步 intra-bar 邏輯
+
+`llm_service.py · _detect_chart_intent` 跟 v0.8.8 `_detect_preprocess_intent` 對齊。原本 Phase B 已正確走 `stacked_long_pct`(P3),但 Phase C 還是走舊判斷 → 進 `stacked_raw` block 不會寫 `yAxis.max=100`。
+
+```python
+intra_bar_proportion = has_intra_bar and has_proportion
+if has_stack and (has_100pct or '百分比' in query or intra_bar_proportion):
+    return "stacked_100"
+```
+
+直接收 STK-01 + STK-02 兩個 case。
+
+### ✨ P2:Phase C rule 0 — 3-col long format 明確偵測
+
+STK-03 LLM 看 Q.cols=`[company_code, review_result, count]` 沒看出來是 long format,寫了 wide-style 單 series。原 rule 0 decision tree 不夠明確,「count」沒 `_xxx` 後綴但 LLM 還是把它當 KPI 欄位。
+
+修 rule 0:加 **「Long / tidy(3-col + multi-series 場景必看)」決定性描述**:
+- 只有 1 個 numeric 欄位(`count` / `percentage` / 「裸名」)
+- 另外 2 欄是 dim + sub_dim(string)
+- sub_dim 欄位裡的值有限(2-10 種 enum)
+
+加判斷口訣 3 條:**numeric 欄位數、string 欄位數、row 數 vs unique(dim) 比例**。
+
+「不確定 long/wide 時,**優先當成 long format**」— filter 不對應的 sub_dim 只會少 series(可控失敗),但 wide 誤認成 long 會炸 KeyError(致命失敗)。
+
+### ✨ P3:`.round()` 第 6 次 — `(expr).round()` + list comp 變種
+
+T2 寫 `[(rate * 100).round(2) for rate in Q["return_rate"].tolist()]`。`rate` 從 `.tolist()` 出來是 Python float,`rate * 100` 還是 Python float,`.round()` 失效。
+
+`embedded_prompts.py · rule 3.5` 加 3 個新反例:
+```python
+(rate * 100).round(2)                          # ❌ expr 結果是 scalar
+[(v * 100).round(2) for v in Q['x'].tolist()]  # ❌ list comp 每元素 scalar
+[v.round(2) for v in some_list]                # ❌ 同上
+```
+
+正解兩條路:
+```python
+(Q['rate'] * 100).round(2).tolist()                 # ✅ Series 鏈式
+[round(v * 100, 2) for v in Q['rate'].tolist()]     # ✅ list comp 用 builtin
+```
+
+`llm_service.py · _format_retry_hint` 對應的 hint 加同樣變種 + 結尾「**禁止寫 `x.round(2)`**」直接命令。
+
+### ✨ P4:dashboard row-level Q 模式 KPI cards 提示
+
+T1 Phase B 走 row-level pass-through 模式(147526 rows,12 cols 含 `is_completed` / `is_returned` / `is_ai_reviewed` / `is_payable` 4 個 bool flag)。但 Phase C 寫 `Q['application_count'].sum()` 假設 aggregated KPI col 存在。
+
+`_PHASE_C_BLOCK_KPI_TABLE` 加 **「dashboard row-level Q 模式偵測」**段:
+
+```
+若 q_columns 含 is_X bool flag 欄位 + Q 是 raw row-level(row 數 ≈ raw_df 級),
+代表 Phase B 走 row-level pass-through dashboard 模式,
+Q.columns **不會有** aggregated KPI 欄位 — 自己用 `.sum()` 算出來。
+```
+
+附 ✅ 完整正解 + ❌ T1 baseline 踩雷反例。口訣:**看到 `is_X` bool 欄就用 `Q['is_X'].sum()`,看到 row 數很大就用 `len(Q)`,不要假設 KPI col 已存在**。
+
+### ✅ 驗證(全綠)
+
+- 2 檔 AST OK(embedded_prompts.py 2165 行 / llm_service.py 3328 行)
+- `scripts/check_prompt_invariants.py` 17 prompts × 52 sentinels 全綠
+- **5 個 _detect_chart_intent 單元測試全綠**:
+  - STK-01/02 → `stacked_100` ✓(P1 修)
+  - STK-03(無 intra-bar)→ `stacked_raw` ✓(沒誤觸發)
+  - 「畫 100% stacked bar」→ `stacked_100` ✓
+  - 「占比」單獨 → `stacked_raw` ✓
+- 4 個 sentinel 對應 P1-P4 patch 都在
+
+### 📋 預計 baseline 改善
+
+| Case | v0.8.8 | v0.8.9 預期 |
+|---|---|---|
+| STK-01 | ❌ yAxis.max | ✅ |
+| STK-02 | ❌ yAxis.max | ✅ |
+| STK-03 | ❌ series=1 + xAxis 重複 | ✅(P2 修)|
+| T2 | ❌ `.round()` 第 6 次 | ✅(P3 修)|
+| T1 | ❌ 幻覺 KPI col | ✅(P4 修)|
+
+理論上 baseline pass rate **18/26 (69%) → 23/26 (88%)**。
+
+剩下的 fail(STK-04 / Case 08 / STK-07)是更 case-specific 的 Phase B 邏輯 bug,留 v0.8.10 處理。
+
+### 📋 須在 production 套用
+
+⚠️ 若 `PROMPT_REPO_ENABLED=true`:`python migrations/001_seed_prompts.py --force`(Phase C prompt 改了)。
+intent 偵測 + retry hint 是純 Python,不需 DB 同步。
+
+---
+
 ## [0.8.8] · 2026-05-16 — v0.8.7 baseline iteration:3 連修
 
 **Patch · v0.8.7 baseline 跑完發現新 dominant pattern + 1 個 design conflict,3 連修。**

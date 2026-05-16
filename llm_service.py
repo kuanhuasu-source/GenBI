@@ -1171,6 +1171,12 @@ def _detect_chart_intent(query: str) -> str:
     has_compare = _has_any(query, _CHART_COMPARE_WORDS)
     has_stack = _has_any(query, _CHART_STACK_WORDS)
     has_100pct = _has_any(query, _CHART_100PCT_WORDS)
+    # v0.8.9:跟 _detect_preprocess_intent 同步 — intra-bar proportion 也算 100%。
+    # 不對齊會讓 STK-01/02 type case:Phase B 正確 normalize 但 Phase C 沒走
+    # stacked_100 block,結果 yAxis.max=100 沒寫。
+    has_intra_bar = _has_any(query, _CHART_INTRA_BAR_WORDS)
+    has_proportion = _has_any(query, _CHART_PROPORTION_WORDS)
+    intra_bar_proportion = has_intra_bar and has_proportion
 
     # ━━━ Tier 1:複合條件 ━━━
     # 雙軸 bar+line:三件齊(絕對量 + 比率 + 比較)
@@ -1186,7 +1192,7 @@ def _detect_chart_intent(query: str) -> str:
         return "scatter"
 
     # ━━━ Tier 3:stacked 變體 ━━━
-    if has_stack and (has_100pct or '百分比' in query):
+    if has_stack and (has_100pct or '百分比' in query or intra_bar_proportion):
         return "stacked_100"
     if has_stack:
         return "stacked_raw"
@@ -1624,17 +1630,24 @@ class LLMService:
                     "畫圖是 Phase C 的工作,Phase B 完全不需要 matplotlib / plotly / seaborn 等。\n"
                     "把所有 `import xxx` 那行刪掉重來。\n"
                 )
-            # v0.8.7:.round() 雷,baseline 出現 5 次連續中
+            # v0.8.7 / v0.8.9:.round() 雷,baseline 出現 6+ 次
             elif "object has no attribute 'round'" in err:
                 hint += (
                     "\n🚨【關鍵修正提示】你對 **scalar** 物件呼叫了 `.round(N)`。\n"
                     "Python `float` / `int` / `str` 都**沒有** `.round()` 方法,只有 pandas Series / DataFrame 有。\n"
-                    "**改用 `round(value, N)` builtin**(對任何 numeric 都行):\n"
-                    "  ❌ `value.round(2)`  /  `Q['rate'].iloc[0].round(2)`  /  `min(Q['x']).round(2)`\n"
-                    "  ✅ `round(value, 2)`\n"
-                    "  ✅ `round(Q['rate'].iloc[0], 2)`\n"
-                    "  ✅ `Q['rate'].round(2).tolist()`(Series 上 OK)\n"
-                    "  ✅ `[round(v, 2) for v in raw_list]`(list 元素是 scalar)\n"
+                    "**改用 `round(value, N)` builtin**(對任何 numeric 都行):\n\n"
+                    "  ❌ 常見錯誤型態(v0.8.9 baseline 第 6 次):\n"
+                    "     `value.round(2)`\n"
+                    "     `Q['rate'].iloc[0].round(2)`\n"
+                    "     `min(Q['x']).round(2)`\n"
+                    "     `(rate * 100).round(2)`                              # expr 結果是 scalar\n"
+                    "     `[(v * 100).round(2) for v in Q['x'].tolist()]`     # list comp 內每元素也是 scalar\n\n"
+                    "  ✅ 正解兩條路:\n"
+                    "     **路 1:Series 鏈式**(最簡)\n"
+                    "       `(Q['rate'] * 100).round(2).tolist()`              # Series → Series → list\n"
+                    "     **路 2:list comp 用 builtin**\n"
+                    "       `[round(v * 100, 2) for v in Q['rate'].tolist()]`\n\n"
+                    "  ⚠️ 不論你想 round 的是不是 expr,只要那個物件是 scalar,就用 `round(x, 2)`,**禁止寫 `x.round(2)`**。\n"
                 )
             # v0.8.7:long format xAxis no dedupe,baseline 連續 3 次中
             elif ("KeyError" in err and any(t in err for t in
