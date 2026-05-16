@@ -476,6 +476,21 @@ TASK_METADATA = {
             "is_ai_review": "review_status == 'Y' and review_mechanism == 'AI'",
             "is_human_review": "review_status == 'Y' and review_mechanism == 'H'"
         },
+        # v0.8.3 — Phase A column-cluster 鐵律。
+        # 若 Phase A 的 $project 引用了 cluster 內任一欄位,**必須**把整個 cluster
+        # 一起 $project,否則 Phase B 算比率/條件計數時會缺欄位、退化成全 0 結果。
+        "column_clusters": [
+            {
+                "cluster_id": "review_state",
+                "cols": ["review_status", "review_result", "review_mechanism"],
+                "reason": (
+                    "review_result / review_mechanism 在 review_status='N' 時是 null。"
+                    "任何比率類 KPI (return_rate / ai_review_rate / pay_rate) 的分母"
+                    "都用 'review_status=Y' 限定為完成件;缺 review_status 就只能用退化"
+                    "公式,結果會偏 0 或失真。"
+                ),
+            },
+        ],
         "small_sample_warning": [
             "Companies with very small hc, such as TSK, should not be over-interpreted.",
             "When hc or completed_count is small, show both rate and absolute count."

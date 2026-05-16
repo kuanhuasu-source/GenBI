@@ -62,10 +62,41 @@ def _build_relationship_block(metadata: dict) -> str:
     return "\n".join(lines)
 
 
+def _build_column_clusters_block(metadata: dict) -> str:
+    """
+    v0.8.3 — 把 metadata.data_preprocessing_guidance.column_clusters 攤平成
+    Phase A 看得懂的「同生共死欄位群」文字。
+
+    若 metadata 沒定 column_clusters,回傳空字串(prompt 不會多印一個空 section)。
+    """
+    clusters = (
+        (metadata.get("data_preprocessing_guidance") or {}).get("column_clusters") or []
+    )
+    if not clusters:
+        return ""
+    lines = []
+    for c in clusters:
+        cluster_id = c.get("cluster_id", "?")
+        cols = c.get("cols") or []
+        reason = c.get("reason", "")
+        if not cols:
+            continue
+        cols_str = ", ".join(f"`{x}`" for x in cols)
+        lines.append(f"  - **{cluster_id}**: {cols_str}")
+        if reason:
+            lines.append(f"    └ 理由:{reason}")
+    return "\n".join(lines)
+
+
 def build_domain_knowledge(metadata: dict) -> str:
     """組裝完整的 Domain Knowledge text block,完全由 metadata 驅動。"""
     db_name = metadata.get("recommended_mongodb", {}).get("database", "unknown")
     dataset_name = metadata.get("dataset_name") or metadata.get("dataset_id") or "Dataset"
+    cluster_block = _build_column_clusters_block(metadata)
+    cluster_section = (
+        f"\n# 欄位 cluster (同生共死 — Phase A 引用其一必須全選)\n{cluster_block}\n"
+        if cluster_block else ""
+    )
     return f"""### {dataset_name} (database: {db_name})
 
 # Collections & 欄位定義
@@ -79,7 +110,7 @@ def build_domain_knowledge(metadata: dict) -> str:
 
 # 資料限制 (CRITICAL — 違反必須回覆「資料不足」)
 {_build_limitation_block(metadata)}
-"""
+{cluster_section}"""
 
 
 def build_echarts_few_shot(metadata: dict) -> str:
@@ -1304,6 +1335,21 @@ PANDAS_ANTIPATTERN_CHEATSHEET = """
 ❌  `Q.pivot(index=A, columns=B)` 把 Q 變 wide format
     為什麼:把值散到動態欄位名後,Phase C 沒辦法用固定欄位名引用,且 ECharts heatmap 要 long format。
     ✅  維持 long format `[dim_a, dim_b, value]` 三欄;只有純表格 (use_table) 場景可考慮 wide。
+
+❌  在 code 內用全形標點 (`，` U+FF0C / `；` U+FF1B / `（` U+FF08 / `）` U+FF09 / `：` U+FF1A)
+    為什麼:Python parser 只接半形 ASCII 標點;全形標點會炸
+    `SyntaxError: invalid character '，' (U+FF0C)`,而且這個錯不會自動修。
+    識別:中文輸入法切換時很容易混進 code,LLM 思考中文時偶發。
+    ✅  程式碼內所有標點(逗號 / 分號 / 括號 / 冒號 / 點)**必須全部 ASCII 半形**:
+        ```python
+        agg = Q.groupby('col').agg(           # ✅ 半形 ( ) ,
+            count=('flag', 'sum'),
+        )
+        # ❌ agg = Q.groupby('col').agg(     # ❌ 全形 ( 會炸
+        #         count=('flag'，'sum')，    # ❌ 全形 ， 會炸
+        #     )
+        ```
+        Comment / docstring 內的中文標點 OK;只有 **code 結構字元** 必須 ASCII。
 
 ❌  比率/除法 用 string 欄位當分子或分母 (例:`Q['count'] / Q['employee_id']`)
     為什麼:string 欄位 (任何 ID / code / category / status / mechanism) 無法做算術運算,

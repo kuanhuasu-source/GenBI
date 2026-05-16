@@ -126,6 +126,11 @@ TEST_CASES = [
         "expected_chart": "scatter",
         "expected_q_cols_all": ["company_code"],
         "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+        # v0.8.3:抓「跑得起來但答錯」silent failure(case 09 baseline 出現過全 0)
+        "q_numeric_must_vary": [
+            ["ai_review_rate", "ai_rate", "AI 審查率"],
+            ["average_return_rate", "return_rate", "退單率", "rtn_rate"],
+        ],
     },
     {
         "id": "10",
@@ -750,6 +755,59 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                 ok,
                 f"actual: {len(Q.columns)}"
             ))
+
+        # v0.8.3:numeric content sanity — 抓「跑得起來但答錯」silent failure
+        # `q_numeric_must_vary`: list[str | list[str]]
+        #   每項是欄位名或 synonym list(沿用 v0.7.3 規格)。
+        #   檢查該欄位在 Q 內 nunique() > 1,可抓:
+        #     - 全 0(常見:狀態欄位漏撈 → Phase B 退化公式)
+        #     - 全 NaN(常見:filter 全濾掉)
+        #     - 全同值(常見:groupby 拼錯維度)
+        for col_spec in case.get("q_numeric_must_vary", []):
+            # 解 synonym:取第一個 in Q.columns 的當實際欄位
+            if isinstance(col_spec, (list, tuple)):
+                actual_col = next((c for c in col_spec if c in q_cols_set), None)
+                label = "(" + " | ".join(col_spec) + ")"
+            else:
+                actual_col = col_spec if col_spec in q_cols_set else None
+                label = str(col_spec)
+
+            if actual_col is None:
+                # 欄位本身不存在 — 上面的 expected_q_cols_all 已會 fail,這邊 skip 不重複
+                continue
+
+            series = Q[actual_col]
+            try:
+                # pandas 在 numeric 上 nunique 會無視 NaN;再用 dropna().empty 判別全 NaN
+                n_unique = int(series.nunique(dropna=True))
+                all_nan = bool(series.dropna().empty)
+                # 「全 0」獨立檢查(numeric only):nunique=1 且該值=0
+                only_value = None
+                if n_unique == 1 and not all_nan:
+                    try:
+                        only_value = float(series.dropna().iloc[0])
+                    except Exception:
+                        only_value = None
+                varied = (n_unique > 1) and (not all_nan)
+                if all_nan:
+                    detail = "全 NaN"
+                elif only_value == 0.0:
+                    detail = "全 0(疑似退化公式)"
+                elif n_unique == 1:
+                    detail = f"全部 = {series.iloc[0]!r}(無變異)"
+                else:
+                    detail = f"unique={n_unique}"
+                result["checks"].append(check(
+                    f"Q[{label}] 有變異(non-degenerate)",
+                    varied,
+                    detail,
+                ))
+            except Exception as e:
+                result["checks"].append(check(
+                    f"Q[{label}] 有變異(non-degenerate)",
+                    False,
+                    f"檢查時例外:{type(e).__name__}: {str(e)[:120]}",
+                ))
     except Exception as e:
         result["checks"].append(check("Phase B 例外", False, str(e)))
         result["phases"]["preprocess_error"] = traceback.format_exc()

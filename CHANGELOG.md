@@ -5,6 +5,85 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.3] · 2026-05-16 — Case 09 4 連修:Plan/Phase A/Cheatsheet/test_runner
+
+**Patch · 從 Case 09 baseline 找到 4 個獨立 bug,一起修。**
+
+### 🔴 Baseline 觀察(Case 09:AI 審查率 vs 退單率散點圖)
+
+- Phase B attempt 1 炸 `SyntaxError: invalid character '，' (U+FF0C)`(LLM 寫全形逗號)
+- Phase B attempt 2 炸 `KeyError: 'review_status'`(Phase A 漏撈)
+- Phase B attempt 3 跑過了,但 `average_return_rate` **全 15 家公司都是 0.0**(退化公式) — 最危險的 silent failure
+
+### ✨ D1:Plan prompt 加「需要的原始欄位」明列段
+
+`embedded_prompts.py · _PHASE_0_PLAN_TEMPLATE` A 段加一條 bullet,要求 LLM 在 Plan 階段就列出 `raw_columns_needed: [col_a, col_b, ...]`,Phase A 才能正確 $project。
+
+特別點名「狀態欄位(review_status/status/state)與其相依的子欄位(result/mechanism)必須一起列出,漏一個就會讓 Phase B 算出全 0 退化結果」。
+
+### ✨ D2:Phase A 加 `column_clusters` 同生共死機制
+
+**Metadata 層**:`tflex_task_metadata_agent_v3.py` 在 `data_preprocessing_guidance` 加 `column_clusters` 區塊。tflex 首批宣告 `review_state` cluster = `[review_status, review_result, review_mechanism]`。
+
+**注入層**:`llm_service.py` 新加 `_build_column_clusters_block(metadata)`,`build_domain_knowledge` 把它組進 Domain Knowledge 文字。**Metadata 沒定義 column_clusters 時,section 不顯示,零侵入。**
+
+**Prompt 層**:`_PHASE_A_PIPELINE_TEMPLATE` 加 **Rule 6.5「欄位 cluster 同生共死(CRITICAL FATAL)」**:若 `$project` 引用 cluster 內任一欄位,**必須**把整 cluster 所有欄位一起 $project。
+
+口訣:**「cluster 一動就要全動」**。
+
+### ✨ D3:`PANDAS_ANTIPATTERN_CHEATSHEET` 加全形標點黑名單
+
+加一條新 anti-pattern:**程式碼內所有標點必須全部 ASCII 半形**,禁止 `，` (U+FF0C) / `；` (U+FF1B) / `（` (U+FF08) / `）` (U+FF09) / `：` (U+FF1A) 等全形字元。
+
+Comment / docstring 內的中文標點 OK;只有 code 結構字元必須 ASCII。
+
+### ✨ D4:`test_runner.py` 加 `q_numeric_must_vary` 檢查
+
+抓「跑得起來但答錯」silent failure。新 case field:
+
+```python
+"q_numeric_must_vary": [
+    ["ai_review_rate", "ai_rate", "AI 審查率"],          # synonym list
+    ["average_return_rate", "return_rate", "退單率"],
+]
+```
+
+對每個欄位檢查 `Q[col].nunique() > 1`,可同時抓:
+
+- 全 0(常見:狀態欄位漏撈 → Phase B 退化公式)
+- 全 NaN(常見:filter 全濾掉)
+- 全同值(常見:groupby 維度錯)
+
+訊息會點明退化原因(全 0 / 全 NaN / 全部相同),debug 直覺。
+
+Case 09 首批加上;其他 rate KPI case 可按需追加。
+
+### ✅ 驗證(全綠)
+
+- 4 個檔 AST OK(embedded_prompts.py / llm_service.py / test_runner.py / tflex_task_metadata_agent_v3.py)
+- `scripts/check_prompt_invariants.py` 17 prompts · 52 sentinels 全過(D1/D2 改動沒破壞 critical rule)
+- 8 個 unit check 綠:
+  - column_clusters 從 metadata 正確讀出
+  - `_build_column_clusters_block` 對 tflex / 空 metadata 都行為正確
+  - `build_domain_knowledge` 含 cluster section
+  - test_runner 4 種退化情境(全 0 / 全 NaN / 全同 / 有變異)都正確判別
+  - Plan prompt 含 `raw_columns_needed` + 「需要的原始欄位」
+  - Phase A prompt 含 cluster 鐵律 + `review_mechanism` 例子
+  - Cheatsheet 含 `U+FF0C` + 「全形」
+
+### 📋 須在 production 套用
+
+⚠️ 若 `PROMPT_REPO_ENABLED=true`,需重 seed:
+
+```bash
+python migrations/001_seed_prompts.py --force        # Plan + Phase A 改了
+python migrations/002_seed_metadata.py --force --include-test-fixtures   # metadata 加 column_clusters
+```
+
+D3 (cheatsheet) 跟 D4 (test_runner) 是純 code 層,沒有 DB 同步動作。
+
+---
+
 ## [0.8.2] · 2026-05-16 — Self-Learning MVP Week 2:Observation Extractor + Dedupe
 
 **Patch · self-learning MVP Week 2 D1+D2 完成。**
