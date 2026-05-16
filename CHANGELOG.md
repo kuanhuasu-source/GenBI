@@ -5,6 +5,98 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.1] · 2026-05-16 — Self-Learning MVP Week 1 D2+D3:Collections + Failure Filter
+
+**Patch · 完成 self-learning MVP Week 1。**
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` §7 + §9。
+
+### ✨ Week 1 D2:其他 4 個 learning_* collections + indexes
+
+**`migrations/005_create_learning_collections.py`**:idempotent migration,建好 4 個 collection + 共 19 個 index。
+
+| Collection | Indexes |
+|---|---|
+| `learning_observations` | 7(含 `observation_id` unique、`dedupe_key` unique、`phase + status` 複合) |
+| `verifier_results` | 3(observation_id、decision、created_at desc) |
+| `learning_jobs` | 4(job_id unique、status、job_type、started_at desc) |
+| `prompt_rule_candidates` | 5(candidate_id unique、status、instinct_id、target_component、created_at desc) |
+
+設計細節:
+- collection 已存在 → skip(不破壞既有 data)
+- index 已存在 → skip(`list_indexes()` pre-check)
+- `--dry-run` 預覽不寫
+- 跟 migration 001-004 同風格,可由 admin CLI 呼叫
+
+### ✨ Week 1 D3:`learning/failure_filter.py`
+
+從 `task_traces` 撈出需要做 observation extraction 的 trace。
+
+**API**:
+
+```python
+from learning.failure_filter import get_failed_traces, get_trace_by_id
+
+# 撈最近 7 天 failed/refused 的 trace summary
+traces = get_failed_traces(
+    db,
+    since_days=7,
+    statuses=("failed", "refused"),
+    include_step_errors=True,    # 任一 step 有 error 的也算
+    include_manual_flag=True,    # needs_review=True 也算
+    limit=200,
+)
+
+# 二次撈完整 trace(含 messages + response)給下游 extractor
+full = get_trace_by_id(db, "uuid-...")
+```
+
+**設計重點**:
+- summary 不撈 messages payload(可能 50KB+/trace),只撈 phase/error 等 metadata。caller 視需要用 trace_id 二次撈。
+- `$or` 三條件:status 命中 ∪ step error ∪ 手動 flag。任一即返回。
+- 時間窗口 `started_at >= now - since_days`,避免撈舊資料。
+- CLI:`python -m learning.failure_filter --days 7 --limit 20`。
+
+### ✅ 驗證
+
+- 兩個檔 syntax OK
+- `COLLECTION_SPECS` = 4 collection,19 個 index 設定
+- `_summarize_trace` synthetic test 正確抽出 has_step_error / failure_reason
+- `get_failed_traces` 查詢結構正確(3 個 $or clauses)
+- 兩個 CLI `--help` 都正常
+
+### 🚧 Week 1 完成 → Week 2 啟動條件
+
+✅ Week 1 三天 deliverable 全完成:
+- D1:bootstrap layer + 13 historical seeds(v0.8.0)
+- D2:其他 4 個 collections + indexes(v0.8.1)
+- D3:failure_filter(v0.8.1)
+
+REPL 應可跑通:
+
+```python
+from pymongo import MongoClient
+import config
+from learning.bootstrap import seed_all
+from learning.failure_filter import get_failed_traces
+
+db = MongoClient(config.MONGO_URI)[config.MONGO_DB]
+
+# 1. seed historical instincts(D1)
+seed_all(db)  # 13 inserted
+
+# 2. failed traces 可被撈(D3)
+failures = get_failed_traces(db, since_days=7)
+print(f"Found {len(failures)} failed traces")
+
+# 3. collections 都建好(D2)
+print(db.list_collection_names())  # 應含 learning_observations 等 4 個
+```
+
+Week 2 啟動:`observation_extractor.py` + dedupe 邏輯。
+
+---
+
 ## [0.8.0] · 2026-05-16 — Self-Learning MVP Week 1 D1:Bootstrap Layer
 
 **Minor · 開啟 self-learning MVP 第一條 milestone。**
