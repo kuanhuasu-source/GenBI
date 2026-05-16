@@ -1552,6 +1552,21 @@ class LLMService:
             "錯誤訊息 (Traceback):\n```\n"
             f"{previous_error}\n```\n"
         )
+        # v0.7.1:特定錯誤模式偵測,加強對應提示(LLM 在 retry feedback 內常常忽略主要規則)
+        if previous_error:
+            if "ModuleNotFoundError" in previous_error or "No module named" in previous_error:
+                hint += (
+                    "\n🚨【關鍵修正提示】你嘗試 `import` 一個不存在的套件。\n"
+                    "**禁止 import 任何套件** — `pd`(pandas)跟 `np`(numpy)已備好。\n"
+                    "Phase B 只負責資料處理(groupby / agg / filter / 計算 KPI),**不畫圖**。\n"
+                    "畫圖是 Phase C 的工作,Phase B 完全不需要 matplotlib / plotly / seaborn 等。\n"
+                    "把所有 `import xxx` 那行刪掉重來。\n"
+                )
+            elif "KeyError" in previous_error:
+                hint += (
+                    "\n🚨【關鍵修正提示】KeyError 表示你引用了不存在的欄位。\n"
+                    "**只能用 `q_columns` / `avail_cols` 中真實存在的欄位**,不要憑想像。\n"
+                )
         if cheatsheet:
             hint += "\n" + cheatsheet
         return hint

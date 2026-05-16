@@ -5,6 +5,39 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.7.1] · 2026-05-15 — Phase B 禁 import 缺失補回 + retry hint 強化
+
+**Patch · 修 v0.6.0 重構時漏接的「禁止 import」rule;順手強化 retry hint。**
+
+### 🐛 修正
+
+實際 case:baseline Case 03「畫出各公司的 PAY 與 RTN 申請數量,我想看哪家公司退件量最大」連續 3 次失敗,原因都是 `ModuleNotFoundError: No module named 'matplotlib'`。LLM 在 Phase B 寫 `import matplotlib`,但 Phase B exec namespace 只給 `pd / np / raw_df`。
+
+Root cause:**v0.6.0 重構 Phase B 為 modular 時,universal header rule 1 漏接「禁止 import 任何套件」**。原版 Phase B 有這條(舊 `_PHASE_B_PREPROCESS_TEMPLATE` rule 1 含「不要再 import 任何套件」),v0.6.0 universal header 只寫了「禁止 print」就斷掉。LLM 看到「畫出 / stacked」query 觸發畫圖直覺 → 自動 `import matplotlib`。
+
+**修法**:
+
+- `_PHASE_B_HEADER_TEMPLATE_V6` rule 1 補:
+  - 「**禁止 import 任何套件**」
+  - 列舉黑名單:`matplotlib` / `plotly` / `seaborn`(典型 plot 套件)
+  - 明確職責邊界:「Phase B 只負責資料處理,**不畫圖**」
+- `_format_retry_hint` 加錯誤類型偵測:
+  - `ModuleNotFoundError` / `No module named` → 加「關鍵修正提示:把 import 刪掉」
+  - `KeyError` → 加「只能用 q_columns 中真實欄位」
+
+### ✅ 預期效果
+
+- 下一輪 baseline:Phase B 不會再寫 `import matplotlib`
+- 即使萬一 LLM 還是寫 import,retry 第二次看到強化 hint 應該能修正
+
+### 🚧 對當前 baseline 影響
+
+當前 baseline(已跑到 Case 03 失敗)會繼續跑剩下的 case,**v0.7.1 修法對當前 run 不生效**(Python process 已 load 舊 prompt)。建議:
+1. 讓當前 baseline 跑完,觀察其他 case 是否也有 ModuleNotFoundError(可能 STK-01~08 受影響)
+2. push 完 v0.7.1 後重啟 → 跑新一輪 baseline
+
+---
+
 ## [0.7.0] · 2026-05-15 — Task Trace Recorder(end-to-end query 追蹤)
 
 **Minor · 加入完整 task trace,可逐步檢視每次 query 的所有 LLM call 與函式呼叫。**
