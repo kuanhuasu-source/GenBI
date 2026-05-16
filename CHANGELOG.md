@@ -5,6 +5,194 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.10] · 2026-05-16 — Self-Learning MVP Week 5:Resolution → TestCase → Candidate → Gate
+
+**Patch · self-learning MVP Week 5 完成 — 3 個新模組,把 self-learning loop 從「觀察 + 聚合 instinct」延伸到「自動產 regression test + 升 prompt candidate + benchmark gate 把關」。**
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` §17 + §17.5 + §18 + §19 + §19.5 + §7.5。
+
+### ✨ D1:`learning/resolution_detector.py`(386 行)
+
+掃 `task_traces` 找「同 query_hash 先 failed 後 completed 且時差 < 30 天」的配對,**自動產生 regression test_case**。
+
+**Algorithm**(spec §17.5):
+
+```
+For each query_hash:
+    if failed run exists
+    and later completed run exists
+    and 時差 < window_days
+    and 沒既有 regression case
+        → 寫 regression test_case
+```
+
+**新 test_case schema**(寫進 `test_cases` collection):
+
+```python
+{
+    "case_id": "AUTO-NNNNN",       # 避開 manual case 的 01/02/STK-XX/Txx
+    "type": "regression",          # 新 type,跟 happy_path / refusal 分開
+    "source": "auto_resolution",
+    "name": "Auto-regression from resolved failure",
+    "query": "<原 user query>",
+    "expected_q_cols_all": [...],  # 從 resolved trace 的 Phase B 實際輸出 capture
+    "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
+    "auto_meta": {
+        "failed_trace_id", "resolved_trace_id",
+        "failed_at", "resolved_at",
+        "elapsed_days", "query_hash",
+    },
+}
+```
+
+**Idempotent**:`auto_meta.query_hash` 已存在 → skip。
+**CLI**:`python -m learning.resolution_detector --days 30 --limit 50 [--dry-run]`
+
+MVP 暫不檢查 prompt 版本變更(spec §17.5 條件 4),目前 trace 沒記錄 prompt version,用「沒既有 regression case」近似。
+
+### ✨ D2:`learning/candidate_generator.py`(327 行)
+
+把 active instinct 升成 `prompt_rule_candidate`(寫進 `prompt_rule_candidates` collection),等人類審後 merge 進 prompt template。
+
+**升 candidate 條件**(spec §18):
+
+- `instinct.status = 'active'`
+- `confidence >= 0.85`
+- `evidence_count >= 3`
+
+**target_component 推導**(從 instinct.phase):
+
+| instinct.phase | target_component |
+|---|---|
+| phase_0 | phase_0_plan |
+| phase_a | phase_a_pipeline |
+| phase_b | phase_b_preprocess |
+| phase_c | phase_c_echarts |
+| phase_d | phase_d_insight |
+| meta | meta |
+
+**新 candidate schema**(對齊 spec §7.5):
+
+```python
+{
+    "candidate_id": "PRC-NNNNNN",
+    "instinct_id": "INST-AUTO-NNNNN",
+    "target_component": "phase_c_echarts",
+    "proposed_rule": "<from instinct.rule>",
+    "evidence_count": ...,
+    "confidence": ...,
+    "supporting_observation_ids": [...],
+    "status": "candidate",     # candidate / testing / approved / rejected
+}
+```
+
+**Idempotent**:同 instinct_id 已有 candidate(status in candidate/testing/approved)→ skip。
+**CLI**:`python -m learning.candidate_generator --min-confidence 0.85 --min-evidence 3 [--dry-run]`
+
+MVP 直接複製 `instinct.rule` 當 `proposed_rule`(spec 沒強制 LLM 二次潤飾),節省 LLM call 成本。
+
+### ✨ D3:`learning/regression_gate.py`(415 行)
+
+比較 baseline test_run 與 candidate test_run,gate 決定 candidate 能否 promote 到 `approved`。
+
+**4 條 gate**(spec §19):
+
+| Gate | 條件 |
+|---|---|
+| **1** | No critical regression(沒 case 從 pass 變 fail) |
+| **2** | Pass count 不降(`candidate.passed >= baseline.passed`) |
+| **3** | Latency 增幅 < 10%(spec §19.5,可調) |
+| **4** | Cost 增幅 < 15%(spec §19.5,可調) |
+
+**對外 API**:
+
+- `compare_runs(baseline_run, candidate_run, ...)` — pure logic,不寫 DB,回 verdict dict
+- `run_gate(db, candidate_run_id, candidate_id, ...)` — 從 DB 抓 baseline + candidate run,跑 gate,且自動更新 `prompt_rule_candidates.status`:
+  - 過 → `approved` + 寫 `gate_verdict` / `approved_at`
+  - 沒過 → `rejected` + 寫 `gate_verdict` / `rejected_at`
+
+**Verdict dict** 詳細含 4 gates 各自 pass/fail、`critical_regressions` 清單、`metrics`(baseline/candidate 各項數值 + delta)、`reasons`(人類可讀的 fail 原因)。
+
+**CLI**:
+
+```bash
+python -m learning.regression_gate \
+    --candidate-run-id 20260516_1922 \
+    --candidate-id PRC-000001 \
+    --domain tflex \
+    [--latency-threshold 0.10] \
+    [--cost-threshold 0.15] \
+    [--dry-run]
+```
+
+### ✅ 驗證
+
+- 3 檔 AST OK(resolution 386 / candidate 327 / gate 415 行,共 1128 行)
+- **15 個 unit test 全綠**:
+  - `_query_hash` whitespace normalize + 唯一性
+  - `_days_between` 邊界處理
+  - `_component_for` 6 種 phase mapping
+  - `_build_candidate_doc` 9 個欄位正確
+  - `compare_runs` 5 種情境:happy path / critical regression / latency 超標 / cost 超標 / empty edge case
+
+### 🚧 Week 5 完成 — Self-learning MVP loop 全綠
+
+```
+failed task_trace
+    ↓ failure_filter
+    ↓ observation_extractor   (LLM 抽 + dedupe)
+learning_observations [candidate]
+    ↓ verifier               (LLM 獨立 + confidence)
+learning_observations [verified | rejected]
+    ↓ instinct_consolidator  (cluster ≥3 + avg conf ≥0.80)
+learning_instincts [candidate]   ← 人類審
+    ↓ ─── (Week 5 新增以下流程) ───
+    ↓ candidate_generator    (active + conf≥0.85 + evidence≥3)
+prompt_rule_candidates [candidate]
+    ↓ test_runner (套用 candidate)
+test_runs [candidate run]
+    ↓ regression_gate        (4 條 gate)
+prompt_rule_candidates [approved | rejected]
+    ↓ 人類 merge 進 prompt template
+
+並行:
+    resolved task_trace (failed → later completed)
+        ↓ resolution_detector
+    test_cases [auto-regression, type='regression']
+```
+
+Self-learning MVP **5 週 milestone 全部達成**(spec §28 Roadmap)。Week 6(dashboard + promotion workflow UI)留作 follow-up,核心 backend loop 已可運作。
+
+### 📋 CLI 一次跑通
+
+```bash
+# 1. 撈 failed traces → 抽 observation
+python -m learning.observation_extractor --days 7 --limit 10
+
+# 2. 驗 candidate observation
+python -m learning.verifier --limit 20
+
+# 3. 聚合 verified obs → candidate instinct
+python -m learning.instinct_consolidator
+
+# 4. resolved failures → regression test_case
+python -m learning.resolution_detector --days 30
+
+# 5. active instinct → prompt_rule_candidate
+python -m learning.candidate_generator
+
+# 6. 套 candidate 重跑 baseline → 寫 test_run
+python test_runner.py --domain tflex   # save 進 test_runs
+
+# 7. Gate(baseline vs candidate run)
+python -m learning.regression_gate \
+    --candidate-run-id 20260516_1922 \
+    --candidate-id PRC-000001 \
+    --domain tflex
+```
+
+---
+
 ## [0.8.9] · 2026-05-16 — v0.8.8 baseline iteration:4 連修(STK-01/02 + STK-03 + T1/T2)
 
 **Patch · 從 v0.8.8 baseline 結果(18/26 = 69%)dig 4 個 case 實際 Phase C code,定位每個 root cause 並批次修。**
