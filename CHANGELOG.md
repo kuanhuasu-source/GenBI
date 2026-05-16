@@ -5,6 +5,121 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.5] · 2026-05-16 — Self-Learning MVP Week 4:Consolidator + Contradiction
+
+**Patch · self-learning MVP Week 4 D1+D2 完成。**
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` §14 + §15 + §15.5。
+
+### ✨ `learning/instinct_consolidator.py`(618 行)
+
+兩個獨立但相關的 maintenance job:
+
+#### `consolidate_instincts(db, ...)`
+
+把語意相似的 verified observation 聚合成 candidate instinct。
+
+**Algorithm**:
+
+1. 撈所有 `status='verified'` 的 observation
+2. 依 `phase` 分組(不同 phase 一定不聚)
+3. 組內依 `recommendation` 跑貪婪 Jaccard cluster(threshold 0.45)
+4. cluster size ≥ 3 且 avg confidence ≥ 0.80 → 建 instinct
+5. 取 cluster 內 confidence 最高的 obs 的 recommendation 當 canonical rule
+6. **status='candidate'**(人類審後在 dashboard 改 `active`)
+7. **Idempotent**:同 supporting_observation_ids signature 已建 → skip
+
+**新 instinct 欄位**(對齊 §7.3):
+
+| 欄位 | 來源 |
+|---|---|
+| instinct_id | `INST-AUTO-NNNNN`(避免撞 seed `INST-SEED-NNN`) |
+| name | `consolidated_inst_auto_nnnnn` |
+| rule | cluster 內最高 conf 那筆的 recommendation |
+| domain | CLI 帶入(default `tflex`) |
+| phase | cluster 共同 phase |
+| tags | cluster tag union(去重保留順序,cap 10) |
+| confidence | cluster avg verifier_confidence |
+| evidence_count | cluster size |
+| supporting_observation_ids | cluster 所有 obs_id |
+| source | `consolidated` |
+| status | `candidate` |
+
+#### `detect_contradictions(db, ...)`
+
+掃 verified observations vs active instincts,找潛在矛盾 + auto-degrade。
+
+**命中規則**(全部成立才算 contradicting):
+
+1. 同 phase
+2. tags 有交集
+3. Jaccard(obs.cause+rec, inst.rule) ≥ 0.50
+4. **Negation 詞 presence 不同**(一邊有「禁止/不要/forbid/avoid/not」,另一邊沒有 — 立場相反)
+
+**Negation 啟發式**:
+
+- 英文 token-level:`not / no / never / avoid / forbid / disallow / forbidden / dont`
+- 中文 substring:`不要 / 不可 / 不准 / 不能 / 禁止 / 避免 / 勿 / 別`
+- 「不」單字太常見(可能是「不過」「不一定」),沒加
+
+**命中動作**:
+
+1. `instinct.contradiction_count++`
+2. `confidence -= 0.05`(spec §15.2)
+3. `confidence < 0.60` → `status='deprecated'`(spec §15.3)
+4. 寫一筆 `learning_jobs` notification(`job_type='contradiction_review'`,`status='needs_review'`)讓人類在 dashboard 審
+5. `applied_contradiction_obs_ids` 加進 instinct,**idempotent**(同 obs 不重複扣)
+
+**為什麼 auto-degrade 但寫 notification**?
+> 啟發式必有 false positive。auto 扣分讓系統反應快,寫 notification 讓人類能複查;真誤判時 dashboard 上可手動 revert。
+
+#### CLI
+
+```bash
+# 跑 consolidation + contradiction(default)
+python -m learning.instinct_consolidator
+
+# Dry run 看會做什麼
+python -m learning.instinct_consolidator --dry-run
+
+# 只跑其中一項
+python -m learning.instinct_consolidator --skip-consolidation
+python -m learning.instinct_consolidator --skip-contradiction
+
+# 換 cluster threshold(預設 3 obs + avg conf 0.80)
+python -m learning.instinct_consolidator --min-observations 5 --min-avg-confidence 0.85
+```
+
+### ✅ 驗證
+
+- AST OK,618 行
+- 10 個 unit check 全綠:
+  - `_has_negation` EN token / ZH substring / mixed / 非 str 防呆
+  - `_cluster_obs_by_similarity` 3 個近似 paraphrase → 1 cluster + 1 個分離
+  - 3 個 diverse rec → 3 cluster(no false union)
+  - `_build_instinct_doc` 正確取最高 conf 代表 / 合併 tag / 算 avg / `status='candidate'` / `source='consolidated'`
+  - `_is_contradicting` 4 種 matrix(正命中 / 跨 phase / 低 sim / 同 negation side / 同 positive side)
+
+### 🚧 Week 4 完成 → MVP loop 全綠
+
+```
+failed task_trace
+    ↓ failure_filter
+    ↓ observation_extractor   (LLM 抽 + dedupe)
+learning_observations [candidate]
+    ↓ verifier               (LLM 獨立 + confidence)
+learning_observations [verified | rejected | candidate-revise]
+    ↓ instinct_consolidator  (cluster ≥3 + avg conf ≥0.80)
+learning_instincts [candidate]   ← 人類在 dashboard 改 active
+    ↓ detect_contradictions  (掃 verified obs vs active instincts)
+    ↓ auto-degrade + notification
+learning_instincts [deprecated 或 lower conf]
+```
+
+Next:Week 5 — failure-to-test 自動轉換 + prompt rule candidate 產生 + regression gate。
+
+---
+
 ## [0.8.4] · 2026-05-16 — Self-Learning MVP Week 3:Verifier + Confidence
 
 **Patch · self-learning MVP Week 3 D1+D2 完成。**
