@@ -5,6 +5,73 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.6.0] · 2026-05-15 — Phase B preprocess modular routing(-40~49% prompt size)
+
+**Minor · 把 v0.5.0 的 Phase C 套路套到 Phase B,再砍一筆 prompt token。**
+
+### 🎯 動機
+
+- Phase C v0.5.0 已 -80% prompt size。次大目標是 Phase B(原 ~9.7K,佔 per-case 第二多)。
+- 同設計原則(intent routing + universal header + 注入 block),從一開始就 domain-generic。
+
+### ✨ 主要改動
+
+- **`_detect_preprocess_intent(query, dashboard_hint, metadata)` 新增**(`llm_service.py`,純 Python heuristic):
+  - 6 種 intent:`dashboard_kpi` / `stacked_long_pct` / `stacked_wide` / `ratio_kpi` / `time_series` / `simple_groupby`(default)
+  - 重用 v0.5.1 的 `_has_rate` / `_has_count` regex(domain-generic)
+  - **`time_series` 走 schema-driven 偵測**:檢查 `metadata.collections.*.fields` 有沒有 date/datetime/timestamp,沒有就不走(避免在沒時間欄的 domain 誤觸)
+  - 20 個 unit test 全綠
+- **Phase B template 拆 modular**(`embedded_prompts.py`):
+  - `_PHASE_B_HEADER_TEMPLATE_V6`:universal rules(rule 1/1.5/2/3/4/5/6/7/8/9/10)
+  - `_PHASE_B_INTENT_BLOCKS` dict:6 個 block
+  - `_PHASE_B_FOOTER_TEMPLATE_V6`
+  - `compose_phase_b_prompt_modular(intent, cols_info, domain_knowledge, dashboard_block)` helper
+- **`generate_preprocess_code` 走 router**:`_detect_preprocess_intent(query, dashboard_hint, self.task_metadata)` → 注入對應 block
+- **legacy Phase B template 保留**:DB repo 仍有舊版,v0.6.0 inline path 跳過(per Option A,migration 留 v0.6.1)
+
+### 📊 量測結果(sandbox 驗證)
+
+| Intent | Size | vs 舊 9.7K |
+|---|---:|---:|
+| `dashboard_kpi` | 5,870 | -39.5% |
+| `stacked_long_pct` | 5,302 | -45.3% |
+| `stacked_wide` | 4,959 | **-48.9%** |
+| `ratio_kpi` | 5,175 | -46.6% |
+| `time_series` | 5,170 | -46.7% |
+| `simple_groupby` | 5,100 | -47.4% |
+
+**平均 -46%**。疊加 v0.5.0 Phase C 的 -80%,**Phase B+C 合計 per case 從 ~31K → ~10K(-67%)**。
+
+### 🐛 修正過的 bug
+
+實作過程踩到 Jinja2 雷:intent block 內含 Python `pd.DataFrame({{'metric': [...]}})` 範例的 `{{` 被 Jinja 誤判為表達式 → crash。修法:intent block **不走 Jinja render**,改為 literal `.replace("{{ dashboard_block }}", ...)` 只處理 dashboard_kpi 的特殊 placeholder。
+
+### 🌐 通用化驗證
+
+| Domain | dashboard | stacked_100 | ratio | time_series | simple |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Healthcare | ✅ | ✅ | ✅ | ✅ | ✅ |
+| E-commerce | ✅ | ✅ | ✅ | ✅ | ✅ |
+| HR | ✅ | ✅ | ✅ | ✅ | ✅ |
+| tflex | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+`time_series` 用 metadata schema 偵測時間欄,避免在沒時間欄的 domain 誤觸。
+
+### ✅ Sandbox 測試
+
+- 20/20 detector unit test 全綠
+- 6 個 intent 全部 < 6K(預估 5-6K,達標)
+- end-to-end router dispatch:6/6 正確
+- dashboard_block 注入驗證:✅ marker round-trip 通過
+- export_pptx smoke 7/7 仍綠
+
+### 🚧 後續(v0.6.1 規劃)
+
+- DB migration:把 Phase B + Phase C 的 modular template seed 進 MongoDB
+- 視 v0.6.0 baseline 結果決定是否要把某些 rule 拉回 universal header
+
+---
+
 ## [0.5.1] · 2026-05-15 — Domain-generic intent detector(regex-based rate / count)
 
 **Patch · 補 v0.5.0 兩個 domain-specific leak,確保新 domain 進來不用改 code。**

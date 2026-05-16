@@ -1168,6 +1168,88 @@ def _detect_chart_intent(query: str) -> str:
     return "bar_basic"
 
 
+# ============================================================
+# v0.6.0:Phase B preprocess intent detector
+#
+# 6 種 intent → 對應 Phase B skeleton block:
+#   dashboard_kpi / stacked_long_pct / stacked_wide / ratio_kpi /
+#   time_series / simple_groupby (default)
+#
+# 完全 domain-generic:用 _has_rate / _has_count regex + universal pattern。
+# ============================================================
+
+_TIMESERIES_WORDS = ('趨勢', 'trend', '時間序列', 'time series',
+                      '走勢', '時序', '每月', '每年', '每週', '每日',
+                      'monthly', 'weekly', 'daily', 'yearly')
+
+
+def _metadata_has_time_col(metadata: dict | None) -> bool:
+    """檢查 metadata 是否描述了任何時間欄位(date / timestamp / datetime)。
+    schema-driven 偵測,避免在沒時間欄的 domain 誤走 time_series。"""
+    if not metadata or not isinstance(metadata, dict):
+        return False
+    collections = metadata.get("collections", {}) or {}
+    if not isinstance(collections, dict):
+        return False
+    for _, col_def in collections.items():
+        if not isinstance(col_def, dict):
+            continue
+        fields = col_def.get("fields", []) or []
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            ftype = (f.get("type") or "").lower()
+            fname = (f.get("name") or "").lower()
+            if ftype in ("date", "datetime", "timestamp"):
+                return True
+            if any(t in fname for t in ("date", "time", "timestamp", "_at", "_dt")):
+                return True
+    return False
+
+
+def _detect_preprocess_intent(query: str,
+                               dashboard_hint: bool = False,
+                               metadata: dict | None = None) -> str:
+    """
+    Phase B routing — 決定該注入哪個 skeleton block。
+
+    回傳 6 種 intent 之一:
+      dashboard_kpi / stacked_long_pct / stacked_wide / ratio_kpi /
+      time_series / simple_groupby
+
+    判斷順序(從特異到通用):
+      1. dashboard_hint 已 set → dashboard_kpi
+      2. stacked + 100%/百分比 信號 → stacked_long_pct
+      3. stacked 但非 100% → stacked_wide
+      4. time_series 詞 + metadata 有 time col → time_series
+      5. 含 rate 詞 → ratio_kpi
+      6. fallback → simple_groupby
+
+    純 heuristic + schema check,零 LLM call。Domain-generic。
+    """
+    if dashboard_hint:
+        return "dashboard_kpi"
+    if not query:
+        return "simple_groupby"
+
+    has_stack = _has_any(query, _CHART_STACK_WORDS)
+    has_100pct = _has_any(query, _CHART_100PCT_WORDS)
+
+    if has_stack and (has_100pct or '百分比' in query):
+        return "stacked_long_pct"
+    if has_stack:
+        return "stacked_wide"
+
+    # time_series 需要 schema-level 確認(domain 沒時間欄不該走這條)
+    if _has_any(query, _TIMESERIES_WORDS) and _metadata_has_time_col(metadata):
+        return "time_series"
+
+    if _has_rate(query):
+        return "ratio_kpi"
+
+    return "simple_groupby"
+
+
 def is_dashboard_query(query: str) -> bool:
     """
     啟發式偵測:此查詢是否為「dashboard / 執行摘要」場景。
@@ -1790,9 +1872,14 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
 
 """
 
+        # v0.6.0:偵測 preprocess intent,只注入相關 skeleton(prompt size -40%)
+        intent = _detect_preprocess_intent(
+            query, dashboard_hint=dashboard_hint, metadata=self.task_metadata,
+        )
         system_prompt = self._render_phase_b_preprocess_prompt(
             cols_info=cols_info,
             dashboard_block=dashboard_block,
+            intent=intent,
         )
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(
@@ -1806,23 +1893,27 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
         )
         return self._strip_code_fence(raw, lang="python")
 
-    def _render_phase_b_preprocess_prompt(self, cols_info: str, dashboard_block: str) -> str:
-        """產生 Phase B preprocess system prompt(repo → inline fallback)。"""
-        if self.prompt_repo is not None:
-            try:
-                return self.prompt_repo.render(
-                    "phase_b_preprocess",
-                    domain=self.domain,
-                    cols_info=cols_info,
-                    domain_knowledge=self.domain_knowledge,
-                    dashboard_block=dashboard_block,
-                )
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"Phase B prompt repo render 失敗,fallback to inline: {e}"
-                )
-        return self._inline_phase_b_preprocess_prompt(cols_info, dashboard_block)
+    def _render_phase_b_preprocess_prompt(self, cols_info: str,
+                                            dashboard_block: str = "",
+                                            intent: str = "simple_groupby") -> str:
+        """產生 Phase B preprocess system prompt。
+
+        v0.6.0 變更(per Option A 設計案):
+        - 走 embedded_prompts.compose_phase_b_prompt_modular(intent)
+        - **跳過 DB repo path**(repo 仍有 v0.4.x monolithic 版,v0.6.0 不用它)
+        - DB migration 留 v0.6.1
+
+        為什麼跳過 repo:repo 的 `phase_b_preprocess` 是 v0.4.x ~9.7K 整塊,
+        和新 modular 不相容。v0.6.0 先讓 inline 走 modular 拿到 -40% prompt size
+        的好處,production migration 留 v0.6.1。
+        """
+        from embedded_prompts import compose_phase_b_prompt_modular
+        return compose_phase_b_prompt_modular(
+            intent=intent,
+            cols_info=cols_info,
+            domain_knowledge=self.domain_knowledge,
+            dashboard_block=dashboard_block,
+        )
 
     def _inline_phase_b_preprocess_prompt(self, cols_info: str, dashboard_block: str) -> str:
         return f"""你是精通 Pandas 的資深資料工程師,負責【B. 資料處理】。

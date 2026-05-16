@@ -430,6 +430,273 @@ _PHASE_D_INSIGHT_TEMPLATE = """你是資深商業分析師,負責撰寫【D. 商
 
 
 # ============================================================
+# Phase B · Preprocess(Pandas 處理)— v0.6.0 modular 版
+# ============================================================
+# 6 種 intent → 對應 Phase B skeleton:
+#   dashboard_kpi / stacked_long_pct / stacked_wide / ratio_kpi /
+#   time_series / simple_groupby
+#
+# 完全 domain-generic:用 `<dim_col>` / `<value_col>` / `<rate_col>` placeholder。
+# 預期 prompt size 從 ~9.7K → 4-6K per call(視 intent)。
+# ============================================================
+
+_PHASE_B_HEADER_TEMPLATE_V6 = """你是精通 Pandas 的資深資料工程師,負責【B. 資料處理】。
+{{ cols_info }}
+
+{{ domain_knowledge }}
+
+### 實作守則 (CRITICAL RULES — universal):
+
+1. 🎯【最外層產出 Q】(CRITICAL FATAL) 最外層必須宣告 `Q` (DataFrame)。
+   禁止包在 function/class 內,禁止 `if __name__`,禁止 `print`。
+
+1.5 🎯【終態必須 Q = 最終結果】(CRITICAL FATAL — 最常犯)
+    不管你中間用什麼變數名(`agg`、`result`、`tmp`、`pivot` 等),
+    **腳本最末必須有 `Q = <最終 DataFrame>` 把終態結果指派回 Q**。
+    Phase C 拿 Q,沒拿其他變數名。
+
+2. 🔠【大小寫鎖死 + KPI 欄名對齊】(CRITICAL) 絕不擅自修改欄位名稱格式。
+   `q_columns` 中是什麼就是什麼,不要 .upper() / .lower() / camelCase 轉換。
+
+3. 🛡️【KPI 公式來源】(CRITICAL) 所有 KPI 計算【嚴格】依照上方 Domain Knowledge 中的
+   `kpi_definitions` 公式。不可自行發明公式、不可自行更動分子分母定義。
+
+4. 🛡️【小樣本處理】若涉及比率,請保留分子分母絕對數,便於後續判讀。
+
+5. 🚫【禁止外部 IO】不可呼叫 `read_csv` / `read_sql` / `open`。`raw_df` 已備好。
+
+6. 🚫【禁止 self-merge】(CRITICAL FATAL) raw_df 已是上游 join 完成的長表,
+   絕對禁止對 raw_df 做 `.merge(raw_df)` 之類的自己 merge 自己。
+
+7. 🚫【禁止幻覺欄位】只使用上方 `avail_cols` 與 `raw_df` 樣本中【實際出現】的欄位。
+
+8. ✅【寫前自我驗證】寫 code 前先在腦中跑一次:每個 `Q['xxx']` 的 `'xxx'`
+   都在 q_columns 中嗎?算術後新增的欄位名跟自己定的 spec 一致嗎?
+
+9. 🚫【Series.first() 禁區】(CRITICAL) Series 物件**沒有 `.first()` 方法**!
+   - ❌ `Q['hc'].first()` → AttributeError
+   - ✅ `Q['hc'].iloc[0]`(取首列值)
+   - ✅ `Q.groupby(...).agg(hc=('hc', 'first'))`(此處 'first' 是 agg function 字串,合法)
+
+10. 🎯【保持 long / tidy format】(CRITICAL) Q 最終結果應為 long-form(tidy data):
+    每列代表一個 observation,每欄是一個變數。
+    - ✅ Long(推薦):`[dim_a, dim_b, value]` 三欄,row 為笛卡兒積
+    - ❌ Wide(除非使用者明說要表格):`pivot(index=dim_a, columns=dim_b)`
+    例外:Heatmap **強制 long format**(ECharts heatmap 需 `[[x,y,value], ...]`)。
+"""
+
+_PHASE_B_FOOTER_TEMPLATE_V6 = """
+請只輸出 python code,不要前言不要說明。"""
+
+
+# ============================================================
+# Phase B Intent-specific blocks(只在偵測到該 intent 時注入)
+# ============================================================
+
+_PHASE_B_BLOCK_DASHBOARD_KPI = """
+{{ dashboard_block }}
+
+### 🎯 Dashboard KPI 配方(query 為 KPI 一覽 / dashboard / 執行摘要場景)
+
+**結論先寫:走 row-level pass-through,把 scalar 算式交給 Phase C 的 `_kpi_cards`。**
+
+✅ 推薦做法:
+```python
+Q = raw_df.copy()
+# 只加衍生 bool / 數值欄位,不做 groupby/agg
+Q['is_<state_a>'] = (Q['<status_col>'] == '<val_a>')
+Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
+# 不要再做 groupby/agg!Phase C 會用 f"{Q['col'].sum():,}" 計算總量
+```
+
+🚫 嚴禁:
+- `Q.agg(name=(col, op))` 任何「沒 groupby 的 named aggregation」
+- `Q = pd.DataFrame({{'metric': [...], 'value': [...]}})` 預組 KPI 表
+- 在 Q 中加入 TOTAL / SUMMARY / 合計 / 總計 列(Phase C `Q['col'].sum()` 會雙倍計算)
+"""
+
+
+_PHASE_B_BLOCK_STACKED_LONG_PCT = """
+### 📚 100% Stacked Bar 標準骨架(query 含 100% / 百分比 + stacked)
+
+Phase B 必須產出 long-format `[dim_x, dim_series, percentage]` 三欄 Q,
+每組 dim_x 內所有 dim_series 的 percentage 加總 = 100。
+
+✅ 標準骨架:
+```python
+# 1. groupby 計數
+counts = raw_df.groupby(['<x_dim>', '<series_dim>']).size().reset_index(name='count')
+
+# 2. 用 transform 算每組總數(不需中介 _total 欄位)
+counts['_total_per_group'] = counts.groupby('<x_dim>')['count'].transform('sum')
+
+# 3. 算百分比(0-100 範圍,Phase C 直接用)
+counts['percentage'] = (counts['count'] / counts['_total_per_group'] * 100).round(2)
+
+# 4. 終態:只留 3 欄(long format,Phase C pivot 用)
+Q = counts[['<x_dim>', '<series_dim>', 'percentage']]
+```
+
+🚫 嚴禁:
+- pivot 後再 melt(`melt` 的 `var_name` 欄會帶 `_pct` 後綴,Phase C filter 對不上)
+- 在 Q 中保留 wide format(Phase C 5.55 強制 pivot 鐵律,wide 反而 confused)
+- 算完 percentage 後忘了 reset_index
+"""
+
+
+_PHASE_B_BLOCK_STACKED_WIDE = """
+### 📚 Raw count Stacked 骨架(query 含 stacked 但沒 100% 信號)
+
+Phase B 產出 long-format 三欄 Q,Phase C 自己 pivot:
+
+✅ 標準骨架:
+```python
+counts = raw_df.groupby(['<x_dim>', '<series_dim>']).size().reset_index(name='count')
+Q = counts[['<x_dim>', '<series_dim>', 'count']]
+```
+
+或若 query 要求 wide(罕見):
+```python
+Q = (raw_df.groupby(['<x_dim>', '<series_dim>'])
+        .size().unstack(fill_value=0).reset_index())
+```
+
+🚫 嚴禁:
+- 自己 normalize 到 100(只有 100% 才這麼做,raw count stacked 保留絕對量)
+"""
+
+
+_PHASE_B_BLOCK_RATIO_KPI = """
+### 📊 比率類 KPI 標準骨架(query 含「率/比率/比例」)
+
+⚠️【數學鐵律】比率類 KPI **必須保留分子分母絕對數**,供 Phase C 算「加權平均」。
+Phase C 看到 `<x>_count` + `<x>_total` 會自動算 `total_rate = numerator.sum() / denominator.sum()`。
+
+✅ 標準骨架:
+```python
+agg = raw_df.groupby('<dim_col>').agg(
+    <numerator>=('<bool_or_count_col>', 'sum'),    # 分子(條件計數)
+    <denominator>=('<total_col>', 'size'),         # 分母(總數)
+).reset_index()
+
+# 比率類欄位(0-1 範圍,Phase C 會 * 100 + formatter "{value}%")
+agg['<rate_col>'] = agg['<numerator>'] / agg['<denominator>']
+
+Q = agg
+```
+
+🚫 嚴禁:
+- 只留 rate 欄不留分子分母(Phase C 無法做加權平均,只能做簡單平均率,小組會拉偏)
+- `agg['rate'] = agg['rate'].mean()`(這是簡單平均率,理論上錯誤)
+- 自己 `* 100`(rate 留 0-1,Phase C 配合 formatter `{{value}}%` 顯示)
+"""
+
+
+_PHASE_B_BLOCK_TIME_SERIES = """
+### 📈 時間序列 KPI 骨架(query 含「趨勢 / 時間 / 走勢」+ schema 有 time col)
+
+✅ 標準骨架:
+```python
+# 1. 確保時間欄是 datetime 型別
+raw_df['<time_col>'] = pd.to_datetime(raw_df['<time_col>'])
+
+# 2. 用 dt 取出時間粒度(月/週/日 視 query 而定)
+raw_df['<period>'] = raw_df['<time_col>'].dt.to_period('<freq>')  # M / W / D
+#     ↑ freq:'M'=月、'W'=週、'D'=日、'Q'=季、'Y'=年
+
+# 3. 按時間 + (可選)維度 groupby
+agg = raw_df.groupby(['<period>', '<optional_dim>']).agg(
+    <metric>=('<col>', '<op>')
+).reset_index()
+
+# 4. period → string(Phase C xAxis.data 需要 str)
+agg['<period>'] = agg['<period>'].astype(str)
+
+Q = agg
+```
+
+🚫 嚴禁:
+- pivot 成 wide(時間序列保 long,Phase C line chart 自己 sort)
+- 用 `dt.strftime('%Y-%m')` 取代 `to_period`(period 排序穩定)
+"""
+
+
+_PHASE_B_BLOCK_SIMPLE_GROUPBY = """
+### 📊 基本 groupby + agg 骨架(default fallback)
+
+✅ 最小可用骨架:
+```python
+Q = (raw_df.groupby('<dim_col>')
+        .agg(<metric>=('<col>', '<op>'))      # op = 'size' / 'sum' / 'mean' / 'nunique'
+        .reset_index())
+```
+
+多 KPI 時:
+```python
+agg = raw_df.groupby('<dim_col>').agg(
+    <metric_a>=('<col_a>', 'size'),
+    <metric_b>=('<bool_col>', 'sum'),
+    <reference>=('<reference_col>', 'first'),  # 維度級參考值(避免 self-merge)
+).reset_index()
+
+# 衍生比率類 KPI(若有)
+agg['<rate>'] = agg['<numerator>'] / agg['<denominator>']
+
+Q = agg
+```
+
+⚠️ 涉及 distinct 計數一律用 `nunique()`,不要 `len(set(...))`。
+⚠️ ID 欄位(主鍵類字串)不要轉 int,保持字串。
+"""
+
+
+# Intent → Block mapping
+_PHASE_B_INTENT_BLOCKS: dict[str, str] = {
+    "dashboard_kpi": _PHASE_B_BLOCK_DASHBOARD_KPI,
+    "stacked_long_pct": _PHASE_B_BLOCK_STACKED_LONG_PCT,
+    "stacked_wide": _PHASE_B_BLOCK_STACKED_WIDE,
+    "ratio_kpi": _PHASE_B_BLOCK_RATIO_KPI,
+    "time_series": _PHASE_B_BLOCK_TIME_SERIES,
+    "simple_groupby": _PHASE_B_BLOCK_SIMPLE_GROUPBY,
+}
+
+
+def compose_phase_b_prompt_modular(intent: str, cols_info: str,
+                                     domain_knowledge: str = "",
+                                     dashboard_block: str = "") -> str:
+    """
+    v0.6.0:依 preprocess intent 組裝 slim Phase B prompt。
+
+    Args:
+        intent: `_detect_preprocess_intent(query, ...)` 回傳的 intent string
+        cols_info: avail_cols + raw_df sample(Python 端預組)
+        domain_knowledge: metadata 注入(schema / kpi_definitions / 限制)
+        dashboard_block: dashboard mode 時的條件區塊(僅 dashboard_kpi intent 用)
+
+    Returns:
+        組裝後的完整 prompt(string)。
+
+    設計細節:
+        - HEADER 走 Jinja2 render(cols_info / domain_knowledge 是變數注入)
+        - intent block **不走 Jinja**,因為 block 內含 Python code 範例(`{{ }}` 在
+          Python dict literal 中是合法字符,Jinja 會誤判);改用 literal .replace
+        - 對 dashboard_kpi 特殊處理 {{ dashboard_block }} placeholder
+    """
+    from jinja2 import Template
+    header = Template(_PHASE_B_HEADER_TEMPLATE_V6).render(
+        cols_info=cols_info,
+        domain_knowledge=domain_knowledge,
+    )
+    intent_block = _PHASE_B_INTENT_BLOCKS.get(
+        intent, _PHASE_B_INTENT_BLOCKS["simple_groupby"]
+    )
+    # 對 dashboard_kpi 做 literal replace(避免 Jinja 把 Python dict literal 中的 `{{` 誤解)
+    if intent == "dashboard_kpi":
+        intent_block = intent_block.replace("{{ dashboard_block }}", dashboard_block)
+    return header + intent_block + _PHASE_B_FOOTER_TEMPLATE_V6
+
+
+# ============================================================
 # Phase C · ECharts(視覺化繪圖)— v0.5.0 modular 版
 # ============================================================
 # 將原本 24K 的 monolithic template 拆成 header + intent blocks + footer。
