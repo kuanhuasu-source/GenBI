@@ -5,6 +5,60 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.7.0] · 2026-05-15 — Task Trace Recorder(end-to-end query 追蹤)
+
+**Minor · 加入完整 task trace,可逐步檢視每次 query 的所有 LLM call 與函式呼叫。**
+
+### 🎯 動機
+
+跑完 query 想 debug 哪一步慢、哪個 prompt 出了什麼問題、LLM 實際給了什麼回應 — 之前要從 console scrollback 撈,無法跨 session 保留。需要一個結構化、可長期保存、可 UI 檢視的 trace 系統。
+
+### ✨ 主要改動
+
+- **`task_trace.py` 新模組**:
+  - `TaskTrace` class:`step(phase, kind)` context manager + `record_llm_call(...)` + `set_chart_intent / set_preprocess_intent` + `finalize(status)` 寫進 MongoDB
+  - `TaskTraceRepository`:`list_recent` / `get_by_id` / `delete` / `purge_older_than`
+  - Silent-fail 設計:DB 寫入失敗不影響 user query;訊息超大時自動截斷
+- **`LLMService._call_llm` 加 hook**:
+  - 新增 `self.trace` attribute(default None,向後相容)
+  - 每次 call 完整記錄 `messages` + `response` + tokens 進 trace
+  - 失敗 call 也記錄(含 error message)
+- **`app.py` 整合**:
+  - 每次 user query 開始時建 TaskTrace,attach 到 `llm_service.trace`
+  - 偵測完 intent 後立刻記到 trace
+  - 成功 / refuse / Phase B retry 失敗 / 系統例外 4 個路徑都會 finalize
+  - 顯示 `🔍 Trace 已記錄 · <id>` toast
+- **`pages/05_task_traces.py` admin 頁面**:
+  - 上半:trace list table(time / domain / query / status / wall / tokens / chart intent / preprocess intent)
+  - 下半:選擇 trace → 5 個 metric card + step 耗時 bar chart + 逐 step expander(LLM call 可展開看完整 messages + response + tokens)
+  - Raw JSON debug view
+  - 個別刪除 / N 天 purge
+- **`config.py`**:加 `TASK_TRACES_COLLECTION` env(預設 `task_traces`)
+
+### 📊 資料結構
+
+每筆 trace ~20-100 KB,含:
+- query / domain / intent / wall_time / status / error
+- steps array(每個 step 含 phase / kind / elapsed_s / meta / llm_call payload)
+- llm_call payload = `{model, messages[], response, prompt_tokens, completion_tokens, intent}`
+- summary aggregates(LLM call 數 / 總 token)
+
+### ✅ Sanity tests
+
+- TaskTrace lifecycle with `db=None`:✅
+- step ordering / kinds / elapsed / summary aggregation:✅
+- LLMService `.trace` attribute 存在:✅
+- pages/05_task_traces.py 語法 OK
+- export_pptx smoke 7/7 仍綠
+
+### 🚧 已知限制
+
+- meta_response 路徑(intro/greeting/data_check 等)目前不會建 trace(早於 trace 建立點)
+- test_runner.py 目前還沒整合 trace(待 v0.7.1,讓 baseline 也有 trace 可分析)
+- 沒有 cross-trace 比較功能(待 v0.7.2)
+
+---
+
 ## [0.6.1] · 2026-05-15 — Phase 0 + Phase A 範例壓縮(邊際改善)
 
 **Patch · 收尾型瘦身,範例濃縮但不破壞語意。**

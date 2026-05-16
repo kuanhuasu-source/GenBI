@@ -158,6 +158,8 @@ METADATA_COLLECTION: str = os.getenv("GENBI_METADATA_COLLECTION", "domain_metada
 TEST_CASES_COLLECTION: str = os.getenv("GENBI_TEST_CASES_COLLECTION", "test_cases")
 TEST_RUNS_COLLECTION: str = os.getenv("GENBI_TEST_RUNS_COLLECTION", "test_runs")
 AUDIT_LOG_COLLECTION: str = os.getenv("GENBI_AUDIT_LOG_COLLECTION", "audit_log")
+# v0.7.0+:Task trace 紀錄(每次 query 完整步驟 + LLM call 內容)
+TASK_TRACES_COLLECTION: str = os.getenv("GENBI_TASK_TRACES_COLLECTION", "task_traces")
 
 
 # ============================================================

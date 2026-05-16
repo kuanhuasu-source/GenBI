@@ -1382,6 +1382,12 @@ class LLMService:
         # 由外部測試框架在 case 開始前呼叫 reset_call_log(),結束時 get_call_summary()
         self.call_log: list[dict] = []
 
+        # ── v0.7.0+ TaskTrace hook ──
+        # caller(app.py / test_runner.py)可在 query 開始前 attach 一個 TaskTrace
+        # instance;_call_llm 會自動同步完整 messages + response 進去。
+        # 若 None,trace 機制完全 disabled(向後相容)。
+        self.trace = None
+
         # ── v0.3.0+ Prompt Repository ──
         # 若 prompt_repo is False,完全停用 repo(回退 v0.2.x inline 行為)
         # 若 prompt_repo is None,build default(走 config.PROMPT_REPO_ENABLED + embedded)
@@ -1443,26 +1449,55 @@ class LLMService:
                 max_tokens=max_tokens,
             )
         except Exception as e:
+            elapsed = round(time.time() - t0, 2)
             self.call_log.append({
                 "phase": phase,
-                "elapsed_s": round(time.time() - t0, 2),
+                "elapsed_s": elapsed,
                 "prompt_tokens": None,
                 "completion_tokens": None,
                 "total_tokens": None,
                 "error": str(e),
             })
+            # v0.7.0:trace 失敗 call(若 trace recorder 存在)
+            if getattr(self, "trace", None) is not None:
+                try:
+                    self.trace.record_llm_call(
+                        phase=phase, model=self.model_name,
+                        messages=messages, response="",
+                        prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                        elapsed_s=elapsed, error=str(e),
+                    )
+                except Exception:
+                    pass  # silent — trace 失敗不影響 user query
             raise RuntimeError(f"LLM API 呼叫失敗: {str(e)}")
 
         elapsed = round(time.time() - t0, 2)
         usage = getattr(response, "usage", None)
+        pt = getattr(usage, "prompt_tokens", None) if usage else None
+        ct = getattr(usage, "completion_tokens", None) if usage else None
+        tt = getattr(usage, "total_tokens", None) if usage else None
         self.call_log.append({
             "phase": phase,
             "elapsed_s": elapsed,
-            "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
-            "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
-            "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": tt,
         })
-        return response.choices[0].message.content
+        response_content = response.choices[0].message.content
+
+        # v0.7.0:trace recorder hook — 完整記錄 messages + response
+        if getattr(self, "trace", None) is not None:
+            try:
+                self.trace.record_llm_call(
+                    phase=phase, model=self.model_name,
+                    messages=messages, response=response_content,
+                    prompt_tokens=pt, completion_tokens=ct, total_tokens=tt,
+                    elapsed_s=elapsed,
+                )
+            except Exception:
+                pass  # silent — trace 失敗不影響 user query
+
+        return response_content
 
     def reset_call_log(self) -> None:
         """測試 framework 在每個 case 開始前呼叫,清空累積 telemetry。"""

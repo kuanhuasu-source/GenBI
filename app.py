@@ -29,7 +29,10 @@ from llm_service import (
     rescue_empty_echarts,
     ensure_default_styling,
     coerce_option_native_types,
+    _detect_chart_intent,
+    _detect_preprocess_intent,
 )
+from task_trace import TaskTrace
 import config
 
 
@@ -645,6 +648,24 @@ if query:
             f"🧠 處理中:{query[:60] + ('…' if len(query) > 60 else '')}",
             expanded=True,
         )
+        # v0.7.0:Task trace 開始記錄(LLMService.trace 內 hook 會自動記 LLM call)
+        _trace = TaskTrace(
+            db=mongo_db,
+            domain=st.session_state.get("active_domain", ""),
+            query=query,
+            collection_name=config.TASK_TRACES_COLLECTION,
+        )
+        llm_service.trace = _trace
+        # 先記 intent(detector 是即時的,跟 query 在同個 frame)
+        try:
+            _trace.set_chart_intent(_detect_chart_intent(query))
+            _trace.set_preprocess_intent(_detect_preprocess_intent(
+                query, dashboard_hint=is_dashboard_query(query),
+                metadata=llm_service.task_metadata,
+            ))
+        except Exception:
+            pass
+
         workflow_namespace = {"pd": pd, "np": __import__("numpy")}
         final_fig = None
         insight_text = None
@@ -687,6 +708,13 @@ if query:
                     "role": "assistant",
                     "content": f"⚠️ 資料不足\n\n{clean_msg}",
                 })
+                # v0.7.0:refuse 也算結束 → finalize trace
+                try:
+                    _trace.finalize(status="refused")
+                except Exception:
+                    pass
+                finally:
+                    llm_service.trace = None
                 st.stop()  # 中止後續 phase
 
             # ============================================================
@@ -795,6 +823,14 @@ if query:
                         st.code(prep_code, language="python")
                         with st.expander("🔍 展開 Traceback"):
                             st.code(prep_err, language="bash")
+                        # v0.7.0:finalize trace 在中止前
+                        try:
+                            _trace.finalize(status="failed",
+                                             error="Phase B retry exhausted")
+                        except Exception:
+                            pass
+                        finally:
+                            llm_service.trace = None
                         st.stop()
 
             Q = workflow_namespace.get("Q")
@@ -998,11 +1034,27 @@ if query:
                 "use_table_fallback": use_table_fallback,
             }
 
+            # v0.7.0:任務成功 → finalize trace 寫進 MongoDB
+            try:
+                _trace_id = _trace.finalize(status="completed")
+                st.caption(f"🔍 Trace 已記錄(在「Task Traces」頁面查看)· `{_trace_id[:8]}`")
+            except Exception:
+                pass
+            finally:
+                llm_service.trace = None  # detach,避免下個 query 沾到舊 trace
+
         except Exception as e:
             status.update(label="❌ 系統執行中斷", state="error", expanded=True)
             st.error(f"發生系統級錯誤:\n{str(e)}")
             with st.expander("🔍 展開 Traceback"):
                 st.code(traceback.format_exc(), language="bash")
+            # v0.7.0:任務失敗 → 仍寫 trace(便於除錯)
+            try:
+                _trace.finalize(status="failed", error=str(e))
+            except Exception:
+                pass
+            finally:
+                llm_service.trace = None
 
 
 # ============================================================
