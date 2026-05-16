@@ -5,6 +5,56 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.0] · 2026-05-16 — Self-Learning MVP Week 1 D1:Bootstrap Layer
+
+**Minor · 開啟 self-learning MVP 第一條 milestone。**
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` §8.1 Historical Seed Rules。
+
+### ✨ 新增
+
+- **`learning/` package**:Self-learning 模組根目錄,含 `__init__.py` 標明後續 8 個 module 的職責(failure_filter / observation_extractor / verifier / confidence / instinct_consolidator / candidate_generator / promotion_gate / dashboard_metrics 待 Week 2-6 補)。
+- **`learning/bootstrap.py`**:
+  - `HISTORICAL_SEEDS` list:13 條對齊 GenBI v0.3.x-v0.7.x hotfix 的 instinct seeds,涵蓋 Phase A (3) / Phase B (3) / Phase C (5) / Phase 0 (1) / Meta (1)。
+  - 每條 seed 含:`instinct_id` / `name` / `rule` / `phase` / `error_class` / `tags` / `implementation` 實際 GenBI code 引用 / `version_source` 來源 hotfix。
+  - `seed_all(db, dry_run, verbose)` idempotent upsert function:已存在的 `historical_seed` 記錄覆蓋更新,production-modified 記錄保留(由 `source` 欄判斷)。
+  - `_ensure_indexes(db)`:確保 4 個 index(instinct_id unique / status / domain / phase / tags)。
+  - CLI:`python -m learning.bootstrap [--dry-run] [--skip-indexes]`。
+- **`migrations/004_bootstrap_learning_instincts.py`**:跟既有 001-003 migration 一致風格,wrap `learning.bootstrap.seed_all` 並加 verification 步驟。
+
+### 📊 13 條 seed 對照表(對齊 codebase 真實實作)
+
+| ID | Name | Phase | Implementation |
+|---|---|---|---|
+| 001 | strip_derived_expressions | A | `sanitize_pipeline()` |
+| 002 | defensive_json_extraction | A | `extract_json_block()` |
+| 003 | phase_a_retry_with_error_feedback | A | `generate_pipeline()` retry |
+| 004 | series_to_dataframe_safety_net | B | Series safety net |
+| 005 | forbid_import_in_phase_b | B | Phase B prompt rule 1 (v0.7.1) |
+| 006 | forbid_phase_b_replay_raw_df | B | Phase B prompt rule 3.1 |
+| 007 | coerce_numpy_to_native | C | `coerce_option_native_types()` |
+| 008 | rescue_empty_echarts | C | `rescue_empty_echarts()` |
+| 009 | rescue_in_except_path | C | except path |
+| 010 | dual_axis_force_route | C | rule 5.9 |
+| 011 | forbid_empty_shell_dynamic_fill | C | rule 3.1 |
+| 012 | chart_word_not_refuse_trigger | 0 | Phase 0 Step 1 |
+| 013 | prompt_invariants_enforcement | meta | `check_prompt_invariants.py` |
+
+### ✅ 驗證
+
+- syntax OK(3 個 file 全 py_compile pass)
+- HISTORICAL_SEEDS = 13 條,instinct_id / name 都 unique
+- Phase 分布:phase_a=3, phase_b=3, phase_c=5, phase_0=1, meta=1
+- CLI `--help` 正確顯示
+- `seed_all(MockDB, dry_run=True)` 回 `{'inserted': 13, 'updated': 0, 'skipped': 0, 'total': 13}`
+
+### 🚧 後續(Week 1 D2 / D3)
+
+- Week 1 D2:其他 4 個 MongoDB collection schema + indexes(`learning_observations` / `verifier_results` / `learning_jobs` / `prompt_rule_candidates`)
+- Week 1 D3:`learning/failure_filter.py` 從 `task_traces` 撈 failed runs
+
+---
+
 ## [0.7.4] · 2026-05-16 — test_runner echarts_required_keys 改 chart-type aware
 
 **Patch · 修 Case 07 false fail(LLM 選 pie chart 但 test 要求 xAxis/yAxis)。**
