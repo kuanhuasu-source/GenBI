@@ -5,6 +5,134 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.7] · 2026-05-16 — Baseline 4 連修 + retry feedback 升級
+
+**Patch · 從 baseline 全程觀察找到 4 個 systematic bug 一起修。**
+
+### 🔴 Baseline 觀察(20+ case)
+
+| Pattern | Phase | 次數 |
+|---|---|---|
+| `.round()` 對 scalar 失效 | C | **5×** |
+| xAxis 沒 dedupe(long format) | C | **3×** |
+| Phase B 弄丟維度欄位 | B | 1× (T3) |
+| LLM 把 long-format value 當 column | C | 1× (STK-07) |
+| str/numeric divide | B | 1× (Case 01) |
+| bracket / tuple-comp syntax | C | 2× |
+
+**共同病因**:retry feedback 不夠具體,LLM 看到 error 3 attempts 同錯。
+
+### ✨ P1:Phase C rule 3.5 — `.round()` API 用法澄清
+
+`_PHASE_C_HEADER_TEMPLATE` rule 3.5 改寫。原規則只說「必須 `.round(N)`」沒講清楚對什麼物件 call。LLM 錯把 scalar 也用 `.round()`,結果踩雷 5 次。
+
+新規則明確區分:
+
+```
+Series / DataFrame → .round(N)
+scalar (Python float / numpy.float / str) → round(x, N) builtin
+
+✅ Q['col'].round(2).tolist()         # Series 鏈式
+✅ round(Q['col'].iloc[0], 2)         # scalar 用 builtin
+✅ [round(v, 2) for v in raw_list]    # list 元素是 scalar
+
+❌ value.round(2)                      # AttributeError
+❌ Q['rate'].iloc[0].round(2)          # iloc[0] 可能回 Python float
+❌ min(Q['rate']).round(2)             # Python min() 返純 float
+```
+
+### ✨ P2:Phase C rule 3.2 — Long format → ECharts 完整 example
+
+3 個 STK case 連續中相同的雷:LLM `Q['<dim>'].tolist()` 直接塞 xAxis,沒 dedupe。`series.data` 長度跟 xAxis 對不上,整張圖壞。
+
+新加 rule 3.2 含**完整 code snippet**示範:
+
+```python
+x_data = Q['company_code'].unique().tolist()       # ✅ dedupe!
+series = []
+for cat in Q['category'].unique():
+    per_company = (
+        Q[Q['category'] == cat]
+          .set_index('company_code')['count']
+          .reindex(x_data).fillna(0).tolist()
+    )
+    series.append({"name": str(cat), "type": "bar",
+                    "stack": "total",
+                    "data": [int(v) for v in per_company]})
+```
+
+同時點出常見的 **「value 當 column」誤用**(`Q['PAY']` → KeyError 因為 PAY 是 review_result 欄位的值)。
+
+### ✨ P3:retry feedback error→hint mapping 升級
+
+`llm_service.py · _format_retry_hint` 新增 5 個 error pattern 對應(原本只有 2 個 — `ModuleNotFoundError` 跟 `KeyError`):
+
+| Error 模式 | Fix hint |
+|---|---|
+| `'X' object has no attribute 'round'` | 用 `round(value, N)` builtin |
+| `KeyError: '<value-str>'`(PAY/RTN/...)| Long format value 不是 column,用 `Q[Q['<col>']=='<val>']` filter row |
+| `KeyError`(generic)| 加碼提醒:groupby 後保留維度級欄位用 `agg(col=('col', 'first'))` |
+| `TypeError: rtruediv ... str` | 比率 KPI 走 boolean flag(`Q['is_X'] = (Q['col']=='val')` → sum → divide)|
+| `SyntaxError: does not match opening parenthesis` / `EOF while` / `forget parentheses around comprehension target` | bracket 配對 / tuple-in-comp 加括號 / 拆多步 |
+| `AttributeError`(generic)| 檢查變數型別,scalar 用 builtin,Series 用 method |
+
+baseline 觀察 LLM 在 3 retries 重複同錯,具體 fix hint 預期顯著降低 retry-fail 比例。
+
+### ✨ P5:Phase B rule 6.5 — groupby 後保留維度級欄位
+
+T3 case `KeyError: 'hc'`:Phase B groupby('company_code') 後 hc 消失,LLM 後面引用就炸。
+
+新加 rule 6.5 + ✅/❌ 範例:
+
+```python
+agg = Q.groupby('company_code').agg(
+    total_count=('application_no', 'size'),  # 新算
+    hc=('hc', 'first'),                       # ✅ 維度級 — 帶上!
+).reset_index()
+```
+
+### ✅ 驗證
+
+- 2 檔 AST OK(embedded_prompts.py 2016 行 / llm_service.py 3276 行)
+- `scripts/check_prompt_invariants.py` 17 prompts × 52 sentinels 全綠
+- 5 個 unit assertion 綠:
+  - P1: `round(value, 2)` builtin 範例 + 「對 scalar 呼叫」警告 in Phase C header
+  - P2: `Long format Q → ECharts 鐵律` + `unique().tolist()` + `reindex(x_data)` example
+  - P3: retry hint 含 round / rtruediv / bracket / tuple-comp 共 5 個新 pattern
+  - P5: `groupby 後保留維度級欄位` + `hc=('hc', 'first')` example
+
+### 📋 預計收掉的 baseline failure
+
+| Baseline 失敗 | v0.8.7 patch | 預期 |
+|---|---|---|
+| Case 02/04/06/STK-06/T2(.round 系列)| P1 + P3 | 4-5 個 ✅ |
+| STK-02/03/05(xAxis dedupe)| P2 + P3 | 2-3 個 ✅ |
+| Case 01(str/num divide)| P3 | retry 可能救回 |
+| STK-01(bracket mismatch)| P3 | retry 可能救回 |
+| STK-04(`in_progress` 幻覺)| 既有 KeyError hint | 部分救 |
+| STK-07(value-as-col + dup row)| P2 + P3 | 部分救 |
+| T3(`hc` 弄丟)| P5 + P3 | ✅ |
+
+預計總體 baseline pass rate **明顯提升**(理論最高從 ~50% 拉到 ~80%+)。
+
+### 📋 須在 production 套用
+
+⚠️ 若 `PROMPT_REPO_ENABLED=true`,需重 seed:
+
+```bash
+python migrations/001_seed_prompts.py --force  # Phase B + Phase C prompt 都改了
+```
+
+retry feedback 是純 Python code,不需 DB 同步。
+
+---
+
+## [0.8.6] · 2026-05-16 — Hotfix:sync embedded_test_cases.py
+
+**已含於 v0.8.6**:test framework 自己的 bug,v0.7.3 / v0.7.4 / v0.8.3 D4 的 test case 改動沒同步進 embedded_test_cases.py(test_runner 實際讀的源頭)。補同步 Case 03 PAY/RTN synonym、Case 09 q_numeric_must_vary、Case 10 return_count synonym。
+
+---
+
 ## [0.8.5] · 2026-05-16 — Self-Learning MVP Week 4:Consolidator + Contradiction
 
 **Patch · self-learning MVP Week 4 D1+D2 完成。**

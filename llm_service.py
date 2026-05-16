@@ -1598,9 +1598,12 @@ class LLMService:
             "錯誤訊息 (Traceback):\n```\n"
             f"{previous_error}\n```\n"
         )
-        # v0.7.1:特定錯誤模式偵測,加強對應提示(LLM 在 retry feedback 內常常忽略主要規則)
+        # v0.7.1 / v0.8.7:特定錯誤模式偵測,加強對應提示
+        # (baseline 觀察:LLM 在 retry feedback 內常常忽略主要規則,
+        #  3 attempts 重複同錯。給「error → fix」明確映射可大幅改善。)
         if previous_error:
-            if "ModuleNotFoundError" in previous_error or "No module named" in previous_error:
+            err = previous_error
+            if "ModuleNotFoundError" in err or "No module named" in err:
                 hint += (
                     "\n🚨【關鍵修正提示】你嘗試 `import` 一個不存在的套件。\n"
                     "**禁止 import 任何套件** — `pd`(pandas)跟 `np`(numpy)已備好。\n"
@@ -1608,10 +1611,62 @@ class LLMService:
                     "畫圖是 Phase C 的工作,Phase B 完全不需要 matplotlib / plotly / seaborn 等。\n"
                     "把所有 `import xxx` 那行刪掉重來。\n"
                 )
-            elif "KeyError" in previous_error:
+            # v0.8.7:.round() 雷,baseline 出現 5 次連續中
+            elif "object has no attribute 'round'" in err:
+                hint += (
+                    "\n🚨【關鍵修正提示】你對 **scalar** 物件呼叫了 `.round(N)`。\n"
+                    "Python `float` / `int` / `str` 都**沒有** `.round()` 方法,只有 pandas Series / DataFrame 有。\n"
+                    "**改用 `round(value, N)` builtin**(對任何 numeric 都行):\n"
+                    "  ❌ `value.round(2)`  /  `Q['rate'].iloc[0].round(2)`  /  `min(Q['x']).round(2)`\n"
+                    "  ✅ `round(value, 2)`\n"
+                    "  ✅ `round(Q['rate'].iloc[0], 2)`\n"
+                    "  ✅ `Q['rate'].round(2).tolist()`(Series 上 OK)\n"
+                    "  ✅ `[round(v, 2) for v in raw_list]`(list 元素是 scalar)\n"
+                )
+            # v0.8.7:long format xAxis no dedupe,baseline 連續 3 次中
+            elif ("KeyError" in err and any(t in err for t in
+                  ("'PAY'", "'RTN'", "'AI'", "'H'", "'Y'", "'N'"))):
+                hint += (
+                    "\n🚨【關鍵修正提示】KeyError 在 value 字串上,代表你把 **long format 的「值」當成「欄位名」**。\n"
+                    "Long format 下,`Q['<dim_col>']` 裡的 'PAY' / 'RTN' / 'AI' 等是**欄位裡的值**,不是欄位本身。\n"
+                    "  ❌ `Q['PAY']`(KeyError,PAY 是 review_result 欄位的值)\n"
+                    "  ✅ `Q[Q['review_result'] == 'PAY']['count']`(filter row 再取 value column)\n"
+                )
+            elif "KeyError" in err:
                 hint += (
                     "\n🚨【關鍵修正提示】KeyError 表示你引用了不存在的欄位。\n"
                     "**只能用 `q_columns` / `avail_cols` 中真實存在的欄位**,不要憑想像。\n"
+                    "若做 `Q.groupby(...).agg(...)` 後想保留 raw 維度欄位(例如 hc / company_code),\n"
+                    "**必須**用 `agg(<col>=('<col>', 'first'))` 主動帶上,否則 column 會消失。\n"
+                )
+            # v0.8.7:Phase B str/numeric divide,baseline Case 01 中
+            elif "rtruediv" in err and "str" in err:
+                hint += (
+                    "\n🚨【關鍵修正提示】TypeError on rtruediv 表示**用 string 欄位做除法**(分子或分母是字串)。\n"
+                    "計比率類 KPI 不要直接除原始 string 欄位(如 review_result / status / id);要先**轉 bool 再 sum**:\n"
+                    "  ❌ `Q['review_result'] / Q['count']`(string ÷ int 必炸)\n"
+                    "  ✅ Step 1: `Q['is_X'] = (Q['<status_col>'] == '<value>')`  ← bool\n"
+                    "     Step 2: `agg(X_count=('is_X', 'sum'), total=('<id>', 'count'))`  ← int / int\n"
+                    "     Step 3: `agg['rate'] = agg['X_count'] / agg['total']`\n"
+                )
+            # v0.8.7:bracket/paren mismatch,Phase C STK-01 連續 3 次
+            elif ("does not match opening parenthesis" in err
+                  or "EOF while" in err
+                  or "did you forget parentheses around the comprehension target" in err):
+                hint += (
+                    "\n🚨【關鍵修正提示】SyntaxError 表示**括號 `( [ {` 對不上**或 comprehension 缺括號。\n"
+                    "常見坑:\n"
+                    "  ❌ `series: [{...} for cat in cats]}`(`{...}` 對 `[`,最後 `}` 多餘)\n"
+                    "  ❌ `data = [i, j, v for i in ... for j in ...]`(tuple 在 comp 內必須加括號)\n"
+                    "  ✅ `data = [(i, j, v) for i in ... for j in ...]`\n"
+                    "  ✅ 用「先建 list / dict 再組裝」拆成多步,避免一行寫滿炸括號。\n"
+                )
+            elif "object has no attribute" in err:
+                # generic AttributeError(非 round)
+                hint += (
+                    "\n🚨【關鍵修正提示】AttributeError 通常是「對錯型別呼叫方法」。\n"
+                    "檢查那個變數是 Series / DataFrame / scalar / str / list 哪一種,\n"
+                    "選對 API(例:scalar 用 builtin,Series 用 `.method()`)。\n"
                 )
         if cheatsheet:
             hint += "\n" + cheatsheet
