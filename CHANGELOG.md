@@ -5,6 +5,107 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.2] · 2026-05-16 — Self-Learning MVP Week 2:Observation Extractor + Dedupe
+
+**Patch · self-learning MVP Week 2 D1+D2 完成。**
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` §10–§11。
+
+### ✨ `learning/observation_extractor.py`(669 行)
+
+把一個 failed `task_trace` 用 LLM 抽成 5+1 欄位的 structured observation,寫進 `learning_observations` collection,並用 `dedupe_key` 防重。
+
+**核心 API**:
+
+```python
+from learning.observation_extractor import (
+    extract_observation,            # 單一 trace → observation
+    run_observation_extraction,     # 批次:撈 → 抽 → dedupe → 寫
+)
+
+# 一鍵跑(會自動串 failure_filter + LLM + dedupe + 寫 learning_jobs record)
+stats = run_observation_extraction(
+    db, llm_service,
+    since_days=7, limit=5,
+    statuses=("failed", "refused"),
+    dry_run=False,
+)
+# stats = {run_id, input_count, extracted, rejected, deduped, errors, observations}
+```
+
+**Observation schema(寫進 `learning_observations`)**:
+
+| 欄位 | 來源 | 說明 |
+|---|---|---|
+| `observation_id` | `OBS-NNNNNN` auto | unique |
+| `run_id` | uuid | 一批 extraction 共用,讓 `learning_jobs` 對得起來 |
+| `source_trace_id` | trace doc | 反查原 trace |
+| `query_hash` | sha256(query) | 跨 trace 找同 query 用 |
+| `phase` | LLM tag 推斷 → step error fallback | phase_a/b/c/d/0/meta |
+| `context / action / result / cause / recommendation` | LLM | 5 個 required field |
+| `tags` | LLM | 最多 5 個 snake_case,優先匹 controlled vocab |
+| `dedupe_key` | sha256(phase ‖ cause ‖ recommendation) | unique index 擋重複 |
+| `status` | `candidate / rejected` | 通過 validation 才 candidate |
+| `created_at` | UTC now | |
+
+**Rejection rules**(對齊 spec §10.3):
+
+1. 任一 required field 缺或空字串 → `missing_field:<name>`
+2. `cause` < 15 chars → `cause_too_short`(防「LLM made a mistake」這種敷衍)
+3. `recommendation` < 25 chars → `recommendation_too_short`
+4. `recommendation` 含 generic 字眼(如「improve the prompt」、「fix the bug」)且 < 80 chars → `recommendation_generic:<phrase>`
+5. dedupe_key 撞既有(unique index 觸發 DuplicateKeyError)→ `deduped`(stats 計數,不算 reject)
+
+**Strict JSON 解析**:
+
+- LLM system prompt 規定回 strict JSON only(6 個 key:5 fields + tags)
+- 沿用 v0.3.6 `extract_json_block` balanced-brace parser,容忍 preamble / markdown fence
+- JSON parse 失敗 → `extraction_error='json_parse_failed: ...'`,計入 `errors`
+
+**Trace digest**(送進 LLM 的 context):
+
+- query / status / intent_chart / intent_preprocess / trace.error
+- 每個 step 的 phase + kind + elapsed + error
+- error step + 最後 step 多塞 LLM payload(user msg 尾段 400 字、response 500 字)
+- 總長度 cap 8000 chars(控成本,單筆 trace 可能 100KB+)
+
+**Cost control**(spec §22):
+
+- default `limit=5`(每天建議 ≤ 50)
+- LLM 呼叫沿用 `LLMService._call_llm`,自動被 task_trace recorder hook 到(若有 set)
+- `--dry-run` 跑 LLM 但不寫 DB,可預覽抽出來會長什麼樣
+
+**`learning_jobs` record**(讓 dashboard 看跑了什麼):
+
+每次 `run_observation_extraction` 結尾寫一筆 `job_type='observation_extraction'`,含 input/output/rejected/deduped/error count + run_id + params。
+
+### ✅ 驗證
+
+- AST OK,669 行
+- 8 個 unit check 全綠:
+  - `_compute_dedupe_key` 大小寫 + 多空白 normalize 一致
+  - `_validate_observation` happy path / missing field / generic / short cause 都正確
+  - `_normalize_tags` cap 5 個 + lowercase
+  - `_build_trace_digest` 不 crash + 含 error 訊息
+
+### 📋 用法
+
+```bash
+# Dry run(撈 7 天內 failed trace,LLM 抽但不寫 DB)
+python -m learning.observation_extractor --days 7 --limit 3 --dry-run
+
+# 實際跑(寫 learning_observations + learning_jobs)
+python -m learning.observation_extractor --days 7 --limit 5
+```
+
+### 🚧 Next:Week 3 啟動
+
+- `learning/verifier.py`:獨立 LLM agent 驗 candidate observation(accept/revise/reject)
+- `learning/confidence.py`:4 個 sub-component(evidence/specificity/consistency/novelty)
+- Decision rule:`confidence >= 0.75 AND not duplicate AND actionable` → 升 verified
+
+---
+
 ## [0.8.1] · 2026-05-16 — Self-Learning MVP Week 1 D2+D3:Collections + Failure Filter
 
 **Patch · 完成 self-learning MVP Week 1。**
