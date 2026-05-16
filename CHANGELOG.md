@@ -5,6 +5,91 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.8.8] · 2026-05-16 — v0.8.7 baseline iteration:3 連修
+
+**Patch · v0.8.7 baseline 跑完發現新 dominant pattern + 1 個 design conflict,3 連修。**
+
+### 🔴 v0.8.7 baseline 結果觀察
+
+- 16/26 (62%) pass(12 真 pass + 4 refusal 正確拒絕)
+- **v0.8.7 P1+P2 命中**:Cases 02/04/06/STK-06(`.round()` 4/5)、STK-04(`in_progress` 幻覺)、STK-03/04/08(long format)
+- 新 dominant pattern 浮現:**Phase C 對 aggregated Q 用 raw_df 級欄位 filter**(Cases 03/05 連 hit)
+
+### ✨ P1:Phase C rule 0 強化 — Q 是 post-aggregation 終態
+
+`embedded_prompts.py · _PHASE_C_HEADER_TEMPLATE` rule 0 大幅改寫。原規則只說「欄位名鎖死」太抽象,LLM 還是寫 `Q[Q['review_result']=='Y']`。新版規則點明:
+
+- raw_df 級欄位(`review_status` / `review_result` / `review_mechanism` / `application_no` / `_id` / 任何原始 status / id / code 欄位)在 Phase B **絕大多數情況已被 aggregate 掉,不會出現在 Q.columns**
+- 提供「**怎麼判斷 Q 是 long 還是 wide / aggregated**」decision tree:
+  - **Aggregated wide** — 含 `_count` / `_rate` / `_sum` / `_avg` / `_pct` 後綴 → 多 series 每個 KPI column 一個,**禁止 filter**
+  - **Long / tidy** — 有 dim + sub_dim + value 3 欄結構 → 多 series 用 filter sub_dim 值
+- 附 ❌ 3 種錯誤示範(filter / groupby on raw col)+ ✅ 3 種正解(直接用 KPI column)
+
+### ✨ P2:retry feedback 加 raw-col KeyError pattern
+
+`llm_service.py · _format_retry_hint` 新增第 7 種 error 對應(現共 7 pattern):
+
+```
+KeyError on review_status / review_result / review_mechanism /
+application_no / employee_id / status / _id 等 raw 級欄位
+   ↓
+🚨 Phase B 已 aggregate;Q 是終態,raw 級欄位幾乎一定不在 Q.columns。
+   只用 q_columns 內的 KPI 欄位,**完全禁止 filter Q**。
+   附 multi-series stacked bar 正解 code snippet。
+```
+
+放在「value-as-column」hint 之後、generic KeyError 之前,優先匹配。
+
+### ✨ P3:100% normalize 觸發詞補強(STK-01/02 design conflict)
+
+baseline 觀察 STK-01/02 query「**每條 bar 中呈現** TST、TSN、TSC 的占比」應該觸發 100% normalize,但 v0.8.7 還是走 raw count stack。原因:`_CHART_100PCT_WORDS` 只認「100%」「百分比堆疊」「占比分佈」「比例分佈」「percentage stack」,user 用「每條 bar 內占比」這類自然語言 phrasing 走不到。
+
+`llm_service.py` 新加 2 個 keyword tuple + intent 邏輯:
+
+```python
+_CHART_INTRA_BAR_WORDS = (
+    '每條 bar', '每個 bar', '每一條 bar', '每條柱', '每柱', '每根',
+    'each bar', 'per bar', 'within each bar', 'inside each bar',
+)
+_CHART_PROPORTION_WORDS = ('占比', '佔比', '比例', 'proportion', 'share')
+```
+
+`_detect_preprocess_intent` 加 `intra_bar_proportion = has_intra_bar and has_proportion` 判斷:
+- `stack + (has_100pct OR '百分比' OR intra_bar_proportion)` → `stacked_long_pct`
+- 「占比」單獨還是走 `stacked_wide`(維持原 spec 設計)
+- 「**每條 bar 內** + **占比/佔比/比例**」**新觸發** `stacked_long_pct`
+
+### ✅ 驗證
+
+- 2 檔 AST OK(embedded_prompts.py 2086 行 / llm_service.py 3315 行)
+- `scripts/check_prompt_invariants.py` 17 prompts × 52 sentinels 全綠
+- **8 個 _detect_preprocess_intent 單元測試全綠**:
+  - STK-01/02 → `stacked_long_pct` ✓(原本走 stacked_wide)
+  - STK-03(無 intra-bar 字)→ 維持 `stacked_wide` ✓(沒誤觸發)
+  - 「畫 100% stacked bar」→ 維持 `stacked_long_pct` ✓
+  - 「占比」單獨 → 維持 `stacked_wide` ✓(spec 設計)
+  - 「占比分佈」→ 維持 `stacked_long_pct` ✓
+  - 「佔比」(formal char)+「每條 bar」→ `stacked_long_pct` ✓
+  - 無 stack 的 ratio 走 `ratio_kpi` ✓
+
+### 📋 預計收掉的 v0.8.7 baseline failure
+
+| Baseline 失敗 | v0.8.8 patch | 預期 |
+|---|---|---|
+| Cases 03 / 05(raw-col filter on aggregated Q)| P1 + P2 | 2 個 ✅ |
+| STK-01 / STK-02(yAxis.max=100 design conflict)| P3 | 2 個 ✅ |
+
+預計 baseline pass rate **62% → 75%+**。
+
+剩下的 fail(T2 .round 第 5 次、T3 / Case 11 / Case 01 Phase B 路徑分歧、STK-05 dim 翻轉、STK-07 follow-up)需要更具體的 case-by-case 分析,留 v0.8.9 處理。
+
+### 📋 須在 production 套用
+
+⚠️ 若 `PROMPT_REPO_ENABLED=true`:`python migrations/001_seed_prompts.py --force`(Phase C prompt 改了)。
+retry feedback + intent 偵測是純 Python,不需 DB 同步。
+
+---
+
 ## [0.8.7] · 2026-05-16 — Baseline 4 連修 + retry feedback 升級
 
 **Patch · 從 baseline 全程觀察找到 4 個 systematic bug 一起修。**

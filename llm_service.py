@@ -1087,6 +1087,15 @@ _CHART_HEATMAP_WORDS = ('熱力圖', 'heatmap', 'heat map', '熱度', '熱圖')
 _CHART_STACK_WORDS = ('stacked', 'stack', '堆疊', '堆積')
 _CHART_100PCT_WORDS = ('100%', '100 %', '百分比堆疊', '占比分佈',
                         '比例分佈', 'percentage stack')
+# v0.8.8:「在每柱/每條 bar 內」+「占比/佔比/比例」= 強信號,等同 100% normalize。
+# STK-01/02 baseline 失敗根因:LLM 把這個 phrase 走 raw count,但 user 明顯
+# 要的是 per-bar 內部歸一化(每柱加總 = 100)。
+_CHART_INTRA_BAR_WORDS = (
+    '每條 bar', '每個 bar', '每一條 bar', '每條柱', '每柱', '每根',
+    'each bar', 'per bar', 'within each bar', 'per category bar',
+    'inside each bar',
+)
+_CHART_PROPORTION_WORDS = ('占比', '佔比', '比例', 'proportion', 'share')
 _CHART_HORIZONTAL_WORDS = ('橫向', '水平', 'horizontal', '排名', 'ranking',
                             'rank', 'top n', 'top 10', 'top 5', 'top 3')
 _CHART_SCATTER_WORDS = ('散布圖', '散點圖', 'scatter', '相關性', 'correlation')
@@ -1265,8 +1274,12 @@ def _detect_preprocess_intent(query: str,
 
     has_stack = _has_any(query, _CHART_STACK_WORDS)
     has_100pct = _has_any(query, _CHART_100PCT_WORDS)
+    # v0.8.8:intra-bar 占比 = 100% normalize 強信號
+    has_intra_bar = _has_any(query, _CHART_INTRA_BAR_WORDS)
+    has_proportion = _has_any(query, _CHART_PROPORTION_WORDS)
+    intra_bar_proportion = has_intra_bar and has_proportion
 
-    if has_stack and (has_100pct or '百分比' in query):
+    if has_stack and (has_100pct or '百分比' in query or intra_bar_proportion):
         return "stacked_long_pct"
     if has_stack:
         return "stacked_wide"
@@ -1631,6 +1644,32 @@ class LLMService:
                     "Long format 下,`Q['<dim_col>']` 裡的 'PAY' / 'RTN' / 'AI' 等是**欄位裡的值**,不是欄位本身。\n"
                     "  ❌ `Q['PAY']`(KeyError,PAY 是 review_result 欄位的值)\n"
                     "  ✅ `Q[Q['review_result'] == 'PAY']['count']`(filter row 再取 value column)\n"
+                )
+            # v0.8.8:Phase C 對 aggregated Q 用 raw_df 級欄位 filter
+            # baseline Cases 03 / 05 兩個連 hit,且 retry 3 次都同錯。
+            elif ("KeyError" in err and any(t in err for t in
+                  ("'review_status'", "'review_result'", "'review_mechanism'",
+                   "'application_no'", "'employee_id'", "review_status",
+                   "review_result", "review_mechanism"))):
+                hint += (
+                    "\n🚨【關鍵修正提示】KeyError 在 raw_df 級欄位上(`review_status` / "
+                    "`review_result` / `review_mechanism` / `application_no` 等),\n"
+                    "代表你對 `Q` 用了 raw 級欄位 filter — 但 **Phase B 已經把這些 aggregate 掉了**!\n"
+                    "**Q 是 Phase B 的終態,raw 級欄位幾乎一定不在 Q.columns**。\n\n"
+                    "  ❌ 你寫的(`Q['review_result']` / `Q[Q['review_mechanism']=='AI']` 之類):\n"
+                    "     對 Q 做 filter / groupby,引用 raw 級欄位\n\n"
+                    "  ✅ 正解:**只用 q_columns 裡實際存在的 KPI 欄位**\n"
+                    "     例如 `Q.columns = ['company_code', 'pay_count', 'return_count', 'ai_rate']`\n"
+                    "     → 多 series stacked bar:每個 KPI column 直接做一個 series:\n"
+                    "       ```python\n"
+                    "       series = [\n"
+                    "           {'name': 'PAY',    'type': 'bar', 'stack': 'x',\n"
+                    "             'data': Q['pay_count'].tolist()},\n"
+                    "           {'name': 'RTN',    'type': 'bar', 'stack': 'x',\n"
+                    "             'data': Q['return_count'].tolist()},\n"
+                    "       ]\n"
+                    "       ```\n"
+                    "     **完全不需要也禁止 filter Q**!\n"
                 )
             elif "KeyError" in err:
                 hint += (
