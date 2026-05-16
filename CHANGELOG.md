@@ -5,6 +5,57 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.7.4] · 2026-05-16 — test_runner echarts_required_keys 改 chart-type aware
+
+**Patch · 修 Case 07 false fail(LLM 選 pie chart 但 test 要求 xAxis/yAxis)。**
+
+### 🐛 修正
+
+實際 case:Case 07「四個福利申請類別,哪個最熱門?」LLM 合理選 pie chart,但 test 設定 `echarts_required_keys = ['title', 'xAxis', 'yAxis', 'series']` 對 pie 不適用(pie 沒 axis),導致 false fail。
+
+**修法**(`test_runner.py`):
+- 從 `option['series'][0].get('type')` 偵測 chart type
+- 若是 axis-less type(`pie` / `radar` / `treemap` / `sunburst` / `gauge` / `funnel`),自動從 `required_keys` 排除 `xAxis` / `yAxis`
+- 其他 chart type(bar / heatmap / line)仍嚴格 check
+- 顯示「(chart=pie,xAxis/yAxis 不適用)」標註,讓 log 一眼看出來
+
+### ✅ 驗證
+
+6 個 logic test 全綠:
+- pie chart(no axis)→ pass
+- bar chart(needs axis)→ pass
+- bar missing xAxis → fail(預期)
+- heatmap → 仍 strict check
+- radar(axis-less)→ pass
+- empty series(type 不明)→ fallback strict check
+
+---
+
+## [0.7.3] · 2026-05-16 — test_runner expected_q_cols_all 加 synonym list 支援
+
+**Patch · 修 Case 03 false fail(user 字眼 vs canonical column name 不一致)。**
+
+### 🐛 修正
+
+實際 case:Case 03「畫出各公司的 PAY 與 RTN 申請數量,我想看哪家公司退件量最大」LLM 忠於 user 字眼產出 `PAY` / `RTN` 欄位,但 test 期待 `pay_count` / `return_count` → false fail。LLM 行為其實合理(BI 場景該忠於 user vocabulary)。
+
+**修法**(`test_runner.py`):
+- `expected_q_cols_all` 內每個項目可以是:
+  - `str`(literal 比對)
+  - `list` / `tuple`(any-of synonym list,任一命中即通過)
+- 失敗訊息顯示「(pay_count | PAY | pay)」這種 OR 格式,debug 一眼看出來
+- 向後相容:其他 string-only case 行為不變
+
+**修了哪些 case**:
+- Case 03:`[["pay_count", "PAY", "pay"], ["return_count", "RTN", "rtn", "RET"], "company_code"]`
+- Case 10(預防性):`["company_code", ["return_count", "退件數", "退件數量", "RTN", "rtn", "rtn_count", "ret_count"]]`
+
+### ✅ 驗證
+
+6 個 logic test 全綠(含正例 / 反例 / 缺欄位 / 中文 synonym / 向後相容 4 種 case)。
+
+---
+
 ## [0.7.2] · 2026-05-15 — Sentinel-based prompt invariants check
 
 **Patch · 防止 v0.7.1 那種「重構漏接 critical rule」未來再發生。**

@@ -61,7 +61,13 @@ TEST_CASES = [
         "query": "畫出各公司的 PAY 與 RTN 申請數量,我想看哪家公司退件量最大",
         "type": "happy_path",
         "expected_chart": "stacked bar",
-        "expected_q_cols_all": ["pay_count", "return_count", "company_code"],
+        # v0.7.3:user query 用 PAY/RTN 簡寫,LLM 可能忠於 user 字眼 → 用 synonym
+        # 接受 canonical(pay_count/return_count) 或 user 字眼(PAY/RTN)
+        "expected_q_cols_all": [
+            ["pay_count", "PAY", "pay"],
+            ["return_count", "RTN", "rtn", "RET"],
+            "company_code",
+        ],
         "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
         "echarts_min_series": 2,
         "echarts_should_have_stack": True,
@@ -127,7 +133,11 @@ TEST_CASES = [
         "query": "列出退件數量最多的前 5 名公司,搭配柱狀圖",
         "type": "happy_path",
         "expected_chart": "sorted bar",
-        "expected_q_cols_all": ["company_code", "return_count"],
+        # v0.7.3:query 用「退件數量」,LLM 可能產 return_count / 退件數 / RTN / rtn_count
+        "expected_q_cols_all": [
+            "company_code",
+            ["return_count", "退件數", "退件數量", "RTN", "rtn", "rtn_count", "ret_count"],
+        ],
         "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
         "phase_a_forbidden_strict": True,
         "phase_b_top_n": 5,
@@ -695,12 +705,34 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
             print(f"   sample (first 3):\n{Q.head(3).to_string(index=False)}")
 
         # 結構性檢查
+        # v0.7.3:expected_q_cols_all 內每個項目可以是:
+        #   - 字串:literal 比對(必須 in Q.columns)
+        #   - list / tuple:any-of synonym(任一個在 Q.columns 即算通過)
+        # 用途:user query 用簡寫(例「PAY」「RTN」),LLM 忠於 user 字眼產出
+        # `PAY` / `RTN` 欄位,語意正確但跟 canonical name(`pay_count` /
+        # `return_count`)不同 — false fail。改用 synonym list 處理。
         expected_all = case.get("expected_q_cols_all", [])
-        missing = [c for c in expected_all if c not in Q.columns]
+        q_cols_set = set(Q.columns)
+
+        def _col_present(expected_item) -> bool:
+            if isinstance(expected_item, str):
+                return expected_item in q_cols_set
+            if isinstance(expected_item, (list, tuple)):
+                return any(e in q_cols_set for e in expected_item)
+            return False
+
+        missing = [c for c in expected_all if not _col_present(c)]
+        # 顯示時把 synonym list 轉成可讀格式
+        def _fmt_expected(item):
+            if isinstance(item, (list, tuple)):
+                return "(" + " | ".join(item) + ")"
+            return str(item)
+        expected_display = [_fmt_expected(c) for c in expected_all]
+        missing_display = [_fmt_expected(c) for c in missing]
         result["checks"].append(check(
-            f"Q 含必備欄位 {expected_all}",
+            f"Q 含必備欄位 {expected_display}",
             len(missing) == 0,
-            f"缺: {missing}" if missing else "✓"
+            f"缺: {missing_display}" if missing else "✓"
         ))
 
         if case.get("phase_b_top_n"):
@@ -849,9 +881,27 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                     "use_table=False (應為 True)"
                 ))
             required_keys = case.get("echarts_required_keys", [])
-            missing_keys = [k for k in required_keys if k not in option]
+
+            # v0.7.4:chart-type aware — pie / radar / treemap 等 axis-less chart
+            # 不需要 xAxis / yAxis。從 series[0].type 偵測,自動排除這兩個 key。
+            series_list = option.get("series", []) or []
+            first_series_type = ""
+            if series_list and isinstance(series_list[0], dict):
+                first_series_type = (series_list[0].get("type") or "").lower()
+            _AXIS_LESS_TYPES = {"pie", "radar", "treemap", "sunburst", "gauge", "funnel"}
+            is_axis_less = first_series_type in _AXIS_LESS_TYPES
+
+            if is_axis_less:
+                required_keys_effective = [k for k in required_keys
+                                            if k not in ("xAxis", "yAxis")]
+                axis_note = f" (chart={first_series_type},xAxis/yAxis 不適用)"
+            else:
+                required_keys_effective = required_keys
+                axis_note = ""
+
+            missing_keys = [k for k in required_keys_effective if k not in option]
             result["checks"].append(check(
-                f"option 含必備 keys {required_keys}",
+                f"option 含必備 keys {required_keys_effective}{axis_note}",
                 len(missing_keys) == 0,
                 f"缺: {missing_keys}" if missing_keys else "✓"
             ))
