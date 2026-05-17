@@ -52,6 +52,8 @@ LLM_API_KEY = config.LLM_API_KEY
 LLM_MODEL = config.LLM_MODEL
 LLM_TEMPERATURE = config.LLM_TEMPERATURE
 LLM_TIMEOUT_S = config.LLM_TIMEOUT_S
+# v0.10.6.1:per-phase sampling profile(default / reasoning_distilled 等)
+LLM_MODEL_PROFILE = config.MODEL_PROFILE
 
 DATA_DIR = config.DATA_DIR
 CSV_APPLICATIONS = DATA_DIR / "tflex_applications_rawdata_v2.csv"
@@ -482,6 +484,7 @@ def _build_llm_service_for_domain(domain: str) -> LLMService:
         task_metadata=task_md,
         prompt_repo=st.session_state.prompt_repo,
         domain=domain,
+        model_profile=LLM_MODEL_PROFILE,  # v0.10.6.1
     )
 
 if "llm_service" not in st.session_state:

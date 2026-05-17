@@ -360,6 +360,8 @@ OLLAMA_KEY = config.LLM_API_KEY
 OLLAMA_MODEL = config.LLM_MODEL
 # 測試環境給更長 timeout (含首次 warm-up + 連續 retry)
 OLLAMA_TIMEOUT = max(config.LLM_TIMEOUT_S, 240.0)
+# v0.10.6.1:per-phase sampling profile
+LLM_MODEL_PROFILE = config.MODEL_PROFILE
 
 MONGO_URI = config.MONGO_URI
 MONGO_DB = config.MONGO_DB
@@ -1466,6 +1468,7 @@ def main() -> int:
         task_metadata=task_md,
         prompt_repo=prompt_repo,
         domain=args.domain,
+        model_profile=LLM_MODEL_PROFILE,  # v0.10.6.1
     )
 
     results = []

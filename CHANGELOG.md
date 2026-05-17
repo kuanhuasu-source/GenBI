@@ -5,6 +5,30 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.6.1] · 2026-05-17 — Hotfix:`model_profile` 沒實際 wire 進 app.py / test_runner.py
+
+**Patch · v0.10.6 加了 profile feature 但 caller 沒真的把它傳給 LLMService → 看似支援 reasoning_distilled 實際還在跑 legacy default。**
+
+### 🔴 漏洞
+
+v0.10.6 的設計是 `config.llm_service_kwargs()` 自動帶 `model_profile`。但實際上 `app.py:_build_llm_service_for_domain` 跟 `test_runner.py` 都是**手動 instantiate** `LLMService(api_url=..., api_key=..., model_name=..., ...)`,沒走 `llm_service_kwargs()`,所以 `model_profile` 永遠是 `None` → 回退 legacy 行為。
+
+User 跑 `test_runner.py --only 01,STK-01 --domain tflex` 時 sampling 還是 temp=0,reasoning distilled 模型在 temp=0 下會退化。
+
+### ✨ 修正
+
+兩處 caller 都加 `model_profile=LLM_MODEL_PROFILE`:
+
+- `app.py:50-55` 加 `LLM_MODEL_PROFILE = config.MODEL_PROFILE`,`_build_llm_service_for_domain` 把它塞進 LLMService kwargs
+- `test_runner.py:355-363` 同上,在頂部從 `config.MODEL_PROFILE` 取出,build LLMService 時帶進去
+
+### ✅ 驗證
+
+- AST OK(4 檔)
+- 模擬 `test_runner.py` build LLMService 流程,確認 `_resolve_phase_sampling` 回 reasoning_distilled 的值(pipeline=0.6 / retry=0.75 / plan=1.0 / insight=0.7+pp=1.5)
+
+---
+
 ## [0.10.6] · 2026-05-17 — Model profile system(reasoning distilled 支援)
 
 **Minor · 換 reasoning distilled 模型(Qwen3.6-27B-Claude-Opus-Reasoning-Distilled)需要不同 sampling 參數 → 加 profile 系統,per-phase resolve temp / presence_penalty。**
