@@ -5,6 +5,57 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.2] · 2026-05-17 — Retry temperature bump(Level 1 strengthening)
+
+**Patch · 打破 LLM 在 `temp=0` deterministic 下連續犯同錯的 stuck pattern。**
+
+### 🔴 觀察
+
+v0.9.3 baseline 6 個 LLM bug 中,3 個是 Phase B/C **連 3 次同錯**(Case 01 KeyError, STK-03/05 fallback)。Cause:`temperature=0` deterministic + 同個 error feedback 餵回去 → 同樣 output stuck。
+
+retry hint 早就給了具體 fix(v0.8.7+),但 LLM 「看到了但沒採用」。
+
+### ✨ Fix
+
+4 個 generate_* method 都加 retry temp bump,attempt 1 維持 default,attempt 2+ (`previous_error` 非空)用 `temp=0.3`:
+
+| Method | Trigger |
+|---|---|
+| `generate_pipeline` | internal 3-attempt loop,`attempt > 0` 時 temp=0.3 |
+| `generate_preprocess_code` | external retry,`previous_error` 非空時 temp=0.3 |
+| `generate_plot_code` | 同上 |
+| `generate_echarts_option` | 同上 |
+
+```python
+# 各 method 統一 pattern:
+_retry_temp = 0.3 if previous_error else self.default_temperature
+raw = self._call_llm([...], temperature=_retry_temp, phase="...")
+```
+
+### 🎯 預期影響
+
+- **Case 01 / STK-03 / STK-05** 等 stuck-pattern 案,attempt 2 因 temp 抬高有機會走不同 path
+- **不動 attempt 1 行為**:大多數 case 還是 1 次過,維持穩定
+- **Cost 中性**:同樣 3-attempt 上限,只是 attempt 2 換 temp
+
+### ⚠️ 風險
+
+- temp 0.3 引入隨機性 → 同 query 在不同 baseline run 結果**更不一致**(本來 deterministic stuck 但至少穩定錯,現在每次可能不同)
+- 若 attempt 1 OK,完全不受影響(99% 行為跟之前一樣)
+- 若需要更 deterministic 的 production behavior,改回 `temp=0.0 or 0.1` 都很簡單
+
+### ✅ 驗證
+
+- `llm_service.py` AST OK(3351 行)
+- 8 處 `_retry_temp` 標記(4 methods × comment+assign)
+
+### 📋 Next(等 baseline 看 ROI)
+
+- v0.10.3 Level 2 — Semantic validator for Phase C(catch「exec OK 但內容錯」STK-02 維度倒置那種)
+- v0.10.4 Level 3 — Multi-shot voting(只在 Level 1+2 不夠時才做)
+
+---
+
 ## [0.10.1] · 2026-05-17 — Hotfix:test_runner 補做 chart-orientation aware
 
 **Hotfix · v0.9.1 加 horizontal stacked block 後留下的 test framework gap**。
