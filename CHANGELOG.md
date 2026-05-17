@@ -5,6 +5,70 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.0] · 2026-05-17 — Composite chart layout (路徑 C:chart + Q side panel)
+
+**Minor · BI-grade composite dashboard 第一階段。** chart 旁邊新增 Q DataFrame side panel,使用者看 chart 同時看到背後的 row-level 資料。
+
+對齊先前討論的 **路徑 C → B 漸進策略**:v0.10.0 落實 C(統一 layout),v0.10.1+ 漸進加 B(intent-specific composite)。
+
+### ✨ D1:Sidebar 加「🧩 圖表呈現模式」toggle
+
+3 個 option,default = **標準**:
+
+| Mode | 效果 |
+|---|---|
+| **精簡** | 只渲染主圖,全寬度(=v0.9.x 行為)|
+| **標準**(預設)| chart 左 60% + Q DataFrame 右 40% side panel |
+| **複合** | 同「標準」(v0.10.0 階段);v0.10.1+ 會依 chart intent 換 layout |
+
+存進 `st.session_state["chart_layout_mode"]`,切 mode 時 history 也自動跟著重渲。
+
+### ✨ D2:`render_composite_chart()` + `_render_q_side_panel()` helper
+
+`render_composite_chart(chart_render_fn, Q, intent, mode, key_prefix)` — 統一 chart 渲染 wrapper。
+- 接收 0-arg `chart_render_fn` callable(`st_echarts` / `st.plotly_chart` 包起來)
+- 依 mode 決定:`精簡` → 直接呼叫;其他 → `st.columns([3, 2])` 分左右
+
+`_render_q_side_panel(Q, intent, key_prefix, max_rows=100)` — side panel 渲染。
+- 自動 `column_config`:rate / ratio / 率 → percentage format;int → 千分位;float → 2 decimal
+- Cap 100 row,height 動態(35 + n_shown × 28,最高 520px)
+- 上方 caption「📊 處理後資料 Q · {N} 列 × {C} 欄(顯示前 N)」
+
+### ✨ D3:Live render + history loop 都走 composite
+
+- **Live path**(`if query:` 區塊):chart 渲染包進 `_render_main_chart` 後丟給 `render_composite_chart`。Detect intent 用 `_detect_chart_intent(query)`。
+- **History loop**:每個 assistant msg 也走 composite(讀 `msg["chart_intent"]` + `msg["q_for_composite"]`),user 切 mode 時 history 跟著重渲。
+- **Message append**:新增 `q_for_composite` (Q.copy()) 跟 `chart_intent`,replay 用。
+
+table fallback case **不加 side panel**(table 本身就是主體),維持原行為。
+
+### ✅ 驗證
+
+- `app.py` AST OK(1413 行,net +140)
+- 9 個 hook 點全在(sidebar var / label / 2 helpers / 2 msg fields / 2 history renderers / 1 live wrapper)
+- 不動 `LLMService` / 不動 `embedded_prompts` / 不動 `test_runner`(test framework 看的是 `option` dict,跟 layout 無關)
+
+### 📋 Roadmap(下個 minor)
+
+v0.10.1+ 路徑 B — intent-specific composite(replace `_render_q_side_panel` 內 default 為 intent-aware):
+
+| Intent | composite layout |
+|---|---|
+| `bar / bar_horizontal / pie` | chart 60% \| **Top-N 排序 table**(highlight 第 1/2/3) 40% |
+| `stacked_100 / stacked_raw / *_horizontal` | chart top \| **per-stack 總計 + 占比 table** bottom |
+| `line_single / line_dual` | chart 70% \| **first / last / Δ% / min / max** summary 30% |
+| `scatter` | chart 60% \| **outlier(±2σ)list** 40% |
+| `heatmap` | chart top \| **top-5 highest cells + 兩軸 legend** bottom |
+| `kpi_table` | (無改變,本來就是 table)|
+
+### 📋 已知限制
+
+- Streamlit `st.columns` 不 responsive — 窄螢幕還是並排(BI 通常 desktop,可接受)
+- side panel cap 100 列 — 大資料集只看前段(future 加 pagination 可選)
+- mode toggle 是 session-level,page reload 會 reset 成 default「標準」
+
+---
+
 ## [0.9.3] · 2026-05-16 — Hotfix:page navigation 後 phase outputs 消失
 
 **Hotfix · User 回報的 Streamlit stateless rendering 經典坑。**

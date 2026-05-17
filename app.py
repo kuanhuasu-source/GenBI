@@ -249,6 +249,87 @@ def render_pretty_table(Q: pd.DataFrame, option: dict | None = None, key_prefix:
 
 
 # ============================================================
+# v0.10.0 · Composite chart layout helper
+# ============================================================
+def _render_q_side_panel(
+    Q: "pd.DataFrame | None",
+    intent: str = "",
+    key_prefix: str = "",
+    max_rows: int = 100,
+) -> None:
+    """側邊欄渲染 Q DataFrame(標準 / 複合模式右側 pane)。
+
+    v0.10.0:標準模式統一渲染。v0.10.1+ 會依 intent 改成 intent-specific
+    summary(top-N / 占比 / outlier 等)。
+    """
+    import pandas as pd  # local import for clarity
+    if Q is None or not isinstance(Q, pd.DataFrame) or Q.empty:
+        st.caption("📊 (無資料)")
+        return
+
+    n_total = len(Q)
+    n_shown = min(max_rows, n_total)
+    st.caption(f"📊 處理後資料 Q · {n_total:,} 列 × {len(Q.columns)} 欄"
+                + (f"(顯示前 {n_shown})" if n_total > max_rows else ""))
+
+    # 數值欄自動千分位逗號顯示;比率類欄位 (rate / ratio / 率) 顯示百分比
+    column_config = {}
+    for col in Q.columns:
+        cl = col.lower()
+        if any(k in cl for k in ("rate", "ratio", "_pct", "percentage")) \
+                or any(k in col for k in ("率", "占比", "佔比", "比例")):
+            column_config[col] = st.column_config.NumberColumn(
+                col, format="%.2f%%"
+                if Q[col].dropna().abs().max() > 1.5 else "%.2%"
+            )
+        elif pd.api.types.is_integer_dtype(Q[col]):
+            column_config[col] = st.column_config.NumberColumn(col, format="%d")
+        elif pd.api.types.is_float_dtype(Q[col]):
+            column_config[col] = st.column_config.NumberColumn(col, format="%.2f")
+
+    st.dataframe(
+        Q.head(max_rows),
+        use_container_width=True,
+        hide_index=True,
+        column_config=column_config,
+        height=min(35 + n_shown * 28, 520),
+    )
+
+
+def render_composite_chart(
+    chart_render_fn,
+    Q: "pd.DataFrame | None",
+    intent: str = "",
+    mode: str = "標準",
+    key_prefix: str = "",
+) -> None:
+    """v0.10.0:把 chart 渲染包成 composite layout。
+
+    Args:
+        chart_render_fn: 0-arg callable,渲染主圖(st_echarts / st.plotly_chart)
+        Q: 處理後資料,供 side panel / composite 用
+        intent: chart intent string(供 v0.10.1+ composite mode 決定 layout)
+        mode: '精簡' | '標準'(預設)| '複合'
+        key_prefix: streamlit key prefix(避免 widget 衝突)
+
+    Modes:
+        精簡: 只渲染主圖,全寬度
+        標準: 主圖 60% | Q DataFrame 40% 並排
+        複合: 同「標準」(v0.10.0 階段);v0.10.1+ 會 intent-driven
+    """
+    if mode == "精簡" or Q is None or (hasattr(Q, "empty") and Q.empty):
+        chart_render_fn()
+        return
+
+    # 標準 / 複合:chart 60% + Q side panel 40%
+    col_chart, col_side = st.columns([3, 2])
+    with col_chart:
+        chart_render_fn()
+    with col_side:
+        _render_q_side_panel(Q, intent=intent, key_prefix=key_prefix)
+
+
+# ============================================================
 # 🚀 系統初始化
 # ============================================================
 # HR 話圖 · HR ChatChart logo(v0.3.7+)
@@ -515,6 +596,19 @@ with st.sidebar:
     )
 
     enable_insight = st.toggle("啟用 Phase D 商業洞察", value=True)
+
+    # v0.10.0:圖表呈現模式 — 預設「標準」(chart + Q DataFrame side panel)
+    chart_layout_mode = st.radio(
+        "🧩 圖表呈現模式",
+        options=["精簡", "標準", "複合"],
+        index=1,
+        help=(
+            "精簡:只顯示主圖。"
+            "標準(預設):chart 左 60% + Q DataFrame 右 40%。"
+            "複合:依 chart intent 套 BI 風格 layout(top-N / 占比 / outlier 等;v0.10.1+ 漸進加)。"
+        ),
+    )
+    st.session_state["chart_layout_mode"] = chart_layout_mode
     st.divider()
 
     # 接續分析狀態
@@ -605,15 +699,34 @@ for idx, msg in enumerate(st.session_state.messages):
             )
         st.write(msg["content"])
         # 圖表回放 — Plotly fig 或 ECharts option dict 二擇一
+        # v0.10.0:支援 composite layout(chart + Q side panel),
+        # 走目前 sidebar 切換的 mode(切 mode 時 history 也跟著重渲)
+        _hist_mode = st.session_state.get("chart_layout_mode", "標準")
+        _hist_intent = msg.get("chart_intent", "")
+        _hist_Q = msg.get("q_for_composite")
+
         if msg.get("fig") is not None:
-            st.plotly_chart(msg["fig"], use_container_width=True)
+            def _hist_render_fig():
+                st.plotly_chart(msg["fig"], use_container_width=True)
+            render_composite_chart(
+                _hist_render_fig, _hist_Q,
+                intent=_hist_intent, mode=_hist_mode,
+                key_prefix=f"hist_{idx}",
+            )
         elif msg.get("echarts_option") is not None:
-            st_echarts(
-                options=msg["echarts_option"],
-                height="520px",
-                key=f"echarts_history_{idx}",
+            def _hist_render_echarts():
+                st_echarts(
+                    options=msg["echarts_option"],
+                    height="520px",
+                    key=f"echarts_history_{idx}",
+                )
+            render_composite_chart(
+                _hist_render_echarts, _hist_Q,
+                intent=_hist_intent, mode=_hist_mode,
+                key_prefix=f"hist_{idx}",
             )
         elif msg.get("table_df") is not None:
+            # table fallback 不加 side panel
             render_pretty_table(
                 msg["table_df"],
                 msg.get("table_option"),
@@ -1069,18 +1182,40 @@ if query:
             # 透過 echarts_option/table_df 渲染,所以不另外存到 phases_done)
             if plot_code:
                 st.session_state.messages[-1]["phases_done"]["echarts_code"] = plot_code
-            if chart_engine == "ECharts":
-                if use_table_fallback:
-                    st.info("📋 LLM 判斷此查詢更適合用表格呈現,套用精美 KPI 表格樣式。")
-                    render_pretty_table(Q, final_option, key_prefix=f"live_{len(st.session_state.messages)}")
+
+            # v0.10.0:走 composite layout(依 sidebar 切換的 mode)
+            _layout_mode = st.session_state.get("chart_layout_mode", "標準")
+            _live_key = f"live_{len(st.session_state.messages)}"
+            _live_chart_intent = ""
+            try:
+                _live_chart_intent = _detect_chart_intent(query)
+            except Exception:
+                pass
+
+            def _render_main_chart():
+                if chart_engine == "ECharts":
+                    if use_table_fallback:
+                        st.info("📋 LLM 判斷此查詢更適合用表格呈現,套用精美 KPI 表格樣式。")
+                        render_pretty_table(Q, final_option, key_prefix=_live_key)
+                    else:
+                        st_echarts(
+                            options=final_option,
+                            height="520px",
+                            key=f"echarts_{_live_key}",
+                        )
                 else:
-                    st_echarts(
-                        options=final_option,
-                        height="520px",
-                        key=f"echarts_live_{len(st.session_state.messages)}",
-                    )
+                    st.plotly_chart(final_fig, use_container_width=True)
+
+            if use_table_fallback:
+                # table fallback 本身就是 table,不再加 side panel
+                _render_main_chart()
             else:
-                st.plotly_chart(final_fig, use_container_width=True)
+                render_composite_chart(
+                    _render_main_chart, Q,
+                    intent=_live_chart_intent,
+                    mode=_layout_mode,
+                    key_prefix=_live_key,
+                )
 
             # ============================================================
             # Phase D — 商業洞察 (可選)
@@ -1108,6 +1243,7 @@ if query:
 
             # v0.9.3:REPLACE in_progress slot,不要 append 第 2 條 assistant。
             # 保留 phases_done 讓 navigation 後重渲。
+            # v0.10.0:也存 q_for_composite + chart_intent 給 history loop 重渲 composite。
             _prev_phases = st.session_state.messages[-1].get("phases_done", {})
             st.session_state.messages[-1] = {
                 "role": "assistant",
@@ -1119,6 +1255,9 @@ if query:
                 "insight": insight_text,
                 "in_progress": False,
                 "phases_done": _prev_phases,
+                # v0.10.0: composite layout replay
+                "q_for_composite": Q.copy() if isinstance(Q, pd.DataFrame) else None,
+                "chart_intent": _live_chart_intent,
             }
 
             # 🔗 寫入「上次分析脈絡」供下一輪 follow-up 使用
