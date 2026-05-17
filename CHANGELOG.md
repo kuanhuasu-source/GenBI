@@ -5,6 +5,64 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.11.0] · 2026-05-17 — Self-learning loop end-to-end validation 啟動
+
+**Minor · v0.8-v0.9 蓋好的 self-learning infrastructure(7 個 learning module + admin UI + cron)從沒被真正餵料跑過。v0.11.0 啟動端到端驗證。**
+
+### 🔴 發現 v0.10.7 baseline 後的 prerequisite gap
+
+`test_runner.py` 沒接 `TaskTrace`(只有 `app.py` 有),意思是 v0.10.7 跑完 26 case / 134 LLM call **0 個 task_trace 寫進 MongoDB**。學習 pipeline(`scripts/run_learning_jobs.py`)沒料可吃。
+
+DB state confirmed:
+- `task_traces`: 10 docs(舊資料殘留,不夠分析)
+- `learning_observations / instincts / candidates / verifier_results / audit_log`: **全 0**
+
+### ✨ P1:`test_runner.py` 接 TaskTrace
+
+每個 case 包一個 TaskTrace,case 結束時 finalize 帶 status:
+
+```python
+_STATUS_TO_TRACE = {
+    "pass":                  "completed",
+    "refusal_detected":      "refused",
+    "phaseC_fallback_used":  "failed",  # 圖沒產出,降級表格 → 視為失敗
+    "phaseB_exec_error":     "failed",
+    "phaseB_no_Q":           "failed",
+    "phaseA_pipeline_error": "failed",
+    "phase_d_error":         "failed",
+    "fatal_error":           "failed",
+}
+
+for case in selected_cases:
+    _trace = TaskTrace(db=db, domain=args.domain, query=case["query"],
+                        collection_name=config.TASK_TRACES_COLLECTION)
+    llm.trace = _trace
+    try:
+        res = run_case(case, llm, db)
+    finally:
+        _trace.finalize(status=_STATUS_TO_TRACE.get(res["status"], "failed"))
+        llm.trace = None
+```
+
+LLMService._call_llm 內已有 trace hook(v0.7.0),會自動把 LLM call 串進去。
+
+### 📌 預期效果
+
+baseline 重跑一次後:
+- task_traces: +26 docs(含每 case 完整 LLM call sequence、phase 結果、status)
+- 其中 STK-01 / STK-05 標記 failed → failure_filter 抓出 → observation_extractor 抽 5-field observation
+- `.round()` / `KeyError 'review_mechanism'` 等 recurring pattern 會被 cluster 成 instinct
+
+接下來 P2 跑 `scripts/run_learning_jobs.py`,驗證 7 個 job 全鏈條(observation_extraction → verification → consolidation → contradiction_scan → confidence_decay → resolution_detection → candidate_generation)能跑出真實 candidate。
+
+### ✅ 驗證
+
+- AST OK(test_runner.py)
+- `db`、`args.domain`、`config.TASK_TRACES_COLLECTION` 都在 scope 內
+- `_STATUS_TO_TRACE` 覆蓋 test_runner 所有已知 status
+
+---
+
 ## [0.10.7] · 2026-05-17 — `bench_model.py` + Modelfile-coder30b + 模型選型決定
 
 **Patch · v0.10.6 加了 profile 系統就是為了能 A/B 試多個模型,這版補上 benchmark 工具 + 把選型結論落到 repo。**

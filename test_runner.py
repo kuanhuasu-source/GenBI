@@ -27,6 +27,8 @@ import pandas as pd
 from pymongo import MongoClient
 
 from llm_service import LLMService, is_dashboard_query, sanitize_pipeline, rescue_empty_echarts, ensure_default_styling, coerce_option_native_types
+# v0.11.0:test_runner 也寫 task_traces,餵 self-learning loop
+from task_trace import TaskTrace
 
 
 # ============================================================
@@ -1473,13 +1475,38 @@ def main() -> int:
 
     results = []
     total_start = time.time()
+    # status → TaskTrace.finalize() status 映射(餵 failure_filter 用)
+    _STATUS_TO_TRACE = {
+        "pass":                  "completed",
+        "refusal_detected":      "refused",
+        "phaseC_fallback_used":  "failed",  # 圖沒產出,降級表格 → 視為失敗
+        "phaseB_exec_error":     "failed",
+        "phaseB_no_Q":           "failed",
+        "phaseA_pipeline_error": "failed",
+        "phase_d_error":         "failed",
+        "fatal_error":           "failed",
+    }
     for case in selected_cases:
         case_wall_t0 = time.time()
+        # v0.11.0:每個 case 包一個 TaskTrace,餵 self-learning loop
+        _trace = TaskTrace(
+            db=db,
+            domain=args.domain,
+            query=case["query"],
+            collection_name=config.TASK_TRACES_COLLECTION,
+        )
+        llm.trace = _trace
         try:
             llm.reset_call_log()
             res = run_case(case, llm, db)
         except KeyboardInterrupt:
             print("\n🛑 使用者中斷")
+            try:
+                _trace.finalize(status="failed", error="user interrupt")
+            except Exception:
+                pass
+            finally:
+                llm.trace = None
             break
         except Exception:
             print(f"\n💥 Case {case['id']} 致命錯誤:")
@@ -1494,6 +1521,18 @@ def main() -> int:
                 "status": "fatal_error",
                 "fatal_traceback": traceback.format_exc(),
             }
+        # v0.11.0:finalize trace 帶 case 結果
+        try:
+            _trace_status = _STATUS_TO_TRACE.get(res.get("status", "fatal_error"), "failed")
+            _trace_id = _trace.finalize(
+                status=_trace_status,
+                error=res.get("fatal_traceback") or None,
+            )
+            res["trace_id"] = _trace_id
+        except Exception as _trace_e:
+            print(f"   ⚠️ trace finalize 失敗(不影響 case 結果):{_trace_e}")
+        finally:
+            llm.trace = None  # detach,避免下個 case 沾到
         # 附加 cost telemetry
         res["wall_elapsed_s"] = round(time.time() - case_wall_t0, 2)
         res["llm_usage"] = llm.get_call_summary()
