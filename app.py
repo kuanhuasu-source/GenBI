@@ -1018,6 +1018,40 @@ if query:
                         workflow_namespace["Q"] = fallback_df
                     with st.expander("🐍 檢視 Python 資料處理腳本", expanded=False):
                         st.code(prep_code, language="python")
+
+                    # v0.10.5 Level 2 (Phase B): exec OK 後跑 semantic validator
+                    # 若回 non-empty issues,當 retry trigger 餵回 LLM
+                    try:
+                        from phase_b_validator import (
+                            validate_phase_b_output,
+                            format_issues_as_retry_hint as _b_fmt_hint,
+                        )
+                        _Q_for_val = workflow_namespace.get("Q")
+                        b_issues = validate_phase_b_output(
+                            _Q_for_val, query=query, dashboard_mode=dashboard_mode,
+                        )
+                    except Exception as _b_val_e:
+                        b_issues = []
+                        st.toast(f"⚠️ phase_b_validator crashed: {_b_val_e}",
+                                  icon="⚠️")
+
+                    if b_issues and attempt < 2:
+                        prep_err = _b_fmt_hint(b_issues)
+                        _short = "; ".join(
+                            i.split(']')[0].lstrip('[') for i in b_issues
+                        )[:120]
+                        st.toast(
+                            f"🔍 Phase B semantic check 失敗 ({_short}),"
+                            f"進入第 {attempt + 2} 次重生",
+                            icon="🔁",
+                        )
+                        continue  # 進下一輪 attempt
+                    elif b_issues:
+                        st.toast(
+                            f"⚠️ Phase B semantic check 3 次都失敗,接受結果",
+                            icon="⚠️",
+                        )
+
                     break
                 except Exception:
                     prep_err = traceback.format_exc()

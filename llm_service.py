@@ -1613,9 +1613,15 @@ class LLMService:
 
     @staticmethod
     def _format_retry_hint(previous_code: str, previous_error: str,
-                            cheatsheet: str = "") -> str:
+                            cheatsheet: str = "",
+                            phase: str = "unknown") -> str:
         """把上一次失敗的 code + traceback 轉成 LLM 修正提示。
-        可選 cheatsheet 附在後面,提示常見 anti-pattern。"""
+        可選 cheatsheet 附在後面,提示常見 anti-pattern。
+
+        v0.10.5:`phase` 參數(preprocess / echarts / plotly / pipeline)
+        讓特定錯誤的 hint 能 phase-aware 給出對的 fix(例 KeyError 在
+        Phase B 跟 Phase C 是兩種不同情境,該給不同 hint)。
+        """
         if not previous_code and not previous_error:
             return ""
         hint = (
@@ -1695,12 +1701,50 @@ class LLMService:
                     "     **完全不需要也禁止 filter Q**!\n"
                 )
             elif "KeyError" in err:
-                hint += (
-                    "\n🚨【關鍵修正提示】KeyError 表示你引用了不存在的欄位。\n"
-                    "**只能用 `q_columns` / `avail_cols` 中真實存在的欄位**,不要憑想像。\n"
-                    "若做 `Q.groupby(...).agg(...)` 後想保留 raw 維度欄位(例如 hc / company_code),\n"
-                    "**必須**用 `agg(<col>=('<col>', 'first'))` 主動帶上,否則 column 會消失。\n"
-                )
+                # v0.10.5:phase-aware — Phase B 的 KeyError 多是 agg result 缺欄位
+                if phase == "preprocess":
+                    hint += (
+                        "\n🚨【關鍵修正提示 · Phase B · v0.10.5 加強】\n"
+                        "KeyError 在 Phase B 多半是這 2 種情境之一:\n\n"
+                        "**情境 A** — `Q.groupby(...).agg(...)` 後想用沒列在 agg() 內的欄位:\n"
+                        "```python\n"
+                        "agg = raw_df.groupby('company_code').agg(\n"
+                        "    total=('application_no', 'size'),\n"
+                        "    completed=('review_status', lambda x: (x=='Y').sum()),\n"
+                        "    # ❌ 忘了把 review_mechanism 列進來!\n"
+                        ")\n"
+                        "agg['ai_rate'] = agg['review_mechanism'].apply(...) / agg['completed']\n"
+                        "#                ^^^^^^^^^^^^^^^^^^^^^^^^ ❌ KeyError\n"
+                        "```\n"
+                        "✅ 修法:把要用的 col 加進 agg(...):\n"
+                        "```python\n"
+                        "agg = raw_df.groupby('company_code').agg(\n"
+                        "    total=('application_no', 'size'),\n"
+                        "    completed=('review_status', lambda x: (x=='Y').sum()),\n"
+                        "    ai_count=('review_mechanism', lambda x: (x=='AI').sum()),  # ✅ 加上\n"
+                        ")\n"
+                        "agg['ai_rate'] = agg['ai_count'] / agg['completed']  # ✅ 用 agg.col\n"
+                        "```\n\n"
+                        "**情境 B** — raw_df 加 bool flag 但 agg 沒帶上:\n"
+                        "```python\n"
+                        "Q['is_ai'] = (Q['review_mechanism'] == 'AI')  # ✅ 加 flag\n"
+                        "company_agg = Q.groupby('company_code').agg(\n"
+                        "    total=('application_no', 'size'),\n"
+                        "    # ❌ 漏 is_ai!\n"
+                        ")\n"
+                        "company_agg['ai_rate'] = company_agg['is_ai'].sum() / company_agg['total']\n"
+                        "#                       ^^^^^^^^^^^^^^^^^^^^^^^^^ ❌ KeyError\n"
+                        "```\n"
+                        "✅ 修法:`ai_count=('is_ai', 'sum')` 加進 agg。\n\n"
+                        "⚠️ 核心心法:**agg 後 ONLY 含 agg(name=...) 內列出的欄位**;raw_df 級 / 中間 flag 都消失,要用就明列進 agg(...)。\n"
+                    )
+                else:
+                    hint += (
+                        "\n🚨【關鍵修正提示】KeyError 表示你引用了不存在的欄位。\n"
+                        "**只能用 `q_columns` / `avail_cols` 中真實存在的欄位**,不要憑想像。\n"
+                        "若做 `Q.groupby(...).agg(...)` 後想保留 raw 維度欄位(例如 hc / company_code),\n"
+                        "**必須**用 `agg(<col>=('<col>', 'first'))` 主動帶上,否則 column 會消失。\n"
+                    )
             # v0.8.7:Phase B str/numeric divide,baseline Case 01 中
             elif "rtruediv" in err and "str" in err:
                 hint += (
@@ -1893,7 +1937,8 @@ class LLMService:
         import json as _json
         system_prompt = self._render_phase_a_pipeline_prompt()
         user_msg = f"需求:{query}\n計畫:{plan_text}"
-        user_msg += self._format_retry_hint(previous_code, previous_error)
+        user_msg += self._format_retry_hint(previous_code, previous_error,
+                                              phase="pipeline")
 
         last_raw = ""
         last_err = ""
@@ -2080,6 +2125,7 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
         user_msg += self._format_retry_hint(
             previous_code, previous_error,
             cheatsheet=PANDAS_ANTIPATTERN_CHEATSHEET,
+            phase="preprocess",
         )
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
         _retry_temp = 0.15 if previous_error else self.default_temperature
@@ -2317,7 +2363,7 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
 請只輸出 python code,不要前言不要說明。
 """
         user_msg = f"需求:{query}\n計畫:{plan_text}"
-        user_msg += self._format_retry_hint(previous_code, previous_error)
+        user_msg += self._format_retry_hint(previous_code, previous_error, phase="plotly")
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
         _retry_temp = 0.15 if previous_error else self.default_temperature
         raw = self._call_llm(
@@ -2348,7 +2394,7 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         intent = _detect_chart_intent(query)
         system_prompt = self._render_phase_c_echarts_prompt(cols_info, intent=intent)
         user_msg = f"需求:{query}\n計畫:{plan_text}"
-        user_msg += self._format_retry_hint(previous_code, previous_error)
+        user_msg += self._format_retry_hint(previous_code, previous_error, phase="echarts")
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
         _retry_temp = 0.15 if previous_error else self.default_temperature
         raw = self._call_llm(

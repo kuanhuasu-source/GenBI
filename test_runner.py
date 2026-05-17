@@ -692,6 +692,35 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                 Q = fallback_df
                 ns["Q"] = Q
             print(f"   attempt {attempt + 1} ({elapsed:.1f}s) ✅ exec OK")
+
+            # v0.10.5 Level 2 (Phase B): exec OK 後跑 semantic validator
+            try:
+                from phase_b_validator import (
+                    validate_phase_b_output,
+                    format_issues_as_retry_hint as _b_fmt_hint,
+                )
+                b_issues = validate_phase_b_output(
+                    Q, query=case["query"], dashboard_mode=dashboard_mode,
+                )
+            except Exception as _b_val_e:
+                b_issues = []
+                print(f"   ⚠️ phase_b_validator crashed: {_b_val_e}")
+
+            if b_issues and attempt < 2:
+                _short = "; ".join(
+                    i.split(']')[0].lstrip('[') for i in b_issues
+                )[:120]
+                print(f"   🔍 semantic check 失敗 ({_short}),進入第 {attempt + 2} 次重生")
+                retry_log.append(f"attempt {attempt + 1}: semantic [{_short}]")
+                prep_err = _b_fmt_hint(b_issues)
+                Q = None
+                continue
+            elif b_issues:
+                _short = "; ".join(
+                    i.split(']')[0].lstrip('[') for i in b_issues
+                )[:120]
+                print(f"   ⚠️ semantic check 3 次都失敗 ({_short}),接受結果")
+
             prep_err = None
             break  # 成功跳出
         except Exception:

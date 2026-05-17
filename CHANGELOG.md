@@ -5,6 +5,62 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.5] · 2026-05-17 — Level 2 (Phase B):phase-aware retry hint + Phase B semantic validator
+
+**Patch · Phase B exec error 提示太通用 + silent Q content failure 抓不到 → 拆 phase-aware hint + 加 phase_b_validator。**
+
+### 🔴 v0.10.4 baseline 觀察
+
+Phase B 既有 retry 只有 exception 才觸發,且 KeyError 提示是 Phase B / Phase C 共用(一段通用文案),Phase B 的特定情境(agg() 漏列欄、bool flag agg 沒帶)沒法用對的範例修。同時觀察到部分 Case Phase B exec 成功但 Q 是空 / 全 0 / 重複 long-format key → Phase C 接到爛 Q 出錯,但 retry 提示又指向 Phase C 改不到根因。
+
+### ✨ P1:`_format_retry_hint` 加 `phase` 參數
+
+`llm_service.py:_format_retry_hint(previous_code, previous_error, cheatsheet="", phase="unknown")`,KeyError 分支依 phase 給不同 hint:
+
+- `phase == "preprocess"` → 詳列 Phase B 兩種典型情境(A: agg() 後想用沒列在 agg 內的欄位;B: raw_df 加 bool flag 但 agg 沒帶上),含完整 fix snippet
+- 其他 → 維持既有通用 hint
+
+4 個 caller 全部加上 phase 參數:
+- `generate_pipeline` → `phase="pipeline"`
+- `generate_preprocess_code` → `phase="preprocess"` (這是 Phase B KeyError 對應 case 的關鍵)
+- `generate_plot_code` → `phase="plotly"`
+- `generate_echarts_option` → `phase="echarts"`
+
+### ✨ P2:`phase_b_validator.py`(新檔)
+
+5 個 Phase B 「exec OK 但 Q 內容錯」semantic check + 統一 `validate_phase_b_output(Q, query, dashboard_mode)` API:
+
+| Check | 抓什麼 |
+|---|---|
+| **A** `_check_q_not_empty` | Q 是空 DataFrame(filter 過嚴 / merge key 對不上) |
+| **B** `_check_q_numeric_not_all_zero` | 數值欄全 0 / 全 NaN(bool flag agg 錯) |
+| **C** `_check_q_no_total_row` | dashboard mode 但 Q 含 TOTAL/合計/全公司 row |
+| **D** `_check_q_long_format_dedupe` | long format Q 的 (cat, series) pair 重複 |
+| **E** `_check_q_comparison_has_multi_rows` | query 含比較/各/排名 等字但 Q 只 1 row |
+
+**特性**:
+- 任一 check 內部 crash 不影響其他(全部 wrap try/except)
+- 空 Q 抓到後 short-circuit 其餘 check(避免雜訊)
+- 每條 issue 含 `[CHECK_NAME]` 標籤 + 中文解釋 + 具體修法 snippet
+
+### ✨ P2:Wire 進 test_runner + app.py Phase B retry loop
+
+兩處 Phase B retry loop 都加同樣邏輯(模式同 v0.10.4 Phase C wire-in):
+
+- exec 成功 + validator pass → 跳出 loop
+- exec 成功 + validator fail + attempt < 2 → 當 retry trigger,LLM 拿 specific issue 重生 Phase B code
+- exec 成功 + validator fail + 3 attempts 用完 → 接受結果,讓 test framework 標 fail
+- exec 失敗(exception)→ 維持原本 traceback retry 邏輯
+
+### ✅ 驗證
+
+- 4 檔 AST OK(`llm_service.py`, `app.py`, `test_runner.py`, `phase_b_validator.py` 新建)
+- 5 個 check unit test 全綠(`python3 phase_b_validator.py` self-test)
+- 4 個 caller 全部加 phase 參數(`_format_retry_hint` grep:1940/2125/2366/2397)
+- 2 處 integration hook 全在(app.py Phase B retry + test_runner.py Phase B retry)
+
+---
+
 ## [0.10.4] · 2026-05-17 — Level 2:Phase C semantic validator + retry
 
 **Minor · 「exec OK 但內容錯」抓不到 → 加 semantic validator + retry loop。**
