@@ -5,6 +5,107 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.4] · 2026-05-17 — Level 2:Phase C semantic validator + retry
+
+**Minor · 「exec OK 但內容錯」抓不到 → 加 semantic validator + retry loop。**
+
+### 🔴 v0.10.3 baseline 觀察
+
+19/26 (73%),剩 7 個 fail。**4 個 STK case 都是 silent failure**(Phase C exec 成功,但 option dict 內容語意錯):
+
+- STK-01:series.data lens [15, 14, 15, 15] vs yAxis 15 — 1 series 漏 1 entry
+- STK-02:yAxis.max == None — 100% stacked 漏 max=100
+- STK-03:series.data=[30, 30] vs xAxis=15 — 長 format 沒 filter
+- STK-05:series.data=[8, 8] vs yAxis=2 — 維度倒置 / filter 錯
+
+既有 retry 只有 exception 才觸發,這類滑過去 → fail。
+
+### ✨ D1:`phase_c_validator.py`(新檔,376 行)
+
+5 個 semantic check + 統一 `validate_phase_c_output(option, Q, query, intent)` API:
+
+| Check | 抓什麼 | 主要目標 case |
+|---|---|---|
+| **A** `_check_axis_alignment` | series.data 長度 != category axis.data 長度 | STK-01, STK-03, STK-05 |
+| **B** `_check_100pct_max` | 100% stacked 場景但 value axis 沒 max=100 | STK-02 |
+| **C** `_check_cat_dedupe` | category axis.data 含重複 | 既有 v0.8.x pattern |
+| **D** `_check_long_format_one_series` | Q 3-col long format 但只 1 series | STK-03 變體 |
+| **E** `_check_series_non_degenerate` | series.data 全 0 / 全同值 silent failure | 抓 Phase B 退化公式 |
+
+**特性**:
+- 任一 check 內部 crash 不影響其他(全部 wrap try/except)
+- `_use_table=True` (table fallback) skip — 不該被當 chart 檢
+- horizontal / vertical 都支援(用 `_detect_axes` 抓 orientation)
+- 100% stack 自動偵測:intent OR Q 含 percentage/pct col OR series.stack + formatter "{value}%"
+
+**輸出格式**:
+- 每條 issue 以 `[CHECK_NAME]` 標籤開頭,LLM 容易解析
+- 含中文解釋 + 具體修法 snippet(例如 reindex+fillna pattern)
+- `format_issues_as_retry_hint()` 包成 `previous_error` 字串
+
+### ✨ D2:Wire 進 test_runner + app.py Phase C retry loop
+
+兩處 Phase C retry loop 都加同樣邏輯:
+
+```python
+try:
+    exec(plot_code)
+    option = ns2['option']
+    # ... existing post-processing (rescue, coerce) ...
+    
+    # NEW v0.10.4: semantic validation
+    issues = validate_phase_c_output(option, Q, query, intent)
+    if issues and attempt < 2:
+        plot_err = format_issues_as_retry_hint(issues)
+        continue  # 進下一輪 attempt
+    elif issues:
+        # 3rd attempt 還是 fail,接受結果
+        pass
+    break  # OK
+except Exception as e:
+    plot_err = traceback.format_exc()
+    continue
+```
+
+**設計重點**:
+- exec 成功 + validator pass → 跳出 loop(現行行為)
+- exec 成功 + validator fail + attempt < 2 → 當 retry trigger,LLM 拿 specific issue 重生
+- exec 成功 + validator fail + 3 attempts 用完 → 接受結果,讓 test framework 標 fail
+- exec 失敗(exception)→ 維持原本 traceback retry 邏輯
+
+### ✅ 驗證
+
+- 3 檔 AST OK(phase_c_validator 376 / test_runner 1595 / app.py 1451)
+- 5 個 check unit test 全綠(`python3 phase_c_validator.py` self-test)
+- 6 個 integration hook 全在(2 imports / 2 calls / 2 retries)
+- OK case 不誤報
+
+### 📋 預期 baseline 影響
+
+| Case | v0.10.3 | v0.10.4 預期 | 機制 |
+|---|---|---|---|
+| STK-01 | ❌ axis lens | ✅(check A,attempt 2 帶 reindex hint)| 救 |
+| STK-02 | ❌ 漏 max=100 | ✅(check B,attempt 2 帶 max=100 hint)| 救 |
+| STK-03 | ❌ long format misuse | ✅(check D,attempt 2 帶 filter snippet)| 救 |
+| STK-05 | ❌ axis lens | ✅(check A)| 救 |
+
+預期 19 → **22-23/26 (85-88%)**
+
+剩下:Case 03 fallback / T1 fallback / T3 phase B 是非 Phase C 問題,需另外處理。
+
+### 📋 Cost 影響
+
+每個 case Phase C 平均多 0-2 個 attempt(取決 LLM 第 1 attempt 是否過 validator)。預計 token 增加 ~10-15%(原本 already 3 attempts cap)。
+
+### 🎯 與 v0.8.7 retry hint 互補關係
+
+v0.8.7 retry hint = 「**exception → 對應 fix hint**」(基於 error message)
+v0.10.4 validator = 「**exec OK 但 semantic 錯 → 對應 fix hint**」(基於 option 結構)
+
+兩者覆蓋互補,合起來 retry 機制完整。
+
+---
+
 ## [0.10.3] · 2026-05-17 — Option 1 saner:temp 降溫 + 部門 / horizontal max / synonym 三補
 
 **Patch · v0.10.2 retry temp=0.3 引發 variance(洗牌但 net 0:fix 6 新壞 6)→ 降溫 + 修 3 個具體 bug。**

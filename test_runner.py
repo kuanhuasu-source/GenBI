@@ -875,6 +875,44 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                 option = coerce_option_native_types(option)
             plot_err = None
             print(f"   attempt {c_attempt + 1} ({c_elapsed:.1f}s) ✅ exec OK")
+
+            # v0.10.4 Level 2:exec OK 後跑 semantic validator,有 issue → retry
+            try:
+                from phase_c_validator import (
+                    validate_phase_c_output, format_issues_as_retry_hint,
+                )
+                _intent_for_val = ""
+                try:
+                    from llm_service import _detect_chart_intent
+                    _intent_for_val = _detect_chart_intent(case.get("query", ""))
+                except Exception:
+                    pass
+                semantic_issues = validate_phase_c_output(
+                    option, Q,
+                    query=case.get("query", ""),
+                    intent=_intent_for_val,
+                )
+            except Exception as _val_e:
+                semantic_issues = []
+                print(f"   ⚠️ validator crashed (ignored): {_val_e}")
+
+            if semantic_issues and c_attempt < 2:
+                plot_err = format_issues_as_retry_hint(semantic_issues)
+                short_summary = "; ".join(
+                    i.split(']')[0].lstrip('[') for i in semantic_issues
+                )[:120]
+                c_retry_log.append(
+                    f"attempt {c_attempt + 1}: semantic fail [{short_summary}]"
+                )
+                print(f"   🔍 semantic check 失敗:{short_summary} — 重生中...")
+                continue  # 進下一輪 attempt
+            elif semantic_issues:
+                # 最後一輪還是 fail — 接受結果,讓 test framework 標 fail
+                c_retry_log.append(
+                    f"attempt {c_attempt + 1}: semantic fail (3 attempts 用盡,接受)"
+                )
+                print(f"   ⚠️ semantic check 失敗 3 次,接受結果")
+
             break
         except Exception:
             plot_err = traceback.format_exc()

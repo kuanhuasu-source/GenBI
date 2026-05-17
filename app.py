@@ -1128,6 +1128,44 @@ if query:
 
                     with st.expander(f"🎨 檢視 {chart_engine} 繪圖腳本", expanded=False):
                         st.code(plot_code, language="python")
+
+                    # v0.10.4 Level 2:exec OK 後跑 semantic validator
+                    # 只對 ECharts + 非 table fallback 跑(plotly fig 跟 table 不適用)
+                    if chart_engine == "ECharts" and not use_table_fallback:
+                        try:
+                            from phase_c_validator import (
+                                validate_phase_c_output, format_issues_as_retry_hint,
+                            )
+                            _intent_for_val = ""
+                            try:
+                                _intent_for_val = _detect_chart_intent(query)
+                            except Exception:
+                                pass
+                            semantic_issues = validate_phase_c_output(
+                                final_option, Q, query=query, intent=_intent_for_val,
+                            )
+                        except Exception as _val_e:
+                            semantic_issues = []
+                            st.toast(f"⚠️ semantic validator crashed: {_val_e}",
+                                      icon="⚠️")
+
+                        if semantic_issues and attempt < 2:
+                            plot_err = format_issues_as_retry_hint(semantic_issues)
+                            short_summary = "; ".join(
+                                i.split(']')[0].lstrip('[') for i in semantic_issues
+                            )[:120]
+                            st.toast(
+                                f"🔍 semantic check 失敗 ({short_summary}),"
+                                f"進入第 {attempt + 2} 次重生",
+                                icon="🔁",
+                            )
+                            continue  # 進下一輪 attempt
+                        elif semantic_issues:
+                            st.toast(
+                                f"⚠️ semantic check 3 次都失敗,接受結果",
+                                icon="⚠️",
+                            )
+
                     break
                 except Exception:
                     plot_err = traceback.format_exc()
