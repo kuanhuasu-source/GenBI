@@ -535,10 +535,74 @@ with st.sidebar:
     st.caption("💡 環境變數可調:HRDA_MODEL_BASE_URL / HRDA_MODEL_NAME / MONGO_URI …")
 
 # ============================================================
+# v0.9.3: 把上次 session 的 in_progress message 標 interrupted
+# (page navigation 中斷 / 刷新頁面 後,讓 user 知道發生什麼)
+# ============================================================
+for _m in st.session_state.messages:
+    if _m.get("role") == "assistant" and _m.get("in_progress"):
+        _m["in_progress"] = False
+        _m["interrupted"] = True
+
+
+def _render_phases_done(phases: dict, interrupted: bool = False) -> None:
+    """v0.9.3:從 message['phases_done'] 重渲已完成 phase 的 expander。
+
+    Live execution path 也會即時 inline 渲染這些,但 page navigation 後
+    inline 沒了 — 這裡從 session_state 重渲。
+    """
+    if interrupted:
+        st.warning(
+            "⚠️ 上次執行被中斷(可能因切換頁面或 reload),僅顯示已完成階段。"
+            "重新提交相同問題即可繼續。"
+        )
+    if "plan" in phases:
+        with st.expander("📋 檢視 AI 執行計畫", expanded=False):
+            st.markdown(phases["plan"].get("text", ""))
+    if "pipeline" in phases:
+        p = phases["pipeline"]
+        if p.get("summary"):
+            st.markdown(p["summary"])
+        start_coll = p.get("start_collection", "?")
+        with st.expander(f"🛠️ 檢視 MongoDB Pipeline (起點: {start_coll})",
+                         expanded=False):
+            st.code(p.get("json", "(missing)"), language="json")
+        if p.get("raw_df_head") is not None:
+            n = p.get("n_rows", 0)
+            with st.expander(f"📄 檢視原始資料前 100 筆 ({n:,} 筆中)",
+                             expanded=False):
+                try:
+                    st.dataframe(p["raw_df_head"], use_container_width=True)
+                except Exception:
+                    pass
+    if "preprocess" in phases:
+        pp = phases["preprocess"]
+        with st.expander("🐍 Phase B 處理程式碼", expanded=False):
+            st.code(pp.get("code", "(missing)"), language="python")
+        if pp.get("q_info"):
+            st.caption(pp["q_info"])
+        if pp.get("q_head") is not None:
+            with st.expander(f"📊 Q 前 {pp.get('q_head_rows', 5)} 列",
+                             expanded=False):
+                try:
+                    st.dataframe(pp["q_head"], use_container_width=True)
+                except Exception:
+                    pass
+    if "echarts_code" in phases:
+        with st.expander("🎨 檢視 ECharts 繪圖腳本", expanded=False):
+            st.code(phases["echarts_code"], language="python")
+
+
+# ============================================================
 # 💬 歷史訊息渲染
 # ============================================================
 for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
+        # v0.9.3:in_progress / 完成後的 message 都有 phases_done — 重渲已完成階段
+        if msg.get("phases_done"):
+            _render_phases_done(
+                msg["phases_done"],
+                interrupted=msg.get("interrupted", False),
+            )
         st.write(msg["content"])
         # 圖表回放 — Plotly fig 或 ECharts option dict 二擇一
         if msg.get("fig") is not None:
@@ -576,6 +640,16 @@ if query:
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.write(query)
+
+    # v0.9.3:預先 append in_progress assistant slot,讓 page navigation
+    # 中途中斷時,session_state.messages 仍保有已完成階段的 snapshot,
+    # 切回 app page 時 history loop 從 session_state 重渲。
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": "🧠 分析進行中...",
+        "in_progress": True,
+        "phases_done": {},
+    })
 
     # ============================================================
     # 🎯 Pre-Phase 0 · Intent Router
@@ -684,6 +758,11 @@ if query:
             with st.expander("📋 檢視 AI 執行計畫", expanded=False):
                 st.markdown(plan_text)
 
+            # v0.9.3:snapshot 進 session_state.messages 供 navigation 後重渲
+            st.session_state.messages[-1]["phases_done"]["plan"] = {
+                "text": plan_text,
+            }
+
             # 🛑 拒絕短路:Plan 若標示 [REFUSE] 或明確拒絕,直接呈現結果並中止
             plan_head = plan_text.strip()[:400]
             is_refusal = (
@@ -704,10 +783,14 @@ if query:
                     "系統不執行 Phase A/B/C/D。"
                 )
                 st.markdown(clean_msg)
-                st.session_state.messages.append({
+                # v0.9.3:REPLACE in_progress slot(不要 append 第 2 條 assistant)
+                st.session_state.messages[-1] = {
                     "role": "assistant",
                     "content": f"⚠️ 資料不足\n\n{clean_msg}",
-                })
+                    "in_progress": False,
+                    "phases_done": st.session_state.messages[-1].get(
+                        "phases_done", {}),
+                }
                 # v0.7.0:refuse 也算結束 → finalize trace
                 try:
                     _trace.finalize(status="refused")
@@ -755,12 +838,25 @@ if query:
                 raise ValueError("Phase A 撈取結果為空,請檢查 pipeline 的 $match 條件。")
 
             workflow_namespace["raw_df"] = raw_df
-            st.markdown(
+            _phase_a_summary = (
                 f"📥 **Phase A 完成** · 來源:{source_label} · "
                 f"撈出 {len(raw_df):,} 筆明細 · 欄位:{list(raw_df.columns)}"
             )
+            st.markdown(_phase_a_summary)
             with st.expander(f"📄 檢視原始資料前 100 筆 ({len(raw_df):,} 筆中)", expanded=False):
                 st.dataframe(raw_df.head(100), use_container_width=True)
+
+            # v0.9.3:Phase A snapshot
+            st.session_state.messages[-1]["phases_done"]["pipeline"] = {
+                "start_collection": start_collection,
+                "json": json.dumps(
+                    {"start_collection": start_collection, "pipeline": pipeline},
+                    indent=2, ensure_ascii=False,
+                ),
+                "summary": _phase_a_summary,
+                "n_rows": len(raw_df),
+                "raw_df_head": raw_df.head(100).copy(),
+            }
 
             # ============================================================
             # Phase B — Pandas 處理 (帶錯誤回饋自我修正)
@@ -823,6 +919,17 @@ if query:
                         st.code(prep_code, language="python")
                         with st.expander("🔍 展開 Traceback"):
                             st.code(prep_err, language="bash")
+                        # v0.9.3:REPLACE in_progress slot,標 phase_b 失敗
+                        if st.session_state.messages and \
+                                st.session_state.messages[-1].get("in_progress"):
+                            _prev = st.session_state.messages[-1]
+                            st.session_state.messages[-1] = {
+                                "role": "assistant",
+                                "content": "❌ Phase B 連續失敗 3 次 — 請調整 query 或 metadata",
+                                "in_progress": False,
+                                "phases_done": _prev.get("phases_done", {}),
+                                "error": "Phase B retry exhausted",
+                            }
                         # v0.7.0:finalize trace 在中止前
                         try:
                             _trace.finalize(status="failed",
@@ -840,6 +947,15 @@ if query:
             st.markdown(f"⚙️ **Phase B 完成** · KPI 已計算 (共 {len(Q):,} 筆)")
             with st.expander(f"📊 檢視處理後資料前 100 筆 (共 {len(Q):,} 筆)", expanded=False):
                 st.dataframe(Q.head(100), use_container_width=True)
+
+            # v0.9.3:Phase B snapshot
+            _q_head = Q.head(100).copy() if hasattr(Q, 'head') else None
+            st.session_state.messages[-1]["phases_done"]["preprocess"] = {
+                "code": prep_code or "",
+                "q_info": f"Q.shape={getattr(Q, 'shape', '?')} · cols={list(getattr(Q, 'columns', []))}",
+                "q_head": _q_head,
+                "q_head_rows": min(100, len(Q) if hasattr(Q, '__len__') else 0),
+            }
 
             # ============================================================
             # Phase C — 視覺化 (引擎依 sidebar 切換 / 帶錯誤回饋自我修正)
@@ -948,6 +1064,11 @@ if query:
                 else f"引擎:{chart_engine}"
             )
             st.markdown(f"🖼️ **Phase C 完成** · {_phase_c_note}")
+
+            # v0.9.3:Phase C echarts code snapshot(option dict 會在最終 message
+            # 透過 echarts_option/table_df 渲染,所以不另外存到 phases_done)
+            if plot_code:
+                st.session_state.messages[-1]["phases_done"]["echarts_code"] = plot_code
             if chart_engine == "ECharts":
                 if use_table_fallback:
                     st.info("📋 LLM 判斷此查詢更適合用表格呈現,套用精美 KPI 表格樣式。")
@@ -985,7 +1106,10 @@ if query:
             # ============================================================
             status.update(label="✅ 分析完成", state="complete", expanded=False)
 
-            st.session_state.messages.append({
+            # v0.9.3:REPLACE in_progress slot,不要 append 第 2 條 assistant。
+            # 保留 phases_done 讓 navigation 後重渲。
+            _prev_phases = st.session_state.messages[-1].get("phases_done", {})
+            st.session_state.messages[-1] = {
                 "role": "assistant",
                 "content": "分析已完成,如上方資料、圖表與洞察所示。",
                 "fig": final_fig,
@@ -993,7 +1117,9 @@ if query:
                 "table_df": Q if use_table_fallback else None,
                 "table_option": final_option if use_table_fallback else None,
                 "insight": insight_text,
-            })
+                "in_progress": False,
+                "phases_done": _prev_phases,
+            }
 
             # 🔗 寫入「上次分析脈絡」供下一輪 follow-up 使用
             if use_table_fallback:
@@ -1048,6 +1174,17 @@ if query:
             st.error(f"發生系統級錯誤:\n{str(e)}")
             with st.expander("🔍 展開 Traceback"):
                 st.code(traceback.format_exc(), language="bash")
+            # v0.9.3:REPLACE in_progress slot,標 error,保留 phases_done
+            if st.session_state.messages and \
+                    st.session_state.messages[-1].get("in_progress"):
+                _prev = st.session_state.messages[-1]
+                st.session_state.messages[-1] = {
+                    "role": "assistant",
+                    "content": f"❌ 系統執行中斷:{str(e)[:200]}",
+                    "in_progress": False,
+                    "phases_done": _prev.get("phases_done", {}),
+                    "error": str(e),
+                }
             # v0.7.0:任務失敗 → 仍寫 trace(便於除錯)
             try:
                 _trace.finalize(status="failed", error=str(e))

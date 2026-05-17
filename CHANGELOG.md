@@ -5,6 +5,60 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.9.3] · 2026-05-16 — Hotfix:page navigation 後 phase outputs 消失
+
+**Hotfix · User 回報的 Streamlit stateless rendering 經典坑。**
+
+### 🔴 Bug
+
+User 在 app 頁 submit query → 5-phase workflow 跑到一半 → 切到 `🔍 Task Traces` 等其他 page → 切回 app 頁 → **只剩 Current Question banner,Phase 0/A/B/C/D 全部消失**。
+
+### 🎯 根因
+
+Streamlit 每次 page navigation 觸發整個 script rerun。Phase 階段的 `st.expander` / `st.markdown` / `st.code` 是**渲染呼叫**,只在當下 script 執行寫 DOM,**沒寫進 `st.session_state` 就不會 persist**。原本只在 5 phase 全部完成後才 `messages.append({final})`,中途切走就遺失所有中間階段。
+
+### ✨ Fix · piggyback `st.session_state.messages`
+
+不增新 state,改用既有 `messages` 漸進式 enrich:
+
+1. **Query 提交時** → append 一個 `in_progress=True` assistant slot:
+   ```python
+   {"role": "assistant", "content": "🧠 分析進行中...",
+     "in_progress": True, "phases_done": {}}
+   ```
+
+2. **每個 phase 完成** → snapshot 進 `messages[-1]["phases_done"]`:
+   - `plan`: text
+   - `pipeline`: start_collection / json / summary / n_rows / raw_df_head
+   - `preprocess`: code / q_info / q_head
+   - `echarts_code`: raw plot_code(option dict 走既有 `echarts_option` field)
+
+3. **最終 success / refuse / error** → **REPLACE**(不 append)last message,保留 phases_done。
+
+4. **history loop 加 `_render_phases_done(phases, interrupted)`** 重渲已完成階段(navigation back 走這條)。
+
+5. **每次 script 啟動,標前次未完成的 `in_progress` 為 `interrupted=True`** → 切回來時顯示 `⚠️ 上次執行被中斷` 警告 + 已完成階段內容。
+
+### 🎁 額外得益
+
+`pages/05_task_traces.py` / `06_learning_review.py` 切回來都自動正確,因為 history loop 本來就會跑。
+
+Page reload(F5)後同樣也會看到 `interrupted` 警告 + 已完成階段,跟 navigation 同行為。
+
+### ✅ 驗證
+
+- `app.py` AST OK(1274 行,net +120)
+- 8 個 phase snapshot 全在(in_progress init / Phase 0 / A / B / C / interrupted detection / final replace × 2)
+- 既有完成 path(refuse / final success / Phase B exhausted / 系統 exception)都改 REPLACE 不 append,確保不會雙寫 assistant message
+
+### 📋 不變
+
+- `LLMService` 完全沒動
+- 既有 history 渲染 fig / echarts_option / table_df / insight 都不變
+- LLM call 流程不變,純 state 管理改動
+
+---
+
 ## [0.9.2] · 2026-05-16 — Confidence decay + STK 邊角 + nightly orchestrator + docs
 
 **Patch · 補完 self-learning MVP 缺漏項 + 解 baseline 剩 2 fail + cron 整合 + 文件刷新。**
