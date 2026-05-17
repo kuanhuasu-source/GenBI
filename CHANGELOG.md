@@ -5,6 +5,55 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.11.2] · 2026-05-17 — `DEPLOY_A100_QWEN36_27B.md` production 部署指南
+
+**Patch · 文件版本。為「從本地 dev → A100 40GB production」的 deployment 寫完整 SOP。**
+
+### ✨ `DEPLOY_A100_QWEN36_27B.md`(新檔,11 sections)
+
+對象 DevOps / MLOps,把 GenBI 從 M-series + Ollama + qwen3-coder:30b dev 環境推上 A100 40GB + vLLM + Qwen3.6-27B-AWQ-INT4 production。
+
+涵蓋:
+
+1. 系統需求(硬體 / 軟體 / 預期效能對照)
+2. 部署路徑選擇 — 下載現成 vs 自製 AWQ
+3. **路徑 A:下載現成 AWQ(主流程,15-30 分鐘)** — `cyankiwi/Qwen3.6-27B-AWQ-INT4` 為首選,fallback `QuantTrio/Qwen3.6-27B-AWQ`
+4. 路徑 B:自己量化(若有 audit / 客製 calibration 需求)
+5. **GenBI .env 切換** + 為什麼用 `reasoning_distilled` profile + Disable thinking 雙層處理(vLLM template + `_strip_think_blocks`)
+6. **3 階段測試** — smoke (1 min) / bench (5-10 min) / full baseline (20-30 min) + 判讀基準
+7. Production checklist(部署前 11 項 + 部署後監控 3 項)
+8. 故障排除(vLLM 起不來 / 結果怪 / 量化質量差 三大類)
+9. **3 分鐘回滾計畫**(回到 ollama + qwen3-coder)+ self-learning learning_* backup 指示
+10. 進階場景(高 QPS / 多卡 TP / self-learning cron 部署)
+11. 參考連結 + 內部文件 cross-ref
+
+### 🎯 關鍵設計決策
+
+1. **首選 cyankiwi**(CUDA 版本要求較寬)— v0.11 期間 search HF 確認過兩個社群品牌,QuantTrio 要 CUDA 12.8+ vLLM 0.19+ 較嚴
+2. **vLLM 啟動參數每個值附理由**(`awq_marlin` 比 plain awq 快 1.5-2x / `gpu-memory-utilization 0.85` 給 model + KV cache + 緩衝)
+3. **`reasoning_distilled` profile 對齊 Qwen 官方建議**(對照表證明 temp=0.7 / presence_penalty=1.5 跟 Qwen3.6 non-thinking sampling 一致)
+4. **量化選擇對照表**(AWQ vs GPTQ vs GGUF vs FP8)幫團隊評估 trade-off
+5. **Production checklist 結構化**(11 項部署前 + 3 項部署後監控)
+
+### 🗑️ .gitignore 更新
+
+把今天實驗過但已決定不採用的 Modelfile 加 ignore:
+- `Modelfile-qwen25-coder-32b`(qwen2.5-coder:32b 慢 6x,benchmark 證實不適合)
+- `Modelfile-qwen35-9b`(reasoning model thinking 漏)
+
+### ✅ 預期效能(務實估計,實測待 A100 access)
+
+| 環境 | Per-query | vs current 43.5s | 機率 |
+|---|---|---|---|
+| 最佳:thinking 完全關 + Qwen3.6 質量正常 | 10-15s | 3-4x 快 | 30% |
+| **務實:thinking 大致關 + 少 overhead** | **18-28s** | **1.5-2.4x 快** | **50%** |
+| 打平:thinking 偶爾漏 + retry 變多 | 40-70s | 0.6-1.0x | 15% |
+| 退步:thinking 嚴重漏 / 量化品質差 | 100s+ | 0.4x 或更糟 | 5% |
+
+期望值 ~28s/query(快 1.5x),但**實測才算數**。
+
+---
+
 ## [0.11.0.2] · 2026-05-17 — Hotfix:confidence_decay tz-naive vs aware datetime 比較
 
 **Patch · 同 v0.11.0.1 家族 bug。learning pipeline 真實版跑出 13 個 candidate,但 confidence_decay 那一步炸 TypeError。**
