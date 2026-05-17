@@ -599,6 +599,10 @@ def apply_confidence_decay(
         last_updated = inst.get("updated_at")
         if not isinstance(last_updated, datetime):
             continue
+        # v0.11.0.2:pymongo 預設讀 BSON Date 是 tz-naive,threshold_dt 是 aware
+        # → 比較會 TypeError。視 naive datetime 為 UTC 補 tzinfo。
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
         if last_updated > threshold_dt:
             continue  # 還夠新,不 decay
 

@@ -5,6 +5,52 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.11.0.2] · 2026-05-17 — Hotfix:confidence_decay tz-naive vs aware datetime 比較
+
+**Patch · 同 v0.11.0.1 家族 bug。learning pipeline 真實版跑出 13 個 candidate,但 confidence_decay 那一步炸 TypeError。**
+
+### 🔴 症狀
+
+```
+❌ confidence_decay failed:
+TypeError: can't compare offset-naive and offset-aware datetimes
+File: learning/instinct_consolidator.py:602
+   if last_updated > threshold_dt:
+```
+
+`threshold_dt = datetime.now(timezone.utc) - timedelta(days=dormancy_days)` 是 tz-aware,但 `last_updated = inst.get("updated_at")` 從 pymongo 讀回是 **tz-naive**(BSON Date 沒有 tzinfo,pymongo 預設行為)。
+
+### ✨ 修正
+
+在比較前對 naive datetime 補上 `tzinfo=timezone.utc`:
+
+```python
+last_updated = inst.get("updated_at")
+if not isinstance(last_updated, datetime):
+    continue
+if last_updated.tzinfo is None:
+    last_updated = last_updated.replace(tzinfo=timezone.utc)  # ← 新增
+if last_updated > threshold_dt:  # 現在 aware vs aware 可比
+    continue
+```
+
+### 🔍 同類掃描
+
+掃 `learning/` 下所有用 datetime 比較的地方:
+- `resolution_detector.py:227-231` — `started_at` 互比,但 fallback 用 `datetime.min`(naive)。**只在同源 naive 比 naive 場景,目前不出錯**;若未來 trace_id pipeline 改 aware,要連帶 patch
+- 其他都是寫入路徑(`now = datetime.now(timezone.utc)`),只有 instinct_consolidator decay job 是讀後比較,所以也只有它出錯
+
+### ✅ 驗證
+
+- AST OK
+- 邏輯 smoke:naive `2026-04-01` 補 tzinfo 後 vs aware `now-90d`,比較正確、跟 decay 邏輯一致(該日尚未 dormant,不 decay)
+
+### 📌 下次 nightly run 預期
+
+`confidence_decay` 那行從 `❌ error` 變 `✅ 0.0s ok`。實際不會 decay 任何 instinct(剛 bootstrap 完,沒有 ≥ 90d dormant 的)。
+
+---
+
 ## [0.11.1] · 2026-05-17 — `SELF_LEARNING_OPS.md` 維運手冊 + 全面更新 README / AI_CONTEXT / AI_CODE
 
 **Patch · 文件刷新版本。**
