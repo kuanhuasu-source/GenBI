@@ -225,13 +225,21 @@ streamlit run app.py
 
 ### 6.4 「明明跑了 bootstrap,instinct 還是 0」
 
-`bootstrap` 寫的是 `learning_observations`,不是 `learning_instincts`。要等 nightly run 跑完 consolidation 才會出現 instinct。
+**v0.11.1 修正版**:`bootstrap` **直接寫 `learning_instincts`**(不是 observations),所以跑完應該立刻看到 13 個 active instinct。
 
-或手動觸發:
+確認:
 ```python
-from learning.instinct_consolidator import run_consolidation
-run_consolidation(db, verbose=True)
+from pymongo import MongoClient
+import config
+db = MongoClient(config.MONGO_URI)[config.MONGO_DB]
+print(db.learning_instincts.count_documents({"status": "active"}))
+# 預期 13
 ```
+
+若 0,檢查:
+- `--dry-run` 沒拿掉
+- DB 連線跑錯 DB(看 config.MONGO_DB)
+- 既有 seed 因 dedupe_key 衝突被 skip(可看 `learning_audit_log`)
 
 ### 6.5 「失敗 trace 數量爆量,LLM 帳單壓力大」
 
