@@ -5,6 +5,97 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.3] · 2026-05-17 — Option 1 saner:temp 降溫 + 部門 / horizontal max / synonym 三補
+
+**Patch · v0.10.2 retry temp=0.3 引發 variance(洗牌但 net 0:fix 6 新壞 6)→ 降溫 + 修 3 個具體 bug。**
+
+### 🔴 v0.10.2 baseline 觀察
+
+跑出來 17/26 (65%) 跟 v0.9.3 一樣,但**6 個 stuck case 被救 + 6 個新壞**(穩定 case 因 temp 抬高被翻盤)。Net 0 = bad trade-off。
+
+仍 fail 3 個 chronic case:
+- Case 03(LLM 產 `rtn_count`,synonym list 沒這名)
+- STK-01(LLM horizontal 但漏 `xAxis.max=100`)
+- STK-04(Phase C fallback)
+
+新發現:Case 08 因 Phase D 寫「部門」被 denial marker 誤判(類似「趨勢」的 false positive)。
+
+### ✨ P1:`_retry_temp` 0.3 → **0.15**
+
+降一半。原 0.3 太 chaotic,0.15 還是有 break-stuck 機會但 noise 降低。4 個 generate_* 同步調:
+
+```python
+# v0.10.2 → v0.10.3:
+_retry_temp = 0.15 if previous_error else self.default_temperature  # 之前是 0.3
+```
+
+### ✨ P2:`部門` 加進 `_CONTEXT_REQUIREMENTS`
+
+跟「趨勢」同套機制 — 只在「依/各/分/間/比較/by」等 dept-analytical context 才算 misuse:
+
+```python
+_CONTEXT_REQUIREMENTS = {
+    "趨勢": ("過去", "未來", "月", "週", "季", "年", "日", "時間", ...),
+    "部門": ("各部門", "依部門", "分部門", "by department",
+              "部門間", "部門比較", "部門別", "部門差異", "departmental"),  # 新
+}
+```
+
+5 個 unit test 全綠:
+- 「考慮按部門細分」→ OK(forward-looking 建議)
+- 「**各部門**退單率差異」→ 違規(真誤用)
+- 「**若有**部門資料」→ OK(caveat)
+- 「**部門間**流動率比較」→ 違規(真分析)
+- 「**無**部門欄位,**無法**做部門比較」→ OK(denial context)
+
+### ✨ P3:Phase C `STACKED_100_HORIZONTAL` block 強化 `xAxis.max=100`
+
+baseline 多次:LLM 寫對 horizontal 但漏 `"max": 100`,bar 看起來 100% 但實際 scale 0~total。
+
+`_PHASE_C_BLOCK_STACKED_100_HORIZONTAL` 加 **CRITICAL FATAL** 警告:
+
+```
+🚨【CRITICAL FATAL — v0.10.3 強化】橫向 100% stacked 必須寫
+   `xAxis: {"max": 100, ...}`!value 軸從 vertical 的 yAxis 換到
+   xAxis,但「max=100 鎖頂」這條規則沒消失,只是搬到 xAxis 上。
+
+   ❌【baseline 多次踩雷】:
+   `xAxis: {"type": "value", "axisLabel": {"formatter": "{value}%"}}`
+   忘 "max": 100
+   ✅ 正解:"max": 100 必須跟 formatter "{value}%" 一起,缺一不可
+```
+
+### ✨ P4:Case 03 synonym 補 `rtn_count` / `return_cnt`
+
+baseline 看到 LLM 產 `rtn_count` 不在 synonym list,加進去。兩處同步(`test_runner.py` + `embedded_test_cases.py`):
+
+```python
+['return_count', 'RTN', 'rtn', 'RET', 'rtn_count', 'return_cnt']
+```
+
+### ✅ 驗證
+
+- 4 檔 AST OK
+- 5 個 patch 點 sentinel check 全在
+- 5 個 部門 context unit test 全綠(boundary 含 denial / caveat / 真誤用)
+
+### 📋 預期 baseline 影響
+
+| 項目 | 預期 |
+|---|---|
+| temp 0.15 變異性 | 減半,可能 ±1-2 case |
+| Case 03 | ✅(synonym 命中 rtn_count) |
+| Case 08 部門誤判 | ✅(context 不含 "by/依/各 部門") |
+| STK-01 horizontal max=100 | 🎲 取決於 LLM 是否吃 prompt 警告 |
+
+預期 17 → **20-22/26 (77-85%)**
+
+### 🚧 若還是不夠 → Level 2
+
+semantic validator(retry 條件加上「exec OK 但內容錯」),預估 ~半天 work。
+
+---
+
 ## [0.10.2] · 2026-05-17 — Retry temperature bump(Level 1 strengthening)
 
 **Patch · 打破 LLM 在 `temp=0` deterministic 下連續犯同錯的 stuck pattern。**

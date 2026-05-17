@@ -54,7 +54,7 @@ EMBEDDED_TEST_CASES: dict[str, list[dict]] = {
             # 接受 canonical(pay_count/return_count) 或 user 字眼(PAY/RTN)
             'expected_q_cols_all': [
                 ['pay_count', 'PAY', 'pay'],
-                ['return_count', 'RTN', 'rtn', 'RET'],
+                ['return_count', 'RTN', 'rtn', 'RET', 'rtn_count', 'return_cnt'],
                 'company_code',
             ],
             'echarts_min_series': 2,

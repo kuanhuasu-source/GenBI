@@ -65,7 +65,7 @@ TEST_CASES = [
         # 接受 canonical(pay_count/return_count) 或 user 字眼(PAY/RTN)
         "expected_q_cols_all": [
             ["pay_count", "PAY", "pay"],
-            ["return_count", "RTN", "rtn", "RET"],
+            ["return_count", "RTN", "rtn", "RET", "rtn_count", "return_cnt"],
             "company_code",
         ],
         "echarts_required_keys": ["title", "xAxis", "yAxis", "series"],
@@ -460,6 +460,13 @@ def is_misused(text: str, term: str) -> bool:
         "趨勢": (
             "過去", "未來", "月", "週", "季", "年", "日", "時間",
             "trend", "time", "monthly", "yearly", "weekly",
+        ),
+        # v0.10.3:「部門」單獨提到(如「考慮按部門 ...」)是 forward-looking
+        # 建議,不算誤用;只有真的做「by 部門」分析才算 misuse
+        "部門": (
+            "各部門", "依部門", "分部門", "by department",
+            "部門間", "部門比較", "部門別", "部門差異",
+            "departmental",
         ),
     }
     denial_markers = (

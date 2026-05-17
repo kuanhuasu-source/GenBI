@@ -1432,10 +1432,19 @@ _PHASE_C_BLOCK_STACKED_100_HORIZONTAL = """
 
 跟 vertical `stacked_100` block 的差異:**xAxis / yAxis 對調 + label position 改 inside-right**。
 
+🚨【CRITICAL FATAL — v0.10.3 強化】橫向 100% stacked **必須**寫 `xAxis: {"max": 100, ...}`!
+   value 軸從 vertical 的 yAxis 換到 xAxis,但「max=100 鎖頂」這條規則**沒**消失,
+   只是搬到 xAxis 上。漏掉的話 ECharts 會自動 scale 變成 0~total(不是 0~100%),
+   bar 看起來「全長 100%」但實際值不對應 100% 刻度。
+
+   ❌【baseline 多次踩雷】LLM 寫 `xAxis: {"type": "value", "axisLabel": {"formatter": "{value}%"}}`
+       忘了 `"max": 100` → test fail / 圖表 mismatch。
+   ✅ 正解:**`"max": 100` 必須跟 `formatter "{value}%"` 一起出現**,缺一不可。
+
 5.54 ⚠️【維度方向辨識】橫向 stacked 100% 下:**dim_x 變 yAxis (category)**,**percentage 變 xAxis (value)**。
     口訣:橫向 = 「類別在左、數值在下」翻轉成「類別在左、數值在右」,bar 從左往右伸展。
 
-5.6H ✅【橫向 100% 配方】每柱(現在是橫條)加總 = 100%,鎖住 xAxis(value)max=100:
+5.6H ✅【橫向 100% 配方】每柱(現在是橫條)加總 = 100%,**必須**鎖住 xAxis(value)max=100:
     ```python
     x_dim, series_dim, value_col = '<...>', '<...>', '<percentage>'  # Phase B 已 0-100 normalize
     if value_col in Q.columns:

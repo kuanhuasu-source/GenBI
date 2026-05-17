@@ -1900,7 +1900,7 @@ class LLMService:
         for attempt in range(3):
             # v0.10.2:retry 時 temp 抬高打破 LLM stuck pattern(temp=0 deterministic
             # 會讓同個 prompt 連續產同樣錯誤)。attempt 1 維持 default 求穩。
-            _retry_temp = 0.0 if attempt == 0 else 0.3
+            _retry_temp = 0.0 if attempt == 0 else 0.15
             raw = self._call_llm(
                 [{"role": "system", "content": system_prompt},
                  {"role": "user", "content": user_msg}],
@@ -2082,7 +2082,7 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
             cheatsheet=PANDAS_ANTIPATTERN_CHEATSHEET,
         )
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
-        _retry_temp = 0.3 if previous_error else self.default_temperature
+        _retry_temp = 0.15 if previous_error else self.default_temperature
         raw = self._call_llm(
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_msg}],
@@ -2319,7 +2319,7 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error)
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
-        _retry_temp = 0.3 if previous_error else self.default_temperature
+        _retry_temp = 0.15 if previous_error else self.default_temperature
         raw = self._call_llm(
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_msg}],
@@ -2350,7 +2350,7 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error)
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
-        _retry_temp = 0.3 if previous_error else self.default_temperature
+        _retry_temp = 0.15 if previous_error else self.default_temperature
         raw = self._call_llm(
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_msg}],
