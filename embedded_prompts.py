@@ -585,6 +585,41 @@ Q = counts[['<x_dim>', '<series_dim>', 'percentage']]
 - pivot 後再 melt(`melt` 的 `var_name` 欄會帶 `_pct` 後綴,Phase C filter 對不上)
 - 在 Q 中保留 wide format(Phase C 5.55 強制 pivot 鐵律,wide 反而 confused)
 - 算完 percentage 後忘了 reset_index
+
+🎯【Multi-state composite query 處理】(v0.9.2 — STK-04 case)
+若 query 列舉 **≥3 個衍生狀態**(例如「**核准/退件/進行中**」「**新/舊/流失客戶**」
+「**待回應/處理中/已結案**」),這些 state **通常不是 raw column,需要從多個
+status flag 衍生**成單一 categorical column 再 groupby。
+
+❌ 反例(STK-04 baseline 踩過):
+```python
+counts = raw_df.groupby(['<dim>', 'review_status', 'review_result']).size()
+Q = counts[['<dim>', 'review_status', '<value>']]      # ❌ 漏 review_result,
+                                                          #   review_status 只有 Y/N 2 種
+                                                          # → Phase C 只能畫 2 series,不是 3
+```
+
+✅ 正解:**先 derive `state` categorical column 再 groupby**:
+```python
+import numpy as np
+
+# Step 1:用 np.select / df.apply 衍生一個 state column
+conditions = [
+    raw_df['review_status'] == 'N',                                              # 進行中
+    (raw_df['review_status'] == 'Y') & (raw_df['review_result'] == 'Y'),         # 核准
+    (raw_df['review_status'] == 'Y') & (raw_df['review_result'] == 'N'),         # 退件
+]
+choices = ['進行中', '核准', '退件']
+raw_df['state'] = np.select(conditions, choices, default='其他')
+
+# Step 2:groupby (dim, state) 算占比
+counts = raw_df.groupby(['<dim>', 'state']).size().reset_index(name='count')
+counts['_total_per_group'] = counts.groupby('<dim>')['count'].transform('sum')
+counts['percentage'] = (counts['count'] / counts['_total_per_group'] * 100).round(2)
+Q = counts[['<dim>', 'state', 'percentage']]   # ✅ 3 個 state value,Phase C 3 series
+```
+
+口訣:**多狀態 query = derived state column,不要硬塞 raw status 欄位**。
 """
 
 

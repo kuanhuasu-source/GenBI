@@ -603,4 +603,143 @@ DB 整個壞掉?系統不會死:
 
 ---
 
+## 17. v0.4.x–v0.7.x · Phase 修補 + Task Trace + Modular Prompts
+
+`v0.3.x` → `v0.7.x` 期間累積一連串 5-phase workflow 強化,**不改架構**只強化內部:
+
+- **v0.4.x · 5-phase 細修**:Plan pie-chart false positive 防線、Phase A `sanitize_pipeline`(strip `$cond`/`$divide` 等派生 operator)、Phase C 雙軸 routing、Export Insight → PPTX。
+- **v0.5.x · 模組化 prompt**:Phase C 拆 universal header + 11 chart intent blocks(pie / stacked_100 / stacked_raw / line_dual / heatmap / bar_horizontal / line_single / scatter / kpi_table / bar_grouped / bar_basic),`_detect_chart_intent()` 純 heuristic 路由。Prompt 大小 24K → 6-9K per call。
+- **v0.6.x · Phase B 模組化**:同手法拆 Phase B 成 universal header + 6 intent block(dashboard_kpi / stacked_long_pct / stacked_wide / ratio_kpi / time_series / simple_groupby),`_detect_preprocess_intent()`。
+- **v0.7.0 · Task Trace**:`task_trace.py` 模組,每次 user query 記錄每個 phase 耗時 + 每次 LLM call 完整 messages + response + tokens 到 `task_traces` collection。Streamlit `pages/05_task_traces.py` 可逐步驟展開檢視。
+- **v0.7.2 · Prompt invariants**:`scripts/check_prompt_invariants.py` sentinel check 防止 refactor 漏接 critical rule。17 prompts × 52 sentinels。
+
+---
+
+## 18. v0.8.x–v0.9.x · Self-Learning Layer(MVP 6 週完成)
+
+對齊 `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md`。**End-to-end loop**:
+
+```
+失敗 task_trace
+    ↓ failure_filter            (撈最近 N 天 failed/refused trace)
+    ↓ observation_extractor     (LLM 抽 context/action/result/cause/recommendation + dedupe)
+learning_observations [candidate]
+    ↓ verifier                  (LLM 獨立驗 + confidence 4-component composite)
+learning_observations [verified | rejected]
+    ↓ instinct_consolidator     (cluster ≥3 同意 obs + avg conf ≥0.80 → 升 instinct)
+learning_instincts [candidate]
+    ↓ candidate_generator       (active + conf≥0.85 + evidence≥3 → 升 prompt patch candidate)
+prompt_rule_candidates [candidate]
+    ↓ test_runner               (套 candidate 重跑 baseline)
+    ↓ regression_gate           (4 gate: no regression / pass↑ / latency<10% / cost<15%)
+prompt_rule_candidates [approved | rejected]
+    ↓ 人類在 pages/06_learning_review.py 確認 → 手動 merge 進 prompt template
+
+並行 jobs:
+    resolved trace → resolution_detector → test_cases [type='regression']
+    verified obs vs active instinct → contradiction_scan → auto-degrade + 寫 notification
+    Dormant instinct (90d 無 evidence) → confidence_decay → conf -= 0.02
+```
+
+### 18.1 · 11 個新模組
+
+| 模組 | 功能 |
+|---|---|
+| `learning/bootstrap.py` | 13 條歷史 hotfix(v0.3.x–v0.7.x 累積)seed 進 `learning_instincts` |
+| `learning/failure_filter.py` | 從 `task_traces` 撈 failed/refused/手動 flag trace |
+| `learning/observation_extractor.py` | LLM 抽 5+1 欄位 observation + sha256 dedupe |
+| `learning/verifier.py` | LLM 獨立判 accept/revise/reject + 套 confidence |
+| `learning/confidence.py` | 4-component composite (evidence/specificity/consistency/novelty) |
+| `learning/instinct_consolidator.py` | Jaccard cluster + contradiction handling + confidence decay(v0.9.2)|
+| `learning/resolution_detector.py` | resolved failure → auto regression test_case |
+| `learning/candidate_generator.py` | instinct → prompt_rule_candidate |
+| `learning/regression_gate.py` | 4 條 gate(no regression / pass / latency / cost) |
+| `learning/dashboard_metrics.py` | operational / quality / impact 指標計算 |
+| `pages/06_learning_review.py` | Streamlit admin review UI(metric / candidate / contradiction / observation browser) |
+
+### 18.2 · 5 個新 MongoDB collections(migration 005 自動建)
+
+| Collection | 用途 |
+|---|---|
+| `learning_observations` | 從 trace 抽出的觀察(7 indexes 含 dedupe_key unique) |
+| `verifier_results` | Verifier agent 對 observation 的獨立判決 |
+| `learning_instincts` | 累積的 instinct(13 seed + auto-consolidated)|
+| `learning_jobs` | 所有 batch job 執行記錄(包含 contradiction notifications) |
+| `prompt_rule_candidates` | 從 instinct 升的 prompt patch candidate,等人類審 |
+
+### 18.3 · Orchestrator(`scripts/run_learning_jobs.py`)
+
+一鍵 nightly cron 跑完 7 個 job 序列:
+
+```bash
+# 推薦 cron 部署
+0 2 * * * /usr/bin/python /path/to/GenBI/scripts/run_learning_jobs.py
+
+# Flag:
+#   --dry-run             所有 job dry-run
+#   --skip <job_name>     跳過(可多次)
+#   --only <job1,job2>    只跑某幾個
+#   --window-days N       failure window
+#   --extraction-limit N  observation extraction 上限
+```
+
+### 18.4 · Domain-agnostic 加強(v0.8.3)
+
+- **Plan prompt 加 `raw_columns_needed`**:Plan 明列要 $project 的 raw 欄位
+- **Phase A `column_clusters` 鐵律**:metadata 定義 cluster(如 tflex 的 `[review_status, review_result, review_mechanism]`),Phase A 引用任一就**必須**全撈
+- **`q_numeric_must_vary` test check**:抓「跑得起來但答錯」silent failure(全 0 / 全 NaN / 全同值)
+
+### 18.5 · Baseline 50% → 92% 的 4 輪迭代
+
+v0.8.7 → v0.9.1 用 baseline 驅動,每輪從實際 `phases.echarts.code` JSON 反推 root cause,**批次修 + unit test 驗證**:
+
+| 版本 | Pass% | 主修 |
+|---|---|---|
+| v0.8.7 | 62% | `.round()` builtin / Phase C long-format example / retry feedback 7 種 error→hint mapping |
+| v0.8.8 | 69% | Phase C「Q 是 post-aggregation 終態」/ raw-col KeyError hint / 100% normalize 觸發詞 |
+| v0.8.9 | **92%** | `_detect_chart_intent` 同步 intra-bar / 3-col long format / `(expr).round()` 變種 / dashboard row-level KPI |
+| v0.9.1 | (待測) | Horizontal stacked bar(orientation 與 chart type 正交)/ Phase B 0-100 normalize 強化 |
+
+### 18.6 · 用法
+
+```bash
+# 一次跑通整個 loop
+python scripts/run_learning_jobs.py                       # 所有 job 跑一輪
+
+# 或單獨跑某 module
+python -m learning.observation_extractor --days 7
+python -m learning.verifier --limit 20
+python -m learning.instinct_consolidator                  # consolidation + contradiction + decay
+python -m learning.resolution_detector --days 30
+python -m learning.candidate_generator
+python -m learning.regression_gate --candidate-run-id <id> --candidate-id PRC-NNNNNN
+
+# Dashboard
+python -m learning.dashboard_metrics --days 7             # CLI snapshot
+streamlit run pages/06_learning_review.py                 # 人類 review UI
+```
+
+---
+
+## 19. 更新後的 12 · 版本演進表(2026-05)
+
+| Version | Highlight |
+|---|---|
+| `v0.4.0` | Export Insight → PPTX(python-pptx,matplotlib renderer + table/KPI fallback)|
+| `v0.4.1–v0.4.3` | Phase A `sanitize_pipeline` strip `$cond` / Phase C 雙軸 routing / Plan pie chart false positive 防線 |
+| `v0.5.0–v0.5.1` | Phase C 拆 universal + 11 intent blocks + `_detect_chart_intent` 路由(prompt 24K→9K)|
+| `v0.6.0–v0.6.1` | Phase B 拆 universal + 6 intent blocks + `_detect_preprocess_intent` 路由 |
+| `v0.7.0` | Task Trace 模組(每 query 完整 phase + LLM call 記錄)+ `pages/05_task_traces.py` |
+| `v0.7.1–v0.7.4` | Phase B「禁止 import」hotfix / sentinel prompt invariants check / test_runner synonym list + chart-type aware key check |
+| `v0.8.0–v0.8.5` | **Self-Learning MVP Week 1-4** — bootstrap + 5 collections + failure_filter + observation_extractor + dedupe + verifier + confidence + consolidator + contradiction |
+| `v0.8.3` | Plan `raw_columns_needed` + Phase A `column_clusters` 鐵律 + cheatsheet 全形標點 + `q_numeric_must_vary` silent-failure check |
+| `v0.8.6` | hotfix:sync `embedded_test_cases.py` 跟 `test_runner.py` 的 v0.7.3/7.4/8.3 改動 |
+| `v0.8.7–v0.8.9` | **Baseline 50%→92% 的 4 輪迭代** — `.round()` / long-format dedupe / raw-col filter / intra-bar 100% / dashboard row-level KPI |
+| `v0.8.10` | **Self-Learning Week 5** — resolution_detector + candidate_generator + regression_gate |
+| `v0.9.0` | **Self-Learning Week 6** — `pages/06_learning_review.py` + `learning/dashboard_metrics.py`(4 section admin UI: metric / candidate review / contradiction review / observation browser)|
+| `v0.9.1` | Horizontal stacked bar(orientation 與 chart type 正交)+ Phase B 0-100 normalize 強化 |
+| `v0.9.2` | confidence decay(spec §16 補)+ STK-04 multi-state composite + 趨勢 denial false positive + `scripts/run_learning_jobs.py` cron orchestrator + 本文件更新 |
+
+---
+
 # (以下為文件結束)

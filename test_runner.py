@@ -449,7 +449,19 @@ def is_misused(text: str, term: str) -> bool:
 
     拒絕語境的判斷:term 所在的「整句」(以句號/分號/換行斷句) 內含 denial marker。
     比 40 字 window 更穩,能處理「無 X、Y、Z 等資訊,無法進行 ...」這類長列舉句。
+
+    v0.9.2 例外:某些 term 在中文裡是「一般用法 + 特定用法」雙義,只當「特定用法」
+    才算違規。例如「趨勢」單獨可指「pattern / tendency」(一般中文),
+    搭配時間詞才指「time-series trend」(資料缺時間時的禁忌)。
     """
+    # v0.9.2:term 的「上下文要求」(出現時還要伴隨這些字才算 misuse)
+    # 沒列在這的 term,維持原行為(出現在非拒絕語境就算 misuse)。
+    _CONTEXT_REQUIREMENTS = {
+        "趨勢": (
+            "過去", "未來", "月", "週", "季", "年", "日", "時間",
+            "trend", "time", "monthly", "yearly", "weekly",
+        ),
+    }
     denial_markers = (
         # 強拒絕詞 (硬性缺欄位 / 不支援)
         "無法", "缺少", "缺乏", "不存在", "不支援", "不可", "沒有", "未有",
@@ -470,11 +482,16 @@ def is_misused(text: str, term: str) -> bool:
         # 廣義 forward-looking 標記(這些詞在 insight 中通常代表「若有資料就能做」)
         "建議", "協助", "視覺化", "探索", "將來", "或地區", "或職級",
     )
+    context_required = _CONTEXT_REQUIREMENTS.get(term)
     for pos in _find_all(text, term):
         sentence = _enclosing_sentence(text, pos)
-        if not any(m in sentence for m in denial_markers):
-            return True  # 至少一處在正向使用 = 違規
-    return False  # 沒出現或全在拒絕語境
+        if any(m in sentence for m in denial_markers):
+            continue   # 拒絕語境,OK
+        # v0.9.2:term 需要 context check 時,只有 context 字眼出現才算 misuse
+        if context_required and not any(c in sentence for c in context_required):
+            continue   # 沒時間詞,「趨勢」是一般用法 = OK
+        return True    # 至少一處在正向使用且符合 context = 違規
+    return False  # 沒出現或全在拒絕/無 context
 
 
 # ============================================================

@@ -5,6 +5,91 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.9.2] · 2026-05-16 — Confidence decay + STK 邊角 + nightly orchestrator + docs
+
+**Patch · 補完 self-learning MVP 缺漏項 + 解 baseline 剩 2 fail + cron 整合 + 文件刷新。**
+
+### ✨ P1:Confidence decay job(spec §16 補做)
+
+`learning/instinct_consolidator.py` 加 `apply_confidence_decay()`:
+- Active instinct `updated_at` ≥ 90 天 (dormancy_days) → `confidence -= 0.02`
+- `confidence < 0.50` → `status='deprecated'`
+- 每次 decay 成功把 `updated_at` 撥 now + 寫 `last_decay_at`(日內 idempotent)
+- 寫 `learning_jobs` record(job_type='confidence_decay')
+- CLI:`python -m learning.instinct_consolidator --skip-consolidation --skip-contradiction`(或直接跑全部就會帶 decay)
+
+5 個 unit test 全綠:dormant 100d / fresh 30d / boundary 0.50→0.48 deprecate / boundary 0.51→0.49 deprecate / dry-run 不寫 DB。
+
+### ✨ P2:STK-04 multi-state composite column rule
+
+Phase B `_PHASE_B_BLOCK_STACKED_LONG_PCT` 加 generic rule:query 列舉 ≥3 個衍生狀態(核准/退件/進行中)時,**先 derive 一個 categorical state column 再 groupby**,不要硬塞 raw status 欄位。
+
+附 ❌ 反例(漏 review_result 只剩 2 state)+ ✅ 用 `np.select()` derive 3 state 的標準骨架。
+
+### ✨ P3:test_runner「趨勢」denial marker 收緊
+
+`is_misused()` 加 `_CONTEXT_REQUIREMENTS` 機制:某些 term 在中文裡是「一般用法 + 特定用法」雙義,只有出現特定 context 字眼才算 misuse。
+
+```python
+_CONTEXT_REQUIREMENTS = {
+    "趨勢": ("過去", "未來", "月", "週", "季", "年", "日", "時間",
+              "trend", "time", "monthly", "yearly", "weekly"),
+}
+```
+
+- 「申請趨勢一致」「需求趨勢」「整體申請趨勢」 → OK(一般中文)
+- 「過去三個月趨勢」「每月申請趨勢」「本季審核趨勢」 → 違規(有時間 context)
+- 拒絕語境內 → OK(維持原邏輯)
+
+9 個 unit test 全綠(3 OK / 3 違規 / 2 拒絕 / 其他 term 維持原行為)。
+
+### ✨ P4:`scripts/run_learning_jobs.py` orchestrator(spec §16.5)
+
+Nightly cron 一鍵入口,跑 7 個 self-learning job 序列:
+
+```
+observation_extraction → verification → consolidation →
+contradiction_scan → confidence_decay → resolution_detection →
+candidate_generation → dashboard_snapshot
+```
+
+**Flag**:
+- `--dry-run` 所有 job dry-run
+- `--skip <job_name>` 跳過某 job(可多次)
+- `--only <job1,job2>` 只跑某幾個
+- `--window-days N` / `--extraction-limit N` / `--verifier-limit N` 等
+
+**特性**:
+- 一個 job 失敗不影響後續(orchestrator catch + 印 traceback + 繼續)
+- 結束印 dashboard snapshot
+- exit code:任何 job error → 1(給 cron 判斷)
+- LLM service 失敗 → 自動 skip extraction/verification
+
+**推薦 cron**:`0 2 * * * python scripts/run_learning_jobs.py`
+
+### ✨ P5:`AI_CONTEXT.md` / `README.md` 更新
+
+`AI_CONTEXT.md` 加 3 個新 section:
+- §17 v0.4.x–v0.7.x Phase 修補 + Task Trace + Modular Prompts 總覽
+- §18 v0.8.x–v0.9.x Self-Learning Layer(loop 圖、11 個新模組、5 個 collections、orchestrator、baseline 50→92% 迭代)
+- §19 更新版的版本演進表(v0.4–v0.9.2 全列)
+
+`README.md`:Admin pages 從 4 → 7(加 `05_task_traces` / `06_learning_review`)。
+
+### ✅ 驗證
+
+- 4 檔 AST OK
+- `scripts/check_prompt_invariants.py` 17 prompts × 52 sentinels 全綠
+- 15 個 unit test 全綠(decay 5 + 趨勢 9 + orchestrator JOB_ORDER vs JOB_RUNNERS 對齊)
+
+### 🎯 Self-Learning MVP 至此**完整**
+
+Spec §16(decay)補做 → spec §16.5(scheduler)做完 → 所有 backend 模組到位。剩下:
+- Production end-to-end 真實跑(等 user 累積 trace)
+- Beyond MVP(L3 Skills / cross-domain / autonomous curation,spec §31)
+
+---
+
 ## [0.9.1] · 2026-05-16 — Horizontal stacked bar + Phase B 0-100 normalize
 
 **Patch · user 截圖回報 2 個 bug:「橫向」被忽略 + percentage 顯示成 0.26%(實際是 26%)。**

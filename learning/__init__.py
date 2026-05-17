@@ -15,4 +15,4 @@ Modules:
 See GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md for details.
 """
 
-__version__ = "0.9.0-alpha"
+__version__ = "0.9.2-alpha"

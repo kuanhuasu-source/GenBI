@@ -27,7 +27,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,10 @@ _CLUSTER_SIMILARITY_THRESHOLD = 0.45    # Jaccard:rec 相似才算同 cluster
 _CONTRADICTION_SIMILARITY_THRESHOLD = 0.5   # 大致同 topic
 _CONTRADICTION_CONF_PENALTY = 0.05      # spec §15.2
 _CONTRADICTION_DEPRECATE_AT = 0.60      # spec §15.3
+# v0.9.2 — Confidence decay(spec §16)
+_DECAY_DORMANCY_DAYS = 90               # 多久沒新 evidence 算 dormant
+_DECAY_AMOUNT = 0.02                    # 每次 decay 扣多少
+_DECAY_DEPRECATE_AT = 0.50              # < 0.50 → deprecated
 
 # Negation 啟發式:出現在一邊 cause/rec 而不在另一邊 → 視為「立場相反」
 # 英文走 token-level(避免 "donut" 誤觸 "do not");中文走 substring(_tokenize 不切中文)
@@ -532,6 +536,135 @@ def detect_contradictions(
 
 
 # ============================================================
+# Public:apply_confidence_decay(spec §16 — v0.9.2 補做)
+# ============================================================
+def apply_confidence_decay(
+    db,
+    *,
+    dormancy_days: int = _DECAY_DORMANCY_DAYS,
+    decay_amount: float = _DECAY_AMOUNT,
+    deprecate_threshold: float = _DECAY_DEPRECATE_AT,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    對 active instinct 套 confidence decay(spec §16)。
+
+    規則:
+      - 若 instinct.updated_at 距今 ≥ dormancy_days(無新 supporting evidence)
+        → confidence -= decay_amount
+      - 若新 confidence < deprecate_threshold → status='deprecated'
+      - 每次成功 decay 把 updated_at 撥到 now(避免下次 nightly 又重 decay)
+        + 寫 last_decay_at 給 dashboard 看歷史
+
+    Idempotent within day:同個 instinct 一天只會 decay 一次,因為
+    updated_at 已是 now,下次跑(明天)才會再達到 dormancy 條件
+    (除非 dormancy_days 設成 0 — 那是測試用)。
+
+    Returns:
+        stats dict 含 scanned / dormant / decayed / deprecated / errors
+    """
+    if db is None:
+        raise ValueError("db is required")
+
+    stats = {
+        "run_id": str(uuid.uuid4()),
+        "scanned_active": 0,
+        "dormant_found": 0,
+        "decayed": 0,
+        "newly_deprecated": 0,
+        "errors": 0,
+    }
+    job_started = datetime.now(timezone.utc)
+    now = job_started
+    threshold_dt = now - timedelta(days=dormancy_days)
+
+    coll_inst = db["learning_instincts"]
+    coll_jobs = db["learning_jobs"]
+
+    try:
+        active = list(
+            coll_inst.find({"status": "active"}).limit(2000)
+        )
+    except Exception as e:
+        logger.error(f"failed to fetch active instincts: {e}")
+        stats["errors"] += 1
+        return stats
+    stats["scanned_active"] = len(active)
+
+    if verbose:
+        print(f"📥 {len(active)} active instincts (dormancy ≥ {dormancy_days}d → decay)")
+
+    for inst in active:
+        last_updated = inst.get("updated_at")
+        if not isinstance(last_updated, datetime):
+            continue
+        if last_updated > threshold_dt:
+            continue  # 還夠新,不 decay
+
+        stats["dormant_found"] += 1
+        inst_id = inst.get("instinct_id")
+        old_conf = inst.get("confidence", 0.0) or 0.0
+        new_conf = max(0.0, round(old_conf - decay_amount, 4))
+        new_status = ("deprecated"
+                       if new_conf < deprecate_threshold else "active")
+
+        if verbose:
+            days_idle = (now - last_updated).days
+            print(f"  ⏳ {inst_id} dormant {days_idle}d  conf {old_conf:.2f} → {new_conf:.2f}"
+                   + (" [DEPRECATED]" if new_status == "deprecated" else ""))
+
+        if dry_run:
+            stats["decayed"] += 1
+            if new_status == "deprecated":
+                stats["newly_deprecated"] += 1
+            continue
+
+        try:
+            coll_inst.update_one(
+                {"instinct_id": inst_id},
+                {"$set": {
+                    "confidence": new_conf,
+                    "status": new_status,
+                    "updated_at": now,
+                    "last_decay_at": now,
+                }},
+            )
+            stats["decayed"] += 1
+            if new_status == "deprecated":
+                stats["newly_deprecated"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+            logger.warning(f"decay failed for {inst_id}: {e}")
+
+    # learning_jobs record
+    if not dry_run:
+        try:
+            coll_jobs.insert_one({
+                "job_id": f"JOB-DECAY-{int(time.time())}",
+                "job_type": "confidence_decay",
+                "status": "completed",
+                "started_at": job_started,
+                "completed_at": datetime.now(timezone.utc),
+                "input_count": stats["scanned_active"],
+                "output_count": stats["decayed"],
+                "dormant_found": stats["dormant_found"],
+                "newly_deprecated": stats["newly_deprecated"],
+                "errors": stats["errors"],
+                "run_id": stats["run_id"],
+                "params": {
+                    "dormancy_days": dormancy_days,
+                    "decay_amount": decay_amount,
+                    "deprecate_threshold": deprecate_threshold,
+                },
+            })
+        except Exception as e:
+            logger.warning(f"failed to write learning_jobs record: {e}")
+
+    return stats
+
+
+# ============================================================
 # CLI
 # ============================================================
 def main() -> int:
@@ -547,9 +680,13 @@ def main() -> int:
     parser.add_argument("--domain", default="tflex",
                         help="Domain tag for new instincts")
     parser.add_argument("--skip-consolidation", action="store_true",
-                        help="Only run contradiction detection")
+                        help="Skip consolidation")
     parser.add_argument("--skip-contradiction", action="store_true",
-                        help="Only run consolidation")
+                        help="Skip contradiction detection")
+    parser.add_argument("--skip-decay", action="store_true",
+                        help="Skip confidence decay (v0.9.2)")
+    parser.add_argument("--dormancy-days", type=int, default=_DECAY_DORMANCY_DAYS,
+                        help=f"Decay 觸發天數 (default {_DECAY_DORMANCY_DAYS})")
     parser.add_argument("--dry-run", action="store_true",
                         help="Don't write to DB")
     args = parser.parse_args()
@@ -609,6 +746,21 @@ def main() -> int:
         print(f"  Instincts deprecated:  {d_stats['instincts_deprecated']}")
         print(f"  Notifications written: {d_stats['notifications_written']}")
         print(f"  Errors:                {d_stats['errors']}")
+        print("─" * 70)
+
+    if not args.skip_decay:
+        print(f"\n🚀 Running confidence decay (dormancy={args.dormancy_days}d){mode}")
+        decay_stats = apply_confidence_decay(
+            db, dormancy_days=args.dormancy_days,
+            dry_run=args.dry_run, verbose=True,
+        )
+        print()
+        print("─" * 70)
+        print(f"  Active scanned:    {decay_stats['scanned_active']}")
+        print(f"  Dormant found:     {decay_stats['dormant_found']}")
+        print(f"  Decayed:           {decay_stats['decayed']}")
+        print(f"  Newly deprecated:  {decay_stats['newly_deprecated']}")
+        print(f"  Errors:            {decay_stats['errors']}")
         print("─" * 70)
 
     if not args.dry_run:
