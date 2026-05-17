@@ -220,12 +220,29 @@ python admin/compare_baseline.py
 
 ## 📜 文件
 
-- `CHANGELOG.md` — SemVer 變更紀錄(v0.1.0 → v0.3.3)
+- `CHANGELOG.md` — SemVer 變更紀錄(v0.1.0 → v0.11.x)
 - `AI_CONTEXT.md` — LLM agent / 接手開發者用的單檔簡介(架構 + API + deployment)
-- `AI_CODE.md` — v0.2.x 完整源碼快照(深入 debug 用)
+- `AI_CODE.md` — 完整源碼快照(用 `python make_ai_code.py` 重新產生)
+- `SELF_LEARNING_OPS.md` — **v0.11.0+ 維運手冊**(self-learning pipeline 操作 / 監控 / 故障排除)
+- `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` — Self-learning MVP 實作規格
 - `STACKED_BAR_TEST.md` — Stacked bar 8 個 STK case 測試規格
 - `TEST_PLAN.md` — 18 case 主測試計畫(v0.2.x 版本)
-- `TEST_UX_SCENARIOS.md` — 57 case UX 整合測試(冷啟動到完整 journey)
+- `TEST_UX_SCENARIOS.md` — 57 case UX 整合測試
+
+## 🆕 v0.4-v0.11 重要里程碑
+
+- **v0.4.0** PPTX export(matplotlib renderer / table fallback / Insight bullet)
+- **v0.5.0/6.0** Phase B/C prompt 拆 router + intent block(prompt size -40%)
+- **v0.7.0** `task_trace` module + admin UI 第 5 頁(每 query 完整 LLM call 紀錄)
+- **v0.8-v0.9** Self-learning MVP 7 個 module:bootstrap / failure_filter / observation_extractor / verifier(4-comp confidence) / instinct_consolidator(Jaccard cluster + contradiction) / resolution_detector / candidate_generator / regression_gate / dashboard_metrics + admin UI 第 6 頁 + nightly cron orchestrator
+- **v0.10.0** Composite chart layout(sidebar 精簡/標準/複合)+ Q side panel
+- **v0.10.4-0.10.5** Phase B/C **semantic validator**(抓「exec OK 但內容錯」silent failure)
+- **v0.10.6** **Model profile system**(`default` vs `reasoning_distilled`,per-phase sampling + `<think>` strip)
+- **v0.10.7** `bench_model.py` benchmark tool + Modelfile-coder30b(8K ctx),確定主力模型 **qwen3-coder:30b**(對照 80B-A3B / 35B-A3B 都明顯較慢)
+- **v0.11.0** test_runner.py 接 TaskTrace,baseline run 也餵料給 self-learning loop
+- **v0.11.0.1** 修 task_trace datetime 序列化 bug(自 v0.7.0 起的隱形問題,failure_filter 終於能 match)
+
+**v0.10.7 baseline**: 24/26 (92%) pass · 1346s wall clock · 134 LLM call
 
 ## 📝 License
 

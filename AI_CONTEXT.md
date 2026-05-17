@@ -739,6 +739,119 @@ streamlit run pages/06_learning_review.py                 # 人類 review UI
 | `v0.9.0` | **Self-Learning Week 6** — `pages/06_learning_review.py` + `learning/dashboard_metrics.py`(4 section admin UI: metric / candidate review / contradiction review / observation browser)|
 | `v0.9.1` | Horizontal stacked bar(orientation 與 chart type 正交)+ Phase B 0-100 normalize 強化 |
 | `v0.9.2` | confidence decay(spec §16 補)+ STK-04 multi-state composite + 趨勢 denial false positive + `scripts/run_learning_jobs.py` cron orchestrator + 本文件更新 |
+| `v0.9.3` | hotfix · page navigation 後 phase outputs 消失 |
+| `v0.10.0` | Sidebar 圖表呈現模式 toggle(精簡/標準/複合)+ `render_composite_chart()` + Q side panel |
+| `v0.10.1` | hotfix · test_runner chart-orientation aware axis checks |
+| `v0.10.2-0.10.3` | retry 機制強化:retry temp 0→0.15 打破 LLM stuck pattern + `部門` synonym + horizontal `max` |
+| `v0.10.4` | **Phase C semantic validator**(`phase_c_validator.py`, 5 個 check:axis_align / 100pct_max / cat_dedupe / long_format / non_degenerate)+ wire 進 test_runner / app.py Phase C retry loop |
+| `v0.10.5` | Phase B-aware retry hint(KeyError 區分 phase)+ **Phase B semantic validator**(`phase_b_validator.py`, 5 個 check:not_empty / numeric_not_zero / no_total_row / long_format_dedupe / comparison_multi_rows)|
+| `v0.10.6` | **Model profile system** — `config.MODEL_PROFILES`(default / reasoning_distilled)、`_resolve_phase_sampling` per-phase 解析、`presence_penalty` 支援、`<think>...</think>` strip |
+| `v0.10.6.1` | hotfix · `model_profile` 沒實際 wire 進 app.py / test_runner.py |
+| `v0.10.7` | **`bench_model.py`** 輕量 benchmark + `Modelfile-coder30b`(8K ctx)。**模型選型結論:qwen3-coder:30b**(對照 80B-A3B 2.5x / 35B-A3B 8x 較慢)|
+| `v0.11.0` | test_runner.py 接 TaskTrace,baseline run 也餵料 self-learning loop |
+| `v0.11.0.1` | hotfix · `task_trace._safe_doc` 保留 datetime(自 v0.7.0 起的隱形 bug,failure_filter 終於能 match)|
+| `v0.11.1` | `SELF_LEARNING_OPS.md` 維運手冊 + 全面更新 README / AI_CONTEXT |
+
+**v0.10.7 baseline**:24/26 (92%) pass,1346s wall clock,134 LLM call,564K tokens(prompt:completion = 92:8)。
+
+---
+
+## 20. v0.10 · Phase B/C semantic validator + Model profile
+
+### 20.1 Phase B/C semantic validator(v0.10.4-v0.10.5)
+
+既有 retry 機制只 catch **exception**。實務有大量「exec OK 但內容語意錯」silent failure(axis 對不齊、100% stacked 漏 yAxis.max=100、long format 沒 filter、Q 是空 / 全 0 / 重複 key)被當成功往下送,結果在 Phase C / 渲染階段才爆,提示又指向 wrong layer。
+
+對策:**post-exec semantic validator**。Phase B 跟 Phase C 各 5 個 check,回 `list[str]` issue;若 non-empty → 餵回 LLM 當 `previous_error` retry。
+
+| 檔案 | Checks | 觸發 case |
+|---|---|---|
+| `phase_b_validator.py` | Q_EMPTY / Q_ALL_NAN / Q_ALL_ZERO / Q_TOTAL_LEAK / Q_LONG_FORMAT_DUPE / Q_SINGLE_ROW_FOR_COMPARISON | STK-05 等 |
+| `phase_c_validator.py` | AXIS_ALIGN / 100PCT_MAX / CAT_DEDUPE / LONG_FORMAT_ONE_SERIES / SERIES_NON_DEGENERATE | STK-01/02/03/05 等 |
+
+### 20.2 Phase-aware retry hint(v0.10.5)
+
+`_format_retry_hint` 加 `phase` 參數,KeyError 在 `phase=="preprocess"` 給 Phase B 特定情境(agg 漏列、bool flag agg 沒帶),其他 phase 維持通用 hint。4 個 caller(`generate_pipeline / preprocess / plot / echarts`)全部加 phase 參數。
+
+### 20.3 Model profile(v0.10.6)
+
+不同 model 系列 sampling 需求差很多。`config.MODEL_PROFILES` 把 per-phase sampling 抽出來:
+
+```python
+MODEL_PROFILES = {
+    "default": {  # 既有 hardcoded 行為(qwen3-coder 系列)
+        "pipeline":   {"temperature": 0.0, "retry_temperature": 0.15},
+        "insight":    {"temperature": 0.3},
+        ...
+    },
+    "reasoning_distilled": {  # Qwen3.6 reasoning 系列
+        "plan":       {"temperature": 1.0},         # thinking
+        "pipeline":   {"temperature": 0.6, "retry_temperature": 0.75},  # coding
+        "insight":    {"temperature": 0.7, "presence_penalty": 1.5},   # non-thinking
+        ...
+    },
+}
+```
+
+切 profile:`HRDA_MODEL_PROFILE=reasoning_distilled`(env)。
+
+新功能:
+- `_resolve_phase_sampling(phase, is_retry, fallback_temp)` 每 phase 解析 sampling
+- `_call_llm` 加 `presence_penalty` 參數(只有 profile 明確設才傳給 OpenAI client)
+- `<think>...</think>` strip(在 `_call_llm` 出口處,trace 保留含 think 的 raw output 方便 debug)
+- ⚠️ 必須走 `config.llm_service_kwargs()` 或 `LLMService(model_profile=config.MODEL_PROFILE, ...)`,**v0.10.6.1 修了 caller 沒帶 profile 的 bug**
+
+### 20.4 模型選型結論(v0.10.7)
+
+跑 `bench_model.py` × 3 model × 3 query × 4 phase 對照:
+
+| Model | Per-query | Calls | Tok/sec | 結論 |
+|---|---|---|---|---|
+| **qwen3-coder:30b-8k**(default profile) | **43.5s** 🏆 | 13(clean) | 375.8 | 主力 |
+| qwen3-coder-next-8k 80B-A3B(default) | 107.6s(2.5x 慢) | 13 | 154 | 64GB Mac swap 壓力 |
+| qwen36-a3b-8k 35B-A3B(reasoning_distilled) | 342.7s(8x 慢) | 19(+6 retry) | 90 | thinking trace 漏進 JSON parser → 3 次 retry |
+
+GenBI 既有 prompt 是針對 code-tuned non-thinking 模型寫的,換 reasoning 系列要重寫 system prompt 才有意義。
+
+---
+
+## 21. v0.11 · Self-learning loop end-to-end validation
+
+### 21.1 起點 — v0.10.7 baseline 之後的 prerequisite gap
+
+`test_runner.py` 沒接 `TaskTrace`(只有 `app.py` 有),v0.10.7 baseline 0 個 trace 寫進 DB → learning pipeline 沒料。
+
+### 21.2 v0.11.0 P1 — test_runner 接 TaskTrace
+
+每 case 包一個 TaskTrace,finalize 帶 `_STATUS_TO_TRACE` 映射:
+- `pass` → completed
+- `refusal_detected` → refused
+- `phaseC_fallback_used / phaseB_exec_error / fatal_error` → failed
+
+### 21.3 v0.11.0.1 — 修 task_trace datetime 序列化(隱形 bug 6 個月)
+
+**自 v0.7.0 起就埋的 bug**:`task_trace.py:_safe_doc` 用 `json.dumps(default=str)` round-trip,**datetime 被無聲轉成字串**。MongoDB 存進去不是 BSON Date,所有 `{'started_at': {'$gte': dt}}` 查詢全 miss。learning pipeline `failure_filter` 永遠 0 candidate。
+
+修正:`_safe_doc` 改用 `_sanitize()` recursive traversal,datetime 第一層 short-circuit return,完全不經字串化路徑。
+
+Backfill script:`scripts/backfill_task_traces_datetime.py`(dry-run by default,`--apply` 才寫)。
+
+### 21.4 Self-learning Pipeline 操作流程
+
+完整流程見 **`SELF_LEARNING_OPS.md`**。簡述:
+
+1. `task_traces` 累積(app.py 跟 test_runner.py 自動寫)
+2. `python scripts/run_learning_jobs.py [--dry-run]` 跑 7 個 job
+3. Admin UI(`pages/06_learning_review.py`)review candidate
+4. Approve → 注入 prompt_templates 下次 query 生效
+
+### 21.5 維運要點(細節看 SELF_LEARNING_OPS.md)
+
+- **nightly cron**:`0 2 * * *`
+- **monitor**:Admin UI 4 個區塊(operational / quality / impact / detail)
+- **故障排除**:看 SELF_LEARNING_OPS §6(常見 5 個 issue)
+- **回滾**:approved candidate 出包用 `deactivate_candidate(db, candidate_id, reason)`
+- **災備**:每週 mongodump 6 個 learning_* + task_traces collection
 
 ---
 

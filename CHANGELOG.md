@@ -5,6 +5,58 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.11.1] · 2026-05-17 — `SELF_LEARNING_OPS.md` 維運手冊 + 全面更新 README / AI_CONTEXT / AI_CODE
+
+**Patch · 文件刷新版本。**
+
+### ✨ `SELF_LEARNING_OPS.md`(新檔)
+
+完整維運手冊,給 SRE / 維運人員。10 個 section:
+1-2 · 概觀 + 高層架構圖(7 module pipeline + 6 collection)
+3 · 6 個 MongoDB collection 角色
+4 · nightly cron / 手動觸發 / dry-run / individual job test / bootstrap
+5 · Admin UI 4 個 dashboard 區塊看什麼
+6 · 5 個常見故障排除(含剛剛修的 datetime bug)
+7 · LLM 成本 / Stochasticity / 回滾 / Backup / 5 個「不要做的事」
+8 · 緊急停機程序
+9 · 版本歷史 self-learning 相關
+10 · 升級路徑與聯絡
+
+### ✨ `README.md` 更新
+
+- CHANGELOG 範圍:v0.1.0 → **v0.11.x**
+- 加 `SELF_LEARNING_OPS.md` 跟 spec 文件到「📜 文件」清單
+- **新增「🆕 v0.4-v0.11 重要里程碑」** section,列 PPTX export / prompt routing / task_trace / self-learning MVP / composite layout / semantic validators / model profile / model selection / TaskTrace wiring 等
+- 加上 v0.10.7 baseline 數字(24/26 92% pass · 1346s · 134 LLM call)
+
+### ✨ `AI_CONTEXT.md` 更新
+
+- §12「版本演進」表補 v0.9.3 → v0.11.1 共 14 個版本
+- **新增 §20 「v0.10 · Phase B/C semantic validator + Model profile」** 4 個子章節:
+  - 20.1 semantic validator 動機 + 兩個 validator 各 5 個 check
+  - 20.2 phase-aware retry hint
+  - 20.3 Model profile 設計 + 切換方式
+  - 20.4 模型選型結論(bench_model.py 結果對比表)
+- **新增 §21 「v0.11 · Self-learning loop end-to-end validation」** 5 個子章節:
+  - 21.1 起點 — TaskTrace gap 發現
+  - 21.2 v0.11.0 P1 — test_runner 接 TaskTrace
+  - 21.3 v0.11.0.1 — datetime 序列化隱形 bug 修正
+  - 21.4 完整 pipeline 操作流程(指向 SELF_LEARNING_OPS.md)
+  - 21.5 維運要點精簡版
+
+### ✨ `AI_CODE.md` 重新產生
+
+`python make_ai_code.py` 重跑:632KB · 27 檔 · git tag v0.11.0.1
+
+### ✅ 驗證
+
+- 4 個 doc 都有 v0.10/v0.11 相關內容
+- README v0.4-v0.11 milestone section 連結都對
+- AI_CONTEXT §20/§21 跟對應 CHANGELOG entry 互相對應
+- AI_CODE.md size 接近 historical baseline(v0.3.x 約 500KB,現在 632KB 包含新模組合理)
+
+---
+
 ## [0.11.0.1] · 2026-05-17 — Hotfix:`task_trace._safe_doc` json round-trip 把 datetime 轉成 str
 
 **Patch · v0.7.0 起就埋的 bug,直到 v0.11.0 P1 接 TaskTrace 進 test_runner 才被發現:learning pipeline 0 candidate trace。**

@@ -52,3 +52,10 @@ Modelfile-coder-next
 
 # Side project — AWQ 量化工具(獨立 sub-project)
 awq_quantize/
+
+# v0.11.0.1+ scratch / diagnostic 用過即丟
+scratch_*.py
+0   # 偶發誤打 `> 0` redirect 殘留
+
+# Learning pipeline dry-run logs
+learning_*_run*.log
