@@ -998,36 +998,55 @@ def run_case(case: dict, llm: LLMService, db) -> dict:
                 result["checks"].append(check("含 visualMap (heatmap 用)", has_vm))
 
             # ───── STK 專屬新檢查 ─────
-            xaxis_data = option.get("xAxis", {}).get("data") if isinstance(option.get("xAxis"), dict) else None
+            # v0.10.1:orientation-aware — horizontal bar 時 (yAxis=category, xAxis=value)
+            # category axis 在 yAxis;若仍 hard-code 檢查 xAxis.data 會 false fail。
+            _xaxis_dict = option.get("xAxis") if isinstance(option.get("xAxis"), dict) else {}
+            _yaxis_dict = option.get("yAxis") if isinstance(option.get("yAxis"), dict) else {}
+            _is_horizontal = (
+                _xaxis_dict.get("type") == "value"
+                and _yaxis_dict.get("type") == "category"
+            )
+            # category axis 上的 data list(垂直 = xAxis;橫向 = yAxis)
+            _cat_axis_data = (_yaxis_dict if _is_horizontal else _xaxis_dict).get("data")
+            _cat_axis_label = "yAxis" if _is_horizontal else "xAxis"
+            # value axis 上的 max(垂直 = yAxis;橫向 = xAxis)
+            _val_axis_dict = _xaxis_dict if _is_horizontal else _yaxis_dict
+            _val_axis_label = "xAxis" if _is_horizontal else "yAxis"
 
             if case.get("echarts_xaxis_unique"):
-                if isinstance(xaxis_data, list):
-                    has_dup = len(xaxis_data) != len(set(map(str, xaxis_data)))
+                if isinstance(_cat_axis_data, list):
+                    has_dup = len(_cat_axis_data) != len(set(map(str, _cat_axis_data)))
                     result["checks"].append(check(
-                        "xAxis.data 無重複",
+                        f"{_cat_axis_label}.data 無重複"
+                        + (f" (橫向,category 在 {_cat_axis_label})" if _is_horizontal else ""),
                         not has_dup,
-                        f"actual: {xaxis_data}" if has_dup else f"len={len(xaxis_data)}"
+                        f"actual: {_cat_axis_data}" if has_dup else f"len={len(_cat_axis_data)}"
                     ))
                 else:
-                    result["checks"].append(check("xAxis.data 是 list", False, f"type={type(xaxis_data).__name__}"))
+                    result["checks"].append(check(
+                        f"{_cat_axis_label}.data 是 list",
+                        False,
+                        f"type={type(_cat_axis_data).__name__}"
+                    ))
 
             if case.get("echarts_data_length_aligned"):
-                if isinstance(xaxis_data, list):
-                    x_len = len(xaxis_data)
+                if isinstance(_cat_axis_data, list):
+                    x_len = len(_cat_axis_data)
                     series_lens = [len(s.get("data", [])) for s in option.get("series", [])]
                     aligned = all(L == x_len for L in series_lens)
                     result["checks"].append(check(
-                        f"所有 series.data 長度 == xAxis.data 長度 ({x_len})",
+                        f"所有 series.data 長度 == {_cat_axis_label}.data 長度 ({x_len})",
                         aligned,
                         f"series lens: {series_lens}"
                     ))
 
             if case.get("echarts_yaxis_max"):
+                # v0.10.1:橫向時 value axis 是 xAxis,改 check xAxis.max
                 expected_max = case["echarts_yaxis_max"]
-                yaxis = option.get("yAxis", {})
-                actual_max = yaxis.get("max") if isinstance(yaxis, dict) else None
+                actual_max = _val_axis_dict.get("max") if isinstance(_val_axis_dict, dict) else None
                 result["checks"].append(check(
-                    f"yAxis.max == {expected_max} (100% stacked 應鎖頂)",
+                    f"{_val_axis_label}.max == {expected_max} (100% stacked 應鎖頂"
+                    + (",橫向" if _is_horizontal else "") + ")",
                     actual_max == expected_max,
                     f"actual: {actual_max}"
                 ))

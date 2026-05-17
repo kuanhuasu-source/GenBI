@@ -5,6 +5,71 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.1] · 2026-05-17 — Hotfix:test_runner 補做 chart-orientation aware
+
+**Hotfix · v0.9.1 加 horizontal stacked block 後留下的 test framework gap**。
+
+### 🔴 Bug
+
+v0.9.3 baseline 17/26 (65%) — dig 進去發現 **3 個 case (STK-01 / STK-04 / STK-06) 是 LLM 正確選 horizontal stacked,但 test framework hard-code 假設 vertical 而誤判**:
+
+```python
+# STK-01 actual chart code:
+"xAxis": {"type": "value", "axisLabel": {"formatter": "{value}%"}},
+"yAxis": {"type": "category", "data": Q["company_code"].unique().tolist()},
+```
+
+- test check `xAxis.data 是 list` → 失敗(value axis 沒 data)
+- test check `yAxis.max == 100` → 失敗(value 在 xAxis,max:100 在 xAxis)
+
+### ✨ Fix · `_is_horizontal` orientation detector + axis-aware checks
+
+`test_runner.py · run_case()`:
+
+```python
+_xaxis_dict = option.get("xAxis", {}) or {}
+_yaxis_dict = option.get("yAxis", {}) or {}
+_is_horizontal = (
+    _xaxis_dict.get("type") == "value"
+    and _yaxis_dict.get("type") == "category"
+)
+_cat_axis_data = (_yaxis_dict if _is_horizontal else _xaxis_dict).get("data")
+_val_axis_dict = _xaxis_dict if _is_horizontal else _yaxis_dict
+```
+
+3 個 check 全部 orientation-aware:
+- `xAxis.data 無重複` → 改檢查 `_cat_axis_data`(垂直 = xAxis,橫向 = yAxis)
+- `所有 series.data 長度 == X.data 長度` → 同上,動態 label
+- `yAxis.max == 100` → 改檢查 `_val_axis_dict.max`(垂直 = yAxis,橫向 = xAxis)
+
+訊息也動態:橫向時 label 顯示「(橫向,category 在 yAxis)」讓 debug 直覺。
+
+### ✅ 驗證
+
+- `test_runner.py` AST OK(1550 行,net +25)
+- 4 個 hook 點全在(_is_horizontal / _cat_axis_data / _val_axis_dict / horizontal label)
+
+### 📋 預計影響
+
+v0.9.3 baseline → v0.10.1:
+- **STK-01** fail(2) → ✅(2 個 axis check 全是 false positive)
+- **STK-04** fail(2) → ✅(同上)
+- **STK-06** fail(1) → ✅(只 1 個 axis check)
+
+預計 17/26 → **20/26 (77%)**。
+
+剩下沒救的 6 個是真 LLM bug:
+- 01(Phase B KeyError)
+- 03(synonym list 沒命中 — case 寫法問題?)
+- 06(Phase C fallback)
+- STK-02(LLM 維度倒置,series=15 應該=3)
+- STK-03(Phase C fallback)
+- STK-05(Phase C fallback)
+
+這些是 LLM stochasticity / 真錯,不是 test framework 問題。
+
+---
+
 ## [0.10.0] · 2026-05-17 — Composite chart layout (路徑 C:chart + Q side panel)
 
 **Minor · BI-grade composite dashboard 第一階段。** chart 旁邊新增 Q DataFrame side panel,使用者看 chart 同時看到背後的 row-level 資料。
