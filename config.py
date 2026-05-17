@@ -63,6 +63,55 @@ _PROVIDER_DEFAULTS = {
 
 
 # ============================================================
+# Model Profiles — per-phase sampling 參數(v0.10.6+)
+# ============================================================
+# 不同 model 系列對 sampling 的最佳值差很多:
+#   - 既有 code-tuned non-thinking 模型(qwen3-coder, Qwen2.5-Coder)
+#       → code-gen 用 temp=0,plan/insight 微抬
+#   - reasoning distilled 模型(Qwen3.6-27B-Claude-Opus-Reasoning-Distilled 系列)
+#       → coding=0.6 / thinking=1.0 / non-thinking=0.7 + presence_penalty=1.5
+#       (HF 模型卡:https://huggingface.co/rico03/Qwen3.6-27B-Claude-Opus-Reasoning-Distilled-GGUF)
+#
+# 每個 profile 是 phase → sampling dict 的 mapping。
+# `retry_temperature` 是 optional,沒設就回退 temperature + 0.15(維持 v0.10.3 既有行為)。
+#
+# 切 profile 用 env:HRDA_MODEL_PROFILE=default | reasoning_distilled
+# 預設 default(沿用舊行為,不會打破現有部署)。
+MODEL_PROFILES: dict[str, dict[str, dict]] = {
+    # 既有行為快照 — code-tuned non-thinking(qwen3-coder:30b 等)
+    "default": {
+        "plan":         {"temperature": 0.2},
+        "pipeline":     {"temperature": 0.0, "retry_temperature": 0.15},
+        "preprocess":   {"temperature": 0.0, "retry_temperature": 0.15},
+        "plotly":       {"temperature": 0.0, "retry_temperature": 0.15},
+        "echarts":      {"temperature": 0.0, "retry_temperature": 0.15},
+        "insight":      {"temperature": 0.3},
+        "meta_response": {"temperature": 0.3},
+    },
+    # Reasoning distilled 模型(Qwen3.6 系列)— 會輸出 <think>...</think>
+    # Coding 用 0.6,thinking 用 1.0,non-thinking 用 0.7 + presence_penalty=1.5
+    "reasoning_distilled": {
+        "plan":         {"temperature": 1.0},  # general thinking
+        "pipeline":     {"temperature": 0.6, "retry_temperature": 0.75},  # coding
+        "preprocess":   {"temperature": 0.6, "retry_temperature": 0.75},  # coding
+        "plotly":       {"temperature": 0.6, "retry_temperature": 0.75},  # coding
+        "echarts":      {"temperature": 0.6, "retry_temperature": 0.75},  # coding
+        "insight":      {"temperature": 0.7, "presence_penalty": 1.5},   # non-thinking
+        "meta_response": {"temperature": 0.7, "presence_penalty": 1.5},  # non-thinking
+    },
+}
+
+# Profile 選擇 — env HRDA_MODEL_PROFILE 不指定就 default
+MODEL_PROFILE_NAME: str = os.getenv("HRDA_MODEL_PROFILE", "default").lower()
+if MODEL_PROFILE_NAME not in MODEL_PROFILES:
+    # fallback to default,印 warning 但不 raise(讓 import 不會炸)
+    print(f"⚠️ HRDA_MODEL_PROFILE='{MODEL_PROFILE_NAME}' 不存在於 MODEL_PROFILES,"
+          f"回退 'default'(可選:{list(MODEL_PROFILES.keys())})")
+    MODEL_PROFILE_NAME = "default"
+MODEL_PROFILE: dict = MODEL_PROFILES[MODEL_PROFILE_NAME]
+
+
+# ============================================================
 # 1. LLM 設定
 # ============================================================
 LLM_PROVIDER: str = os.getenv("HRDA_MODEL_PROVIDER", "ollama").lower()
@@ -115,6 +164,9 @@ def llm_service_kwargs() -> dict:
         from llm_service import LLMService
         from config import llm_service_kwargs
         llm = LLMService(**llm_service_kwargs(), task_metadata=METADATA)
+
+    v0.10.6+ 自動把 MODEL_PROFILE 帶進去,LLMService 會依 phase 查 profile 解析
+    sampling 參數(temperature / presence_penalty)。
     """
     return {
         "api_url": LLM_API_URL,
@@ -122,6 +174,7 @@ def llm_service_kwargs() -> dict:
         "model_name": LLM_MODEL,
         "timeout_s": LLM_TIMEOUT_S,
         "default_temperature": LLM_TEMPERATURE,
+        "model_profile": MODEL_PROFILE,
     }
 
 
@@ -194,6 +247,7 @@ def print_summary() -> None:
     print(f"  LLM timeout      : {LLM_TIMEOUT_S}s")
     print(f"  LLM api_key      : {mask_secret(LLM_API_KEY)}")
     print(f"  LLM temperature  : {LLM_TEMPERATURE}")
+    print(f"  LLM profile      : {MODEL_PROFILE_NAME}")
     print(f"  MongoDB URI      : {MONGO_URI}")
     print(f"  MongoDB DB       : {MONGO_DB}")
     print(f"  Mongo app coll   : {MONGO_COLL_APPLICATIONS}")

@@ -1417,7 +1417,8 @@ class LLMService:
                  default_temperature: float = 0.0,
                  task_metadata: dict | None = None,
                  prompt_repo=None,
-                 domain: str = "tflex"):
+                 domain: str = "tflex",
+                 model_profile: dict | None = None):
         """
         參數預設指向 Ollama (localhost:11434);
         若你在用 vLLM,把 api_url 改成 http://localhost:8000/v1/chat/completions、
@@ -1432,6 +1433,11 @@ class LLMService:
                      若 None,自動 build 一個(走 config.PROMPT_REPO_ENABLED + embedded fallback)。
                      傳入 False 強制不使用 repo,完全 inline f-string(用於 v0.2.x 行為對照)。
         domain: 目前處理的 domain 名稱(影響 prompt 讀取的 domain_scope)。
+        model_profile: v0.10.6+。phase → sampling 參數 dict 的 mapping
+                       (例 {"pipeline": {"temperature": 0.6, "retry_temperature": 0.75},
+                            "insight":  {"temperature": 0.7, "presence_penalty": 1.5}, ...})
+                       由 config.MODEL_PROFILE 提供。None 代表「沿用既有 hardcoded 行為」
+                       (向下相容,不會打破現有部署)。
         """
         self.client = OpenAI(
             base_url=api_url.replace("/chat/completions", ""),
@@ -1442,6 +1448,8 @@ class LLMService:
         self.default_temperature = default_temperature
         self.timeout_s = timeout_s
         self.domain = domain
+        # v0.10.6+ phase → sampling profile;None = legacy hardcoded fallback
+        self.model_profile = model_profile or {}
 
         # ── 載入並組裝 domain knowledge / few-shot ──
         if task_metadata is None:
@@ -1511,18 +1519,74 @@ class LLMService:
     # --------------------------------------------------------
     # 內部工具
     # --------------------------------------------------------
+    def _resolve_phase_sampling(self, phase: str, is_retry: bool = False,
+                                  fallback_temp: float | None = None) -> dict:
+        """v0.10.6+ — 依 phase 查 model_profile 解析 sampling 參數。
+
+        回傳 dict,包含 keys:
+            - temperature (float)
+            - presence_penalty (float, optional — 只有 profile 有設才出現)
+
+        參數:
+            phase: "plan" / "pipeline" / "preprocess" / "plotly" / "echarts" /
+                   "insight" / "meta_response"
+            is_retry: True 時優先取 profile 的 retry_temperature,
+                      沒設就退回 temperature + 0.15(維持 v0.10.3 既有 retry bump 行為)
+            fallback_temp: profile 沒蓋到時用此值(通常 caller 給 self.default_temperature
+                           或既有 hardcoded 值,例如 plan 給 0.2)
+
+        Notes:
+            - profile 為 None / 空 dict / phase 沒蓋到 → 完全 fallback 到舊行為
+              (caller 自己控制 temperature,不傳 presence_penalty)
+        """
+        cfg = (self.model_profile or {}).get(phase, {})
+        out: dict = {}
+        if cfg:
+            base_t = cfg.get("temperature", fallback_temp)
+            if is_retry:
+                out["temperature"] = cfg.get("retry_temperature",
+                                              (base_t + 0.15) if base_t is not None else None)
+            else:
+                out["temperature"] = base_t
+            if "presence_penalty" in cfg:
+                out["presence_penalty"] = cfg["presence_penalty"]
+        else:
+            # profile 沒蓋到此 phase → caller 自決
+            out["temperature"] = fallback_temp
+        # 過濾 None(避免傳給 OpenAI client 出錯)
+        return {k: v for k, v in out.items() if v is not None}
+
+    # --- v0.10.6+ <think>...</think> stripper ---
+    # reasoning distilled 模型(如 Qwen3.6-Claude-Opus-Reasoning-Distilled)會輸出
+    # <think>...</think> 區塊,下游 parser(JSON / code fence)會被搞亂,統一在
+    # _call_llm 出口處 strip 掉。對沒有 think 區塊的 response 完全無感(noop)。
+    _THINK_BLOCK_RE = re.compile(
+        r"<think>.*?</think>\s*", flags=re.DOTALL | re.IGNORECASE
+    )
+
+    @classmethod
+    def _strip_think_blocks(cls, raw: str) -> str:
+        if not raw or "<think" not in raw.lower():
+            return raw
+        return cls._THINK_BLOCK_RE.sub("", raw).lstrip()
+
     def _call_llm(self, messages, temperature=None, max_tokens=2048,
-                   phase: str = "unknown"):
+                   phase: str = "unknown", presence_penalty: float | None = None):
         if temperature is None:
             temperature = self.default_temperature
+        # 組 sampling kwargs;只有 caller / profile 明確指定才傳 presence_penalty
+        # (避免對舊 endpoint / 不支援的 backend 出錯)
+        _create_kwargs = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if presence_penalty is not None:
+            _create_kwargs["presence_penalty"] = presence_penalty
         t0 = time.time()
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            response = self.client.chat.completions.create(**_create_kwargs)
         except Exception as e:
             elapsed = round(time.time() - t0, 2)
             self.call_log.append({
@@ -1560,7 +1624,11 @@ class LLMService:
         })
         response_content = response.choices[0].message.content
 
-        # v0.7.0:trace recorder hook — 完整記錄 messages + response
+        # v0.10.6+:reasoning distilled model 會輸出 <think>...</think> 區塊
+        # 在 trace 之後 strip,讓 trace 保留完整 raw output 方便 debug
+        response_content_clean = self._strip_think_blocks(response_content)
+
+        # v0.7.0:trace recorder hook — 完整記錄 messages + response(含 think block 方便 debug)
         if getattr(self, "trace", None) is not None:
             try:
                 self.trace.record_llm_call(
@@ -1572,7 +1640,7 @@ class LLMService:
             except Exception:
                 pass  # silent — trace 失敗不影響 user query
 
-        return response_content
+        return response_content_clean
 
     def reset_call_log(self) -> None:
         """測試 framework 在每個 case 開始前呼叫,清空累積 telemetry。"""
@@ -1796,7 +1864,8 @@ class LLMService:
             {"role": "user", "content": user_msg},
         ]
         try:
-            return {"status": "success", "message": self._call_llm(messages, temperature=0.2, phase="plan")}
+            _samp = self._resolve_phase_sampling("plan", fallback_temp=0.2)
+            return {"status": "success", "message": self._call_llm(messages, phase="plan", **_samp)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -1945,12 +2014,16 @@ class LLMService:
         for attempt in range(3):
             # v0.10.2:retry 時 temp 抬高打破 LLM stuck pattern(temp=0 deterministic
             # 會讓同個 prompt 連續產同樣錯誤)。attempt 1 維持 default 求穩。
-            _retry_temp = 0.0 if attempt == 0 else 0.15
+            # v0.10.6:改走 profile,reasoning_distilled coding base=0.6 / retry=0.75
+            _samp = self._resolve_phase_sampling(
+                "pipeline", is_retry=(attempt > 0),
+                fallback_temp=(0.0 if attempt == 0 else 0.15),
+            )
             raw = self._call_llm(
                 [{"role": "system", "content": system_prompt},
                  {"role": "user", "content": user_msg}],
-                temperature=_retry_temp,
                 phase="pipeline",
+                **_samp,
             )
             last_raw = raw
             # 第一步:strip code fence
@@ -2128,12 +2201,16 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
             phase="preprocess",
         )
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
-        _retry_temp = 0.15 if previous_error else self.default_temperature
+        # v0.10.6:走 profile,reasoning_distilled coding base=0.6 / retry=0.75
+        _samp = self._resolve_phase_sampling(
+            "preprocess", is_retry=bool(previous_error),
+            fallback_temp=(0.15 if previous_error else self.default_temperature),
+        )
         raw = self._call_llm(
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_msg}],
-            temperature=_retry_temp,
             phase="preprocess",
+            **_samp,
         )
         return self._strip_code_fence(raw, lang="python")
 
@@ -2365,12 +2442,16 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error, phase="plotly")
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
-        _retry_temp = 0.15 if previous_error else self.default_temperature
+        # v0.10.6:走 profile,reasoning_distilled coding base=0.6 / retry=0.75
+        _samp = self._resolve_phase_sampling(
+            "plotly", is_retry=bool(previous_error),
+            fallback_temp=(0.15 if previous_error else self.default_temperature),
+        )
         raw = self._call_llm(
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_msg}],
-            temperature=_retry_temp,
             phase="plotly",
+            **_samp,
         )
         return self._strip_code_fence(raw, lang="python")
 
@@ -2396,12 +2477,16 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error, phase="echarts")
         # v0.10.2:retry 時 temp 抬高打破 stuck pattern
-        _retry_temp = 0.15 if previous_error else self.default_temperature
+        # v0.10.6:走 profile,reasoning_distilled coding base=0.6 / retry=0.75
+        _samp = self._resolve_phase_sampling(
+            "echarts", is_retry=bool(previous_error),
+            fallback_temp=(0.15 if previous_error else self.default_temperature),
+        )
         raw = self._call_llm(
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_msg}],
-            temperature=_retry_temp,
             phase="echarts",
+            **_samp,
         )
         return self._strip_code_fence(raw, lang="python")
 
@@ -3342,14 +3427,16 @@ app 端會把這個 dict 直接餵給 `st_echarts(option, height="520px")` 渲�
             f"處理後資料表 (Q,前 30 列 markdown):\n{q_preview_md}\n\n"
             f"請產出商業洞察。"
         )
+        # v0.10.6:走 profile,reasoning_distilled non-thinking base=0.7+pp=1.5
+        _samp = self._resolve_phase_sampling("insight", fallback_temp=0.3)
         try:
             return {
                 "status": "success",
                 "message": self._call_llm(
                     [{"role": "system", "content": system_prompt},
                      {"role": "user", "content": user_msg}],
-                    temperature=0.3,
                     phase="insight",
+                    **_samp,
                 ),
             }
         except Exception as e:

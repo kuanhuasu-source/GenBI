@@ -5,6 +5,65 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.6] · 2026-05-17 — Model profile system(reasoning distilled 支援)
+
+**Minor · 換 reasoning distilled 模型(Qwen3.6-27B-Claude-Opus-Reasoning-Distilled)需要不同 sampling 參數 → 加 profile 系統,per-phase resolve temp / presence_penalty。**
+
+### 🎯 動機
+
+既有設定假設模型是 code-tuned non-thinking(qwen3-coder, Qwen2.5-Coder),所有 code-gen phase 用 temp=0 / retry=0.15。換到 reasoning distilled 模型時這個假設完全錯:
+- Coding 任務該用 `temp=0.6`(0 會讓模型 reasoning trace 退化)
+- General thinking(plan)該用 `temp=1.0`
+- Non-thinking(insight)該用 `temp=0.7 + presence_penalty=1.5`
+- 模型會輸出 `<think>...</think>` 區塊,下游 parser 會被搞亂
+
+舊架構這些值散在 4 個 `generate_*` 跟 insight 裡 hardcode,沒法切換,且 `_call_llm` 不支援 `presence_penalty`。
+
+### ✨ P1:`config.py:MODEL_PROFILES`
+
+新增 `MODEL_PROFILES: dict[str, dict[str, dict]]`,phase → sampling 參數的 mapping。提供兩個 profile:
+
+| Profile | plan | pipeline / preprocess / plotly / echarts | insight / meta_response |
+|---|---|---|---|
+| `default`(預設,沿用舊行為) | temp=0.2 | temp=0.0 / retry=0.15 | temp=0.3 |
+| `reasoning_distilled` | temp=1.0 | temp=0.6 / retry=0.75 | temp=0.7 + presence_penalty=1.5 |
+
+切 profile:`HRDA_MODEL_PROFILE=reasoning_distilled`(env)。未設或不存在 → 自動 fallback `default` + 印 warning。
+
+`llm_service_kwargs()` 自動把 `MODEL_PROFILE` 帶進去,caller 不用改。
+
+### ✨ P2:`LLMService` 接 profile
+
+- **新參數** `model_profile: dict | None`(constructor)— `None` = legacy hardcoded 行為(向下相容)
+- **新方法** `_resolve_phase_sampling(phase, is_retry, fallback_temp) -> dict` — 回 `{"temperature": ..., "presence_penalty": ...}`(只塞 profile 有設的 key);profile 沒蓋到的 phase 回 `fallback_temp`
+- **`_call_llm` 加 `presence_penalty` 參數** — 只有 caller / profile 明確指定才傳給 OpenAI client(避免對舊 endpoint / 不支援的 backend 出錯)
+- **`<think>...</think>` strip** — `_strip_think_blocks()` 在 `_call_llm` 出口處跑(trace 保留含 think 的 raw output 方便 debug,downstream 只看 clean output)
+- **6 個 caller wire-in** — `generate_plan / generate_pipeline / generate_preprocess_code / generate_plot_code / generate_echarts_option / generate_insight` 都改用 `_resolve_phase_sampling`,把舊 hardcoded 值傳成 `fallback_temp`(default profile byte-equal 舊行為)
+
+### ✨ Retry 策略決策(user-confirmed)
+
+reasoning_distilled coding retry 維持 +0.15 bump(0.6 → 0.75)— 保留打破 stuck pattern 的設計。
+
+### ✅ 驗證
+
+- 5 檔 AST OK(`config.py`, `llm_service.py`, `app.py`, `test_runner.py`, `phase_b_validator.py`)
+- 單元測試:`_resolve_phase_sampling` 兩個 profile × 4 phase × is_retry 全綠
+- 單元測試:`_strip_think_blocks` 處理單 / 多 / 無 think block / None 都正確
+- default profile byte-equal 舊行為(現有部署不會被打破)
+
+### 📝 切換指引
+
+`.env` 加幾行:
+```
+HRDA_MODEL_PROVIDER=ollama          # 或 vllm
+HRDA_MODEL_NAME=Qwen3.6-27B-Claude-Opus-Reasoning-Distilled-GGUF
+HRDA_MODEL_PROFILE=reasoning_distilled
+```
+
+模型卡:<https://huggingface.co/rico03/Qwen3.6-27B-Claude-Opus-Reasoning-Distilled-GGUF>
+
+---
+
 ## [0.10.5] · 2026-05-17 — Level 2 (Phase B):phase-aware retry hint + Phase B semantic validator
 
 **Patch · Phase B exec error 提示太通用 + silent Q content failure 抓不到 → 拆 phase-aware hint + 加 phase_b_validator。**
