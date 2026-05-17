@@ -42,3 +42,13 @@ outputs/
 
 # 日誌
 *.log
+
+# v0.10.7 模型選型實驗 — 廢棄的 Ollama Modelfile(35B-A3B / 80B-A3B / reasoning_distilled
+# 都已 benchmark 證實不適合,保留 Modelfile-coder30b 為主力)
+Modelfile
+Modelfile-a3b
+Modelfile-a3b-35b
+Modelfile-coder-next
+
+# Side project — AWQ 量化工具(獨立 sub-project)
+awq_quantize/

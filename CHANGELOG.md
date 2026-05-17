@@ -5,6 +5,74 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.10.7] · 2026-05-17 — `bench_model.py` + Modelfile-coder30b + 模型選型決定
+
+**Patch · v0.10.6 加了 profile 系統就是為了能 A/B 試多個模型,這版補上 benchmark 工具 + 把選型結論落到 repo。**
+
+### ✨ `bench_model.py`(新檔)
+
+3 個 query × 4 phase = 12 個 LLM call 的輕量 benchmark,獨立於 test_runner.py
+不需要 Mongo / raw_df,純量 LLM 推論耗時。CLI:
+```
+python bench_model.py <model_name> --profile <default|reasoning_distilled>
+```
+產出 per-phase min / median / max / total + tokens/sec 比較表,方便未來換模型時
+5 分鐘下決定。
+
+### ✨ Modelfile-coder30b(新檔)
+
+8K context 的 qwen3-coder:30b 變體。Ollama 預設 num_ctx=2048 對我們 Phase A/B
+的 long prompt 會 truncate(雖然 model 夠 robust 還是能 produce 東西),這個
+Modelfile 把 ctx 拉到 8192,給 prompt + 完整 output 充分空間。
+
+```dockerfile
+FROM qwen3-coder:30b
+PARAMETER num_ctx 8192
+PARAMETER temperature 0.0
+```
+
+`.env` 設 `HRDA_MODEL_NAME=qwen3-coder-30b-8k`(`ollama create` 後的 alias)。
+
+### 📊 模型選型 benchmark 結果(2026-05-17,M-series 64GB)
+
+跑 3 個 query × 4 phase 跨 3 個候選 model:
+
+| Model | Per-query | Calls | Completion tokens | Tok/sec | 結論 |
+|---|---|---|---|---|---|
+| **qwen3-coder:30b-8k** (default) | **43.5s** 🏆 | 13 (clean) | 5,215 | **375.8** | **主力** |
+| qwen3-coder-next-8k (80B-A3B, default) | 107.6s | 13 | 6,406 | 154 | 質量好但 64GB Mac swap 壓力大 |
+| qwen36-a3b-8k (35B-A3B, reasoning_distilled) | 342.7s | 19 (+6 retry) | 38,769 | 90 | thinking trace 漏進 JSON parser → retry 拖死 |
+
+關鍵發現:
+
+1. **qwen3-coder:30b 每維度都贏** — Per-query 43.5s 比 80B 快 2.5x、比 35B-A3B 快 8x
+2. **Reasoning 系列不適合 GenBI 既有 prompt** — 35B-A3B 每 call 多吐 ~2000 thinking tokens,Pipeline JSON 解析失敗 → 每 query 多 2 個 retry call
+3. **64GB Mac 上限約 35GB 模型** — 51GB 模型(80B coder-next)會 swap thrash
+4. **v0.10.6 `<think>` strip 只認 `<think>...</think>`** — Qwen3.6 系列可能用別的標籤,thinking 漏掉,parser 看到怪 token 就 retry
+
+### 📌 結論落實
+
+`.env` 確定為:
+```
+HRDA_MODEL_PROVIDER=ollama
+HRDA_MODEL_NAME=qwen3-coder-30b-8k
+HRDA_MODEL_PROFILE=default
+```
+
+未來換模型基本流程:
+1. `ollama pull <model>` → `ollama create <alias>-Nk -f Modelfile-X`
+2. `python bench_model.py <alias>-Nk --profile <profile>`
+3. Per-query > 60s 或 calls > 12(意指 retry)→ 直接刷掉
+4. Per-query < 50s 且 calls = 12 → 跑 `test_runner.py` 看 pass rate
+
+### 🗑️ .gitignore 加幾條
+
+把實驗用的廢棄 Modelfile(`Modelfile`、`Modelfile-a3b`、`Modelfile-a3b-35b`、
+`Modelfile-coder-next`)跟 sub-project `awq_quantize/` 加 ignore,只留
+`Modelfile-coder30b` 為主力。
+
+---
+
 ## [0.10.6.1] · 2026-05-17 — Hotfix:`model_profile` 沒實際 wire 進 app.py / test_runner.py
 
 **Patch · v0.10.6 加了 profile feature 但 caller 沒真的把它傳給 LLMService → 看似支援 reasoning_distilled 實際還在跑 legacy default。**
