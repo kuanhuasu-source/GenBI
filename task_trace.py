@@ -218,13 +218,60 @@ def _safe_serialize_messages(messages: list) -> list:
 
 
 def _safe_doc(doc: dict) -> dict:
-    """處理 dict 內可能存在的 numpy / pandas 型別,避免 MongoDB 寫入失敗。"""
-    # 簡單 fallback — 跑一遍 JSON round-trip,把 numpy 型別轉成 Python native
-    import json
+    """處理 dict 內可能存在的 numpy / pandas 型別,避免 MongoDB 寫入失敗。
+
+    v0.11.0.1:不能再用 json.dumps(default=str),那會把 datetime 轉成字串,
+    MongoDB 存進去就不是 BSON date,所有時間窗口查詢全失敗(failure_filter 永遠
+    miss)。改用 recursive sanitizer:對 numpy / pandas / set 等型別做轉換,
+    但 datetime 保留原樣交給 pymongo bson encoder。
+    """
+    return _sanitize(doc)
+
+
+def _sanitize(obj):
+    """Recursively sanitize a value to be MongoDB-safe while preserving datetime."""
+    # datetime / date: keep as-is(pymongo bson 會自然處理)
+    if isinstance(obj, datetime):
+        return obj
+    # primitives that pymongo handles natively
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    # dict: recurse
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    # list / tuple / set: recurse
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_sanitize(v) for v in obj]
+    # numpy scalars → Python native
     try:
-        return json.loads(json.dumps(doc, default=str))
+        import numpy as _np
+        if isinstance(obj, _np.integer):
+            return int(obj)
+        if isinstance(obj, _np.floating):
+            return float(obj)
+        if isinstance(obj, _np.bool_):
+            return bool(obj)
+        if isinstance(obj, _np.ndarray):
+            return _sanitize(obj.tolist())
+    except ImportError:
+        pass
+    # pandas Timestamp → datetime
+    try:
+        import pandas as _pd
+        if isinstance(obj, _pd.Timestamp):
+            return obj.to_pydatetime()
+        if hasattr(obj, "to_dict"):  # DataFrame / Series
+            try:
+                return _sanitize(obj.to_dict())
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    # fallback: stringify(不會打到 datetime,因為前面已 return)
+    try:
+        return str(obj)
     except Exception:
-        return doc
+        return None
 
 
 # ────────────────────────────────────────────────────────────

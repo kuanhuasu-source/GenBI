@@ -5,6 +5,75 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.11.0.1] · 2026-05-17 — Hotfix:`task_trace._safe_doc` json round-trip 把 datetime 轉成 str
+
+**Patch · v0.7.0 起就埋的 bug,直到 v0.11.0 P1 接 TaskTrace 進 test_runner 才被發現:learning pipeline 0 candidate trace。**
+
+### 🔴 根因
+
+`task_trace.py:_safe_doc` 處理 numpy/pandas 型別用了**最粗糙的 json round-trip**:
+```python
+import json
+return json.loads(json.dumps(doc, default=str))
+```
+
+`default=str` 一視同仁把所有非 JSON-native 型別轉成字串,**datetime 也被無聲轉成 `'2026-05-17 09:48:50.467825+00:00'` 字串**。MongoDB 存進去就不是 BSON Date,所有時間窗口查詢(`{'started_at': {'$gte': datetime}}`)全 miss。
+
+衝擊範圍:**自 v0.7.0(task_trace.py 新增)起所有 task_trace 寫入的 datetime 欄位 (`started_at` / `completed_at`) 都是字串**。app.py 跟 v0.11.0 P1 後的 test_runner.py 都受影響。實際被 user 注意到是因為 v0.11.0 P1 把 baseline 結果餵 learning pipeline 時,`failure_filter` 找 0 candidate。
+
+證據(`scratch_inspect_traces.py` 跑出來):
+```
+sample started_at type: str
+sample started_at val:  2026-05-17 09:48:50.467825+00:00
+status='failed': 4        ← 確實有 failed trace
+只 status filter: 8       ← 不加時間窗口,8 個 trace 都抓得到
+status + 時間窗口: 0      ← 加時間窗口就 0
+```
+
+### ✨ 修正:`_safe_doc` 改用 `_sanitize()` recursive traversal
+
+```python
+def _sanitize(obj):
+    if isinstance(obj, datetime):
+        return obj  # ← 保留 datetime 給 pymongo bson encoder 處理
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_sanitize(v) for v in obj]
+    # numpy / pandas 個別處理...
+    if isinstance(obj, np.integer): return int(obj)
+    if isinstance(obj, np.floating): return float(obj)
+    if isinstance(obj, np.bool_): return bool(obj)
+    if isinstance(obj, pd.Timestamp): return obj.to_pydatetime()
+    ...
+    return str(obj)  # final fallback
+```
+
+關鍵差異:**datetime 在第一層 short-circuit return,完全不經過字串化路徑**。
+
+### ✨ Backfill script · `scripts/backfill_task_traces_datetime.py`
+
+把既有被吃成字串的 trace 修回 datetime(避免重跑 22 分鐘 baseline):
+- dry-run by default
+- `--apply` 才真改
+- 解析 `datetime.fromisoformat`,容忍 `Z` suffix
+
+### ✅ 驗證
+
+- AST OK
+- 內部 unit test:`_sanitize` 對 datetime / nested dict / list 都保留 datetime
+- 7 個 learning job dry-run 之前 0 candidate,修完 backfill 後 failure_filter 預期 matched 4(STK-01/05 等)
+
+### 📌 下一步
+
+1. 跑 backfill:`python scripts/backfill_task_traces_datetime.py --apply`
+2. 重跑 dry-run 確認 failure_filter 有抓到 trace
+3. 真實跑 learning pipeline → 看 observation_extractor 抽出什麼
+
+---
+
 ## [0.11.0] · 2026-05-17 — Self-learning loop end-to-end validation 啟動
 
 **Minor · v0.8-v0.9 蓋好的 self-learning infrastructure(7 個 learning module + admin UI + cron)從沒被真正餵料跑過。v0.11.0 啟動端到端驗證。**
