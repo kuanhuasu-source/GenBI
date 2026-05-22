@@ -90,6 +90,7 @@ DEFAULT_PROFILES_COLLECTION = "upload_profiles"
 DEFAULT_METADATA_VERSIONS_COLLECTION = "upload_metadata_versions"
 DEFAULT_USER_CORRECTIONS_COLLECTION = "upload_user_corrections"
 DEFAULT_ANALYSIS_SESSIONS_COLLECTION = "analysis_sessions"
+DEFAULT_ANALYSIS_ASSETS_COLLECTION = "analysis_assets"
 
 
 class UploadRepository:
@@ -113,6 +114,7 @@ class UploadRepository:
         metadata_versions_collection: str = DEFAULT_METADATA_VERSIONS_COLLECTION,
         user_corrections_collection: str = DEFAULT_USER_CORRECTIONS_COLLECTION,
         analysis_sessions_collection: str = DEFAULT_ANALYSIS_SESSIONS_COLLECTION,
+        analysis_assets_collection: str = DEFAULT_ANALYSIS_ASSETS_COLLECTION,
     ):
         """
         Args:
@@ -133,6 +135,8 @@ class UploadRepository:
         self._user_corrections = mongo_db[user_corrections_collection]
         # M3+: analysis sessions(chat 對話 + Phase 0/A/B/C/D outputs)
         self._analysis_sessions = mongo_db[analysis_sessions_collection]
+        # M3A+: analysis assets(Saved Chart / Saved Metric / Analysis Template)
+        self._analysis_assets = mongo_db[analysis_assets_collection]
 
     # ============================================================
     # Index management
@@ -164,6 +168,13 @@ class UploadRepository:
         # M3+: analysis_sessions
         self._analysis_sessions.create_index(
             [("dataset_id", 1), ("updated_at", -1)],
+        )
+        # M3A+: analysis_assets
+        self._analysis_assets.create_index(
+            [("dataset_id", 1), ("asset_type", 1), ("created_at", -1)],
+        )
+        self._analysis_assets.create_index(
+            [("dataset_id", 1), ("is_active", 1)],
         )
 
     # ============================================================
@@ -565,6 +576,107 @@ class UploadRepository:
     def delete_session(self, session_id: str) -> bool:
         return self._analysis_sessions.delete_one(
             {"_id": session_id}).deleted_count > 0
+
+    # ============================================================
+    # analysis_assets CRUD(M3A+)
+    # ============================================================
+    def create_asset(self, asset_doc: dict) -> str:
+        """寫一筆 analysis_asset 文件。caller 必須提供 _id(用 generate_asset_id)。
+
+        Required keys:
+          _id, asset_type, dataset_id, metadata_version, name,
+          source_query, asset_payload, lineage, created_by
+        """
+        required = {"_id", "asset_type", "dataset_id", "metadata_version",
+                    "name", "source_query", "asset_payload", "lineage",
+                    "created_by"}
+        missing = required - set(asset_doc.keys())
+        if missing:
+            raise ValueError(f"create_asset: 缺欄位 {missing}")
+        now = _dt.datetime.now(_dt.timezone.utc)
+        asset_doc.setdefault("description", "")
+        asset_doc.setdefault("is_active", True)
+        asset_doc["created_at"] = now
+        asset_doc["updated_at"] = now
+        self._analysis_assets.insert_one(asset_doc)
+        return asset_doc["_id"]
+
+    def get_asset(self, asset_id: str) -> Optional[dict]:
+        return self._analysis_assets.find_one({"_id": asset_id})
+
+    def list_assets(
+        self,
+        dataset_id: Optional[str] = None,
+        asset_type: Optional[str] = None,
+        owner: Optional[str] = None,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """列 assets(新到舊)。dataset_id 可選,沒帶就跨 dataset。"""
+        query: dict[str, Any] = {}
+        if dataset_id:
+            query["dataset_id"] = dataset_id
+        if asset_type:
+            query["asset_type"] = asset_type
+        if owner:
+            query["created_by"] = owner
+        if not include_inactive:
+            query["is_active"] = True
+        return list(
+            self._analysis_assets.find(query)
+            .sort("created_at", -1)
+            .limit(limit)
+        )
+
+    def rename_asset(self, asset_id: str, new_name: str,
+                       description: Optional[str] = None) -> bool:
+        update_doc: dict[str, Any] = {
+            "name": new_name,
+            "updated_at": _dt.datetime.now(_dt.timezone.utc),
+        }
+        if description is not None:
+            update_doc["description"] = description
+        result = self._analysis_assets.update_one(
+            {"_id": asset_id}, {"$set": update_doc},
+        )
+        return result.modified_count > 0
+
+    def soft_delete_asset(self, asset_id: str) -> bool:
+        """軟刪 — is_active=False(保留 audit trail)。"""
+        result = self._analysis_assets.update_one(
+            {"_id": asset_id},
+            {"$set": {
+                "is_active": False,
+                "updated_at": _dt.datetime.now(_dt.timezone.utc),
+            }},
+        )
+        return result.modified_count > 0
+
+    def hard_delete_asset(self, asset_id: str) -> bool:
+        """真刪 — 從 DB 移除(危險,僅 admin 用途)。"""
+        return self._analysis_assets.delete_one(
+            {"_id": asset_id}).deleted_count > 0
+
+
+def generate_asset_id(asset_type: str = "asset") -> str:
+    """產生新的 asset_id — 格式:`<prefix>_<ts>_<6hex>`。
+
+    Args:
+        asset_type: 'saved_chart' | 'saved_metric' | 'analysis_template'
+                    用於 asset_id 前綴(便於肉眼辨識)。
+
+    Returns:
+        例 'chart_20260522135530_a8c3f2' / 'metric_...' / 'tmpl_...'
+    """
+    import secrets
+    prefix_map = {
+        "saved_chart": "chart",
+        "saved_metric": "metric",
+        "analysis_template": "tmpl",
+    }
+    prefix = prefix_map.get(asset_type, "asset")
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"{prefix}_{ts}_{secrets.token_hex(3)}"
 
 
 def generate_dataset_id() -> str:

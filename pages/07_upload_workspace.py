@@ -38,6 +38,7 @@ import config
 from upload_repository import UploadRepository
 from upload_service import UploadService
 from upload_analysis_service import UploadAnalysisService
+from analysis_asset_service import AnalysisAssetService
 from metadata_correction_service import MetadataCorrectionService
 from metadata_provider import UploadMetadataProvider
 from semantic_profiler import SEMANTIC_ROLES, ROLE_PROPERTIES
@@ -874,6 +875,19 @@ def _get_analysis_service(_mongo_db, _llm_id):
 
 analysis_service = _get_analysis_service(mongo_db, id(upload_llm))
 
+
+# M3A: AnalysisAssetService(save chart / metric / template)
+@st.cache_resource(show_spinner=False)
+def _get_asset_service(_mongo_db):
+    _repo = UploadRepository(_mongo_db)
+    return AnalysisAssetService(
+        upload_repo=_repo,
+        correction_service=MetadataCorrectionService(_repo),
+    )
+
+
+asset_service = _get_asset_service(mongo_db)
+
 # ────────────────────────────────────────
 # 10.2 · Session 選擇 / 新建
 # ────────────────────────────────────────
@@ -1104,6 +1118,9 @@ if query:
                 )
                 st.write("分析已完成,如上方資料、圖表與洞察所示。")
 
+                # M3A: 把 result 存到 session_state,讓下方 save 區塊用
+                st.session_state[f"_last_result_{active_sid}"] = result
+
         except Exception as e:
             status_box.update(label="❌ 系統錯誤", state="error", expanded=True)
             st.error(f"❌ 系統執行中斷:{type(e).__name__}: {e}")
@@ -1111,7 +1128,164 @@ if query:
             with st.expander("🔍 Traceback"):
                 st.code(_tb.format_exc(), language="bash")
 
+# ────────────────────────────────────────
+# 11 · Save Asset(M3A — 上次成功分析才會出現)
+# ────────────────────────────────────────
+last_result = st.session_state.get(f"_last_result_{active_sid}")
+if last_result and last_result.get("status") == "completed":
+    st.markdown("#### 1️⃣1️⃣ Save Analysis Asset")
+    st.caption(
+        f"💾 把上次分析(`{last_result['trace_id'][:8]}`)沉澱成可重用資產。"
+        f"3 種類型,各自獨立保存。"
+    )
+
+    tab_chart, tab_metric, tab_template = st.tabs([
+        "📊 Save Chart", "📐 Save Metric", "📋 Save Template",
+    ])
+
+    user = st.session_state.get("_upload_owner", "anonymous")
+
+    with tab_chart:
+        with st.form(f"_save_chart_form_{active_sid}", clear_on_submit=True):
+            chart_name = st.text_input(
+                "Chart name *",
+                placeholder="例:HC 分佈直方圖(M3 baseline)",
+                max_chars=80,
+            )
+            chart_desc = st.text_area(
+                "Description",
+                placeholder="(可選)為何保存這張、何時看",
+                max_chars=300, height=80,
+            )
+            submitted = st.form_submit_button("💾 Save Chart", type="primary")
+            if submitted:
+                if not chart_name.strip():
+                    st.error("Chart name 不能為空")
+                else:
+                    try:
+                        asset_id = asset_service.save_chart(
+                            dataset_id=selected_id,
+                            session_id=active_sid,
+                            analysis_result=last_result,
+                            name=chart_name.strip(),
+                            description=chart_desc.strip(),
+                            user=user,
+                        )
+                        st.success(f"✅ Saved Chart 已存 · `{asset_id}`")
+                        st.toast("📊 Chart asset 已建", icon="💾")
+                    except Exception as e:
+                        st.error(f"❌ 保存失敗:{e}")
+
+    with tab_metric:
+        with st.form(f"_save_metric_form_{active_sid}", clear_on_submit=True):
+            st.caption(
+                "⚠️ Save Metric 會把此 KPI **寫回 dynamic metadata.kpi_definitions**,"
+                "並產生新的 metadata version。後續分析可用自然語言引用。"
+            )
+            metric_key = st.text_input(
+                "KPI key * (snake_case)",
+                placeholder="例:avg_hc / pay_rate / total_revenue",
+                max_chars=40,
+            )
+            metric_name = st.text_input(
+                "KPI 顯示名 *",
+                placeholder="例:平均人數 / 通過率 / 總營收",
+                max_chars=60,
+            )
+            metric_formula = st.text_input(
+                "Formula *",
+                placeholder=(
+                    "例:mean(hc) / sum(pay_count)/sum(total) / "
+                    "Q['amount'].sum()"
+                ),
+                max_chars=200,
+                help="用 dataset 欄位或 Q 欄位寫公式,給後續 LLM 看",
+            )
+            metric_note = st.text_area(
+                "Important note(unit / 限制)",
+                placeholder="例:unit=people / 不可 sum,只能 mean",
+                max_chars=200, height=70,
+            )
+            metric_desc = st.text_area(
+                "Description",
+                placeholder="(可選)業務含義",
+                max_chars=300, height=70,
+            )
+            submitted = st.form_submit_button("💾 Save Metric", type="primary")
+            if submitted:
+                missing = [
+                    f for f, v in (("KPI key", metric_key),
+                                    ("KPI 顯示名", metric_name),
+                                    ("Formula", metric_formula))
+                    if not v.strip()
+                ]
+                if missing:
+                    st.error(f"必填欄位空白:{', '.join(missing)}")
+                elif not metric_key.replace("_", "").isalnum():
+                    st.error("KPI key 只能用 [a-zA-Z0-9_],請改成 snake_case")
+                else:
+                    try:
+                        asset_id = asset_service.save_metric(
+                            dataset_id=selected_id,
+                            session_id=active_sid,
+                            analysis_result=last_result,
+                            kpi_key=metric_key.strip(),
+                            name=metric_name.strip(),
+                            formula=metric_formula.strip(),
+                            important_note=metric_note.strip(),
+                            description=metric_desc.strip(),
+                            user=user,
+                        )
+                        st.success(
+                            f"✅ Saved Metric 已存 · `{asset_id}`\n\n"
+                            f"📌 已寫回 dynamic metadata,產出新 metadata version。"
+                            f"下次 query 引用「{metric_name}」LLM 會看得到。"
+                        )
+                        st.toast("📐 Metric 寫回 metadata 完成", icon="💾")
+                        # metadata 變了 → 清 LLMService cache 讓下次 query 重 build
+                        st.cache_resource.clear()
+                    except Exception as e:
+                        st.error(f"❌ 保存失敗:{type(e).__name__}: {e}")
+
+    with tab_template:
+        with st.form(f"_save_tmpl_form_{active_sid}", clear_on_submit=True):
+            st.caption(
+                "📋 Template 保存「query + plan」,在 Saved Assets page 可一鍵"
+                "重新以同 query 觸發分析。MVP 只支援同 dataset 內重執行。"
+            )
+            tmpl_name = st.text_input(
+                "Template name *",
+                placeholder="例:每月人力分佈分析(template)",
+                max_chars=80,
+            )
+            tmpl_desc = st.text_area(
+                "Description",
+                placeholder="(可選)什麼場景下適用此 template",
+                max_chars=300, height=80,
+            )
+            submitted = st.form_submit_button("💾 Save Template", type="primary")
+            if submitted:
+                if not tmpl_name.strip():
+                    st.error("Template name 不能為空")
+                else:
+                    try:
+                        asset_id = asset_service.save_template(
+                            dataset_id=selected_id,
+                            session_id=active_sid,
+                            analysis_result=last_result,
+                            name=tmpl_name.strip(),
+                            description=tmpl_desc.strip(),
+                            user=user,
+                        )
+                        st.success(f"✅ Saved Template 已存 · `{asset_id}`")
+                        st.toast("📋 Template 已建", icon="💾")
+                    except Exception as e:
+                        st.error(f"❌ 保存失敗:{e}")
+
+    st.caption(
+        "🔗 已保存的 assets 在 **Saved Assets** page 瀏覽 / 重執行 / 重命名 / 刪除。"
+    )
+
 st.caption(
-    "🚧 下個 milestone:M3A 加 Saved Chart / Saved Metric / Analysis Template,"
-    "把成功的分析沉澱為可重用資產。"
+    "✅ M3A — Saved Chart / Saved Metric / Analysis Template + Saved Assets Panel"
 )
