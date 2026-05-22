@@ -61,3 +61,7 @@ scratch_*.py
 
 # Learning pipeline dry-run logs
 learning_*_run*.log
+
+# v0.12.0+: Upload Workspace 本機檔案 staging(每個 dataset_id 一個子目錄)
+# 包含原始上傳檔(.csv / .xlsx) + parquet staging
+uploads/

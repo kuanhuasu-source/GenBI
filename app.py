@@ -456,10 +456,20 @@ if "prompt_repo" not in st.session_state:
     from prompt_repository import build_default_repo
     st.session_state.prompt_repo = build_default_repo(mongo_db=mongo_db)
 
+# v0.12.0+: MetadataProvider 抽象層 — schema-driven (static) 透傳 prompt_repo,
+# upload-driven 走 UploadMetadataProvider(Milestone 3 加入)。
+# 凍結條款:StaticDomainMetadataProvider.get_metadata 必須跟 prompt_repo.get_metadata
+# byte-equal,baseline regression 才不會炸。
+if "metadata_provider" not in st.session_state:
+    from metadata_provider import StaticDomainMetadataProvider
+    st.session_state.metadata_provider = StaticDomainMetadataProvider(
+        st.session_state.prompt_repo
+    )
+
 # 2) 預設 active domain — tflex 永遠優先(v0.3.1+)
 #    若 tflex 不存在 → 才退到 list 第一個 → 都沒才 hardcode 'tflex'
 if "active_domain" not in st.session_state:
-    _available = st.session_state.prompt_repo.list_active_domains()
+    _available = st.session_state.metadata_provider.list_available()
     if "tflex" in _available:
         st.session_state.active_domain = "tflex"
     elif _available:
@@ -469,9 +479,13 @@ if "active_domain" not in st.session_state:
 
 # 3) 用 active domain 建 LLMService。LLMService 內部會接 prompt_repo 走模板讀取
 def _build_llm_service_for_domain(domain: str) -> LLMService:
-    """為指定 domain 建一個新的 LLMService(切換 domain 時呼叫)。"""
+    """為指定 domain 建一個新的 LLMService(切換 domain 時呼叫)。
+
+    v0.12.0+: metadata lookup 走 metadata_provider 抽象;static provider 透傳
+    prompt_repo.get_metadata,行為 byte-equal。
+    """
     try:
-        task_md = st.session_state.prompt_repo.get_metadata(domain)
+        task_md = st.session_state.metadata_provider.get_metadata(domain)
     except KeyError:
         # Fallback to default tflex metadata if domain not found
         task_md = None
@@ -502,7 +516,7 @@ with st.sidebar:
     # ─────────────────────────────────────────────────────────
     st.markdown("### 🌐 Active Domain")
     _available_domains = (
-        st.session_state.prompt_repo.list_active_domains() or [st.session_state.active_domain]
+        st.session_state.metadata_provider.list_available() or [st.session_state.active_domain]
     )
     try:
         _current_idx = _available_domains.index(st.session_state.active_domain)
@@ -547,7 +561,7 @@ with st.sidebar:
     else:
         # 沒有 pending 時顯示當前 domain 的小摘要
         try:
-            _md = st.session_state.prompt_repo.get_metadata(st.session_state.active_domain)
+            _md = st.session_state.metadata_provider.get_metadata(st.session_state.active_domain)
             _name = _md.get("dataset_name") or _md.get("dataset_id") or st.session_state.active_domain
             _n_coll = len((_md.get("collections") or {}))
             _n_kpi = len((_md.get("kpi_definitions") or {}))
@@ -629,6 +643,11 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
+    # v0.12.0+: BYOD (Bring Your Own Data) — Upload Workspace 入口提示
+    # 此處只新增 caption,不動既有 sidebar widget,避免影響 schema-driven 主路徑。
+    st.caption(
+        "📤 **BYOD** · 想分析自己的 CSV / Excel?點左上 **Upload Workspace** page"
+    )
     st.caption("💡 環境變數可調:HRDA_MODEL_BASE_URL / HRDA_MODEL_NAME / MONGO_URI …")
 
 # ============================================================

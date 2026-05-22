@@ -28,3 +28,8 @@ python-dotenv>=1.0.0
 # v0.4.0+: Export Insight → PPTX(matplotlib 已隨 pandas 進來,毋須額外列)
 python-pptx>=0.6.21
 matplotlib>=3.5.0
+
+# v0.12.0+: Upload Workspace — parquet staging engine
+pyarrow>=14.0.0
+# Upload Workspace — Excel single sheet parser
+openpyxl>=3.1.0
