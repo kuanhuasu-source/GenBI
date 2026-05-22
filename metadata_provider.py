@@ -81,3 +81,63 @@ class StaticDomainMetadataProvider(MetadataProvider):
 
     def get_source_type(self) -> str:
         return "static"
+
+
+class UploadMetadataProvider(MetadataProvider):
+    """Upload-driven 路徑 — 從 upload_metadata_versions 拿 active version 的 metadata。
+
+    跟 Static 不同:
+    - 來源是 `upload_metadata_versions` collection,非 `prompt_repo`
+    - 回傳 dict 一定含 `source_type='upload'`(由 M2 build_metadata 寫入)
+    - 只取 active 且 confirmation_status='confirmed' 的版本(unconfirmed 視為 not ready)
+
+    若 dataset 還沒 confirm metadata,`get_metadata` 會 raise KeyError;
+    caller 應在 UI 上引導使用者先去確認 metadata。
+    """
+
+    def __init__(self, upload_repo, require_confirmed: bool = True):
+        """
+        Args:
+            upload_repo: UploadRepository instance
+            require_confirmed: True 時只回 confirmation_status='confirmed' 的版本;
+                False 時 draft 也可以(給 UI 預覽用,不建議實際分析)。
+        """
+        self.repo = upload_repo
+        self.require_confirmed = require_confirmed
+
+    def get_metadata(self, dataset_id: str) -> dict[str, Any]:
+        doc = self.repo.get_active_metadata(dataset_id)
+        if not doc:
+            raise KeyError(
+                f"Upload dataset `{dataset_id}` 沒 active metadata version"
+            )
+        status = doc.get("confirmation_status", "draft")
+        if self.require_confirmed and status != "confirmed":
+            raise KeyError(
+                f"Upload dataset `{dataset_id}` metadata 尚未 confirmed "
+                f"(status={status});請先在 Upload Workspace 點 Confirm。"
+            )
+        md = doc.get("metadata") or {}
+        # 防衛:確保 source_type 旗標存在(build_metadata 寫入,但保險)
+        if md.get("source_type") != "upload":
+            md = dict(md)  # 不 mutate DB doc
+            md["source_type"] = "upload"
+        return md
+
+    def list_available(self) -> list[str]:
+        """列出已 confirmed metadata 的 dataset_id。"""
+        datasets = self.repo.list_datasets(limit=200)
+        ready: list[str] = []
+        for d in datasets:
+            if d.get("active_metadata_version") is None:
+                continue
+            active = self.repo.get_active_metadata(d["_id"])
+            if not active:
+                continue
+            if self.require_confirmed and active.get("confirmation_status") != "confirmed":
+                continue
+            ready.append(d["_id"])
+        return ready
+
+    def get_source_type(self) -> str:
+        return "upload"

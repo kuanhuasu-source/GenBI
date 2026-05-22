@@ -37,10 +37,16 @@ import streamlit as st
 import config
 from upload_repository import UploadRepository
 from upload_service import UploadService
+from upload_analysis_service import UploadAnalysisService
 from metadata_correction_service import MetadataCorrectionService
+from metadata_provider import UploadMetadataProvider
 from semantic_profiler import SEMANTIC_ROLES, ROLE_PROPERTIES
 from upload_metadata_generator import summarize_confidence
+from llm_service import LLMService
 import file_parser
+
+# v0.10.0+: composite chart layout + ECharts renderer(reuse 主 app 的 layer)
+from streamlit_echarts import st_echarts
 
 # ============================================================
 # 頁面設定
@@ -805,7 +811,307 @@ st.divider()
 with st.expander("🔍 Raw metadata JSON(developer / debug)", expanded=False):
     st.json(metadata, expanded=False)
 
+st.divider()
+
+# ============================================================
+# 🔟 · Chat Analysis(M3 新增)
+# ============================================================
+# 只在 metadata confirmed 後才開放(對齊 spec §10.7 acceptance criteria #6)
+st.markdown("### 🔟 Chat Analysis")
+
+if md_status != "confirmed":
+    st.warning(
+        "⚠️ **Metadata 尚未確認** — 請先在 9️⃣ Apply / Confirm 區段按 "
+        "**✅ Confirm metadata** 後才能開始分析。"
+        "未確認的 metadata 進入分析會有欄位語意被誤判的風險。"
+    )
+    st.stop()
+
+# ────────────────────────────────────────
+# 10.1 · LLMService for upload dataset
+# ────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _get_upload_llm_service(_dataset_id: str, _md_version: int, _mongo_db):
+    """為某個 upload dataset + metadata version 建一個 cached LLMService。
+
+    Cache key = (dataset_id, metadata_version) — 確認新版 metadata 時 cache 失效。
+    """
+    provider = UploadMetadataProvider(
+        UploadRepository(_mongo_db), require_confirmed=True,
+    )
+    task_md = provider.get_metadata(_dataset_id)
+    return LLMService(
+        api_url=config.LLM_API_URL,
+        api_key=config.LLM_API_KEY,
+        model_name=config.LLM_MODEL,
+        timeout_s=config.LLM_TIMEOUT_S,
+        default_temperature=config.LLM_TEMPERATURE,
+        task_metadata=task_md,
+        # prompt_repo 對 upload-driven 無關鍵作用(Phase 0/A 走 inline),保留 None
+        prompt_repo=None,
+        domain=_dataset_id,
+        model_profile=config.MODEL_PROFILE,
+    )
+
+
+try:
+    upload_llm = _get_upload_llm_service(selected_id, md_version, mongo_db)
+except Exception as e:
+    st.error(f"❌ 無法建 LLMService:{e}")
+    st.stop()
+
+
+@st.cache_resource(show_spinner=False)
+def _get_analysis_service(_mongo_db, _llm_id):
+    """UploadAnalysisService(每個 LLMService instance 對應一個 service)。"""
+    return UploadAnalysisService(
+        mongo_db=_mongo_db,
+        upload_repo=UploadRepository(_mongo_db),
+        llm_service=upload_llm,
+        uploads_root=_PROJECT_ROOT / "uploads",
+    )
+
+
+analysis_service = _get_analysis_service(mongo_db, id(upload_llm))
+
+# ────────────────────────────────────────
+# 10.2 · Session 選擇 / 新建
+# ────────────────────────────────────────
+st.markdown("#### 10.2 · Session 管理")
+
+sessions = repo.list_sessions(dataset_id=selected_id, limit=20)
+
+col_new, col_pick = st.columns([1, 2])
+with col_new:
+    if st.button(
+        "🆕 開新 Session",
+        use_container_width=True,
+        type="primary",
+    ):
+        user = st.session_state.get("_upload_owner", "anonymous")
+        sid = analysis_service.start_session(
+            dataset_id=selected_id,
+            metadata_version=md_version,
+            user=user,
+        )
+        st.session_state[f"_active_session_{selected_id}"] = sid
+        st.toast(f"已開新 session · {sid[:20]}...", icon="✨")
+        st.rerun()
+
+with col_pick:
+    if sessions:
+        active_sid = st.session_state.get(f"_active_session_{selected_id}")
+        if not active_sid:
+            active_sid = sessions[0]["_id"]
+        sid_options = [s["_id"] for s in sessions]
+        sid_labels = [
+            f"{s['_id'][:20]}... · md_v{s.get('metadata_version', '?')} · "
+            f"{len(s.get('messages', []))} 訊息"
+            for s in sessions
+        ]
+        try:
+            current_idx = sid_options.index(active_sid)
+        except ValueError:
+            current_idx = 0
+        chosen_sid = st.selectbox(
+            "選擇 session(或按左邊開新 session)",
+            options=sid_options,
+            index=current_idx,
+            format_func=lambda x: sid_labels[sid_options.index(x)],
+            key=f"_session_selector_{selected_id}",
+        )
+        st.session_state[f"_active_session_{selected_id}"] = chosen_sid
+    else:
+        st.info("尚無 session — 按左邊「🆕 開新 Session」開始第一輪分析。")
+        st.stop()
+
+active_sid = st.session_state[f"_active_session_{selected_id}"]
+session_doc = repo.get_session(active_sid)
+if not session_doc:
+    st.error(f"Session `{active_sid}` 已不存在")
+    st.session_state.pop(f"_active_session_{selected_id}", None)
+    st.stop()
+
+# ────────────────────────────────────────
+# 10.3 · Chart engine / Insight toggle
+# ────────────────────────────────────────
+col_ce, col_ins = st.columns(2)
+with col_ce:
+    chart_engine = st.radio(
+        "📊 圖表引擎",
+        options=["ECharts", "Plotly"],
+        index=0, horizontal=True,
+        key=f"_chart_engine_{active_sid}",
+    )
+with col_ins:
+    enable_insight = st.toggle(
+        "啟用 Phase D 商業洞察",
+        value=True,
+        key=f"_insight_toggle_{active_sid}",
+    )
+
+# ────────────────────────────────────────
+# 10.4 · Chat history(replay)
+# ────────────────────────────────────────
+st.markdown("#### 10.4 · 對話歷史")
+
+messages = session_doc.get("messages", [])
+if not messages:
+    st.caption("(尚無對話)")
+else:
+    for idx, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        with st.chat_message(role):
+            # Refusal 短路
+            if msg.get("refusal"):
+                st.warning("⚠️ 資料不足")
+                st.markdown(content)
+                continue
+            # Meta intent response
+            if msg.get("meta_intent"):
+                st.markdown(content)
+                continue
+            # 正常 assistant
+            if role == "assistant" and msg.get("plan_text"):
+                with st.expander("📋 Plan", expanded=False):
+                    st.markdown(msg["plan_text"])
+                if msg.get("phase_a_code"):
+                    with st.expander("🪛 Phase A · Pandas filter code", expanded=False):
+                        st.code(msg["phase_a_code"], language="python")
+                if msg.get("phase_b_code"):
+                    with st.expander("🐍 Phase B · Preprocess code", expanded=False):
+                        st.code(msg["phase_b_code"], language="python")
+                if msg.get("phase_c_code"):
+                    with st.expander("🎨 Phase C · Chart code", expanded=False):
+                        st.code(msg["phase_c_code"], language="python")
+                if msg.get("insight"):
+                    with st.expander("🧠 商業洞察", expanded=False):
+                        st.markdown(msg["insight"])
+                if msg.get("trace_id"):
+                    st.caption(f"🔍 trace_id: `{msg['trace_id'][:8]}`")
+            st.write(content)
+
+# ────────────────────────────────────────
+# 10.5 · Chat input
+# ────────────────────────────────────────
+query = st.chat_input(
+    "對此 dataset 提出分析問題(例如:畫 leadtime 的分佈,標示平均、中位數、P95)"
+)
+
+if query:
+    with st.chat_message("user"):
+        st.write(query)
+
+    with st.chat_message("assistant"):
+        status_box = st.status(
+            f"🧠 處理中:{query[:60]}{'…' if len(query) > 60 else ''}",
+            expanded=True,
+        )
+        try:
+            with status_box:
+                st.write("🚦 Pre-Phase 0 intent + Phase 0 plan...")
+                result = analysis_service.handle_query(
+                    session_id=active_sid,
+                    query=query,
+                    chart_engine=chart_engine,
+                    enable_insight=enable_insight,
+                )
+
+            # 處理 result
+            if result["status"] == "meta":
+                status_box.update(
+                    label=f"✅ Meta intent: {result['intent']}",
+                    state="complete", expanded=False,
+                )
+                st.markdown(result.get("meta_response", ""))
+                st.rerun()
+
+            elif result["status"] == "refused":
+                status_box.update(
+                    label="🛑 資料不足", state="error", expanded=False,
+                )
+                st.warning("⚠️ 資料不足 — 此分析觸犯 metadata 中的 data_limitations")
+                st.markdown(result.get("refusal_message", ""))
+                st.rerun()
+
+            elif result["status"] == "failed":
+                status_box.update(
+                    label="❌ 失敗", state="error", expanded=True,
+                )
+                st.error(f"❌ {result.get('error', 'unknown error')}")
+                if result.get("phase_a_code"):
+                    with st.expander("Phase A 最後一版 code"):
+                        st.code(result["phase_a_code"], language="python")
+                if result.get("phase_b_code"):
+                    with st.expander("Phase B 最後一版 code"):
+                        st.code(result["phase_b_code"], language="python")
+
+            elif result["status"] == "completed":
+                status_box.update(
+                    label="✅ 分析完成", state="complete", expanded=False,
+                )
+                if result.get("is_followup"):
+                    st.caption("🔗 偵測為延續性分析")
+                # Plan
+                with st.expander("📋 Plan", expanded=False):
+                    st.markdown(result["plan_text"])
+                # Phase A
+                with st.expander(
+                    f"🪛 Phase A · Pandas filter "
+                    f"(撈出 {result['raw_df_info']['n_rows']:,} 列)",
+                    expanded=False,
+                ):
+                    st.code(result["phase_a_code"], language="python")
+                # Phase B
+                with st.expander(
+                    f"🐍 Phase B · Preprocess "
+                    f"(Q.shape={result['Q_info']['n_rows']} × "
+                    f"{len(result['Q_info']['columns'])})",
+                    expanded=False,
+                ):
+                    st.code(result["phase_b_code"], language="python")
+                # Q dataframe
+                with st.expander(f"📊 Q ({result['Q_info']['n_rows']:,} 列)",
+                                  expanded=False):
+                    st.dataframe(result["Q"].head(200),
+                                  use_container_width=True)
+                # Phase C
+                if result.get("phase_c_code"):
+                    with st.expander("🎨 Phase C · Chart code", expanded=False):
+                        st.code(result["phase_c_code"], language="python")
+                # 圖表
+                if result.get("use_table_fallback"):
+                    st.info("📋 Phase C 降級為表格(retry 3 次失敗)")
+                    st.dataframe(result["Q"], use_container_width=True)
+                elif chart_engine == "ECharts" and result.get("chart_option"):
+                    st_echarts(
+                        options=result["chart_option"],
+                        height="520px",
+                        key=f"echarts_live_{result['trace_id'][:8]}",
+                    )
+                elif chart_engine == "Plotly" and result.get("chart_fig"):
+                    st.plotly_chart(result["chart_fig"],
+                                     use_container_width=True)
+                # Phase D
+                if result.get("insight"):
+                    with st.expander("🧠 商業洞察", expanded=True):
+                        st.markdown(result["insight"])
+                # Trace id
+                st.caption(
+                    f"🔍 trace_id: `{result['trace_id'][:8]}` · "
+                    "可在 Task Traces page 查完整流程"
+                )
+                st.write("分析已完成,如上方資料、圖表與洞察所示。")
+
+        except Exception as e:
+            status_box.update(label="❌ 系統錯誤", state="error", expanded=True)
+            st.error(f"❌ 系統執行中斷:{type(e).__name__}: {e}")
+            import traceback as _tb
+            with st.expander("🔍 Traceback"):
+                st.code(_tb.format_exc(), language="bash")
+
 st.caption(
-    "🚧 下一步:Milestone 3 將把 confirmed metadata 接進 GenBI workflow,"
-    "讓你能對此 dataset 聊天分析。"
+    "🚧 下個 milestone:M3A 加 Saved Chart / Saved Metric / Analysis Template,"
+    "把成功的分析沉澱為可重用資產。"
 )

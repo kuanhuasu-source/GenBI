@@ -89,6 +89,7 @@ DEFAULT_TABLES_COLLECTION = "upload_tables"
 DEFAULT_PROFILES_COLLECTION = "upload_profiles"
 DEFAULT_METADATA_VERSIONS_COLLECTION = "upload_metadata_versions"
 DEFAULT_USER_CORRECTIONS_COLLECTION = "upload_user_corrections"
+DEFAULT_ANALYSIS_SESSIONS_COLLECTION = "analysis_sessions"
 
 
 class UploadRepository:
@@ -111,6 +112,7 @@ class UploadRepository:
         profiles_collection: str = DEFAULT_PROFILES_COLLECTION,
         metadata_versions_collection: str = DEFAULT_METADATA_VERSIONS_COLLECTION,
         user_corrections_collection: str = DEFAULT_USER_CORRECTIONS_COLLECTION,
+        analysis_sessions_collection: str = DEFAULT_ANALYSIS_SESSIONS_COLLECTION,
     ):
         """
         Args:
@@ -129,6 +131,8 @@ class UploadRepository:
         # M2+: metadata version + corrections
         self._metadata_versions = mongo_db[metadata_versions_collection]
         self._user_corrections = mongo_db[user_corrections_collection]
+        # M3+: analysis sessions(chat 對話 + Phase 0/A/B/C/D outputs)
+        self._analysis_sessions = mongo_db[analysis_sessions_collection]
 
     # ============================================================
     # Index management
@@ -156,6 +160,10 @@ class UploadRepository:
         # M2+: user_corrections
         self._user_corrections.create_index(
             [("dataset_id", 1), ("created_at", -1)],
+        )
+        # M3+: analysis_sessions
+        self._analysis_sessions.create_index(
+            [("dataset_id", 1), ("updated_at", -1)],
         )
 
     # ============================================================
@@ -456,6 +464,107 @@ class UploadRepository:
             self._user_corrections.find({"dataset_id": dataset_id})
             .sort("created_at", -1)
         )
+
+    # ============================================================
+    # analysis_sessions CRUD(M3+)
+    # ============================================================
+    def create_session(
+        self,
+        dataset_id: str,
+        metadata_version: int,
+        user: str = "anonymous",
+    ) -> str:
+        """為某 dataset 建一個新分析 session。
+
+        Args:
+            dataset_id: 上傳 dataset
+            metadata_version: 進入分析時 active 的 metadata version(綁定 lineage)
+            user: session owner
+
+        Returns:
+            session_id (str, format `sess_YYYYMMDDHHMMSS_<6hex>`)
+        """
+        import secrets
+        now = _dt.datetime.now(_dt.timezone.utc)
+        ts = now.strftime("%Y%m%d%H%M%S")
+        session_id = f"sess_{ts}_{secrets.token_hex(3)}"
+        doc = {
+            "_id": session_id,
+            "dataset_id": dataset_id,
+            "metadata_version": metadata_version,
+            "owner": user,
+            "messages": [],          # 對話歷史(user / assistant 交替)
+            "last_analysis": None,   # 給 follow-up 接續用
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._analysis_sessions.insert_one(doc)
+        return session_id
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        return self._analysis_sessions.find_one({"_id": session_id})
+
+    def list_sessions(
+        self,
+        dataset_id: str,
+        owner: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """列出某 dataset 下的最近 sessions(新到舊)。"""
+        query: dict[str, Any] = {"dataset_id": dataset_id}
+        if owner:
+            query["owner"] = owner
+        return list(
+            self._analysis_sessions.find(query)
+            .sort("updated_at", -1)
+            .limit(limit)
+        )
+
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        **extra,
+    ) -> bool:
+        """加一則 message 到 session(role='user' or 'assistant')。
+
+        `extra` 任何 key/value(例:phase_outputs / chart_intent / trace_id)
+        都會跟 role/content 一起存進該 message。
+        """
+        msg = {
+            "role": role,
+            "content": content,
+            "created_at": _dt.datetime.now(_dt.timezone.utc),
+            **extra,
+        }
+        result = self._analysis_sessions.update_one(
+            {"_id": session_id},
+            {
+                "$push": {"messages": msg},
+                "$set": {"updated_at": _dt.datetime.now(_dt.timezone.utc)},
+            },
+        )
+        return result.modified_count > 0
+
+    def update_last_analysis(
+        self,
+        session_id: str,
+        last_analysis: dict,
+    ) -> bool:
+        """更新 session.last_analysis(給 follow-up 偵測接續分析用)。"""
+        result = self._analysis_sessions.update_one(
+            {"_id": session_id},
+            {"$set": {
+                "last_analysis": last_analysis,
+                "updated_at": _dt.datetime.now(_dt.timezone.utc),
+            }},
+        )
+        return result.modified_count > 0
+
+    def delete_session(self, session_id: str) -> bool:
+        return self._analysis_sessions.delete_one(
+            {"_id": session_id}).deleted_count > 0
 
 
 def generate_dataset_id() -> str:

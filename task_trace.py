@@ -40,12 +40,21 @@ class TaskTrace:
     """
 
     def __init__(self, db: Any = None, domain: str = "",
-                  query: str = "", collection_name: str = "task_traces"):
+                  query: str = "", collection_name: str = "task_traces",
+                  source_type: str = "static"):
+        """
+        v0.12.0+:`source_type` 欄位
+            - 'static':schema-driven 路徑(既有 tflex / ecommerce / healthcare)
+            - 'upload':upload-driven 路徑(Upload Workspace)
+            Default 'static' — 既有 caller 不傳此參數,行為不變。
+            Self-learning loop 可透過此欄位分開統計兩條路徑的 failure rate。
+        """
         self.trace_id = str(uuid.uuid4())
         self.db = db
         self.collection_name = collection_name
         self.doc: dict = {
             "trace_id": self.trace_id,
+            "source_type": source_type,
             "domain": domain,
             "query": query,
             "started_at": _now_utc(),

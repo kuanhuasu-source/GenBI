@@ -1855,7 +1855,13 @@ class LLMService:
         # - DB enabled 時用 DB 版本(可線上編輯)
         # - DB disabled / 連不上 / 內容缺 時自動 fallback 到 inline
         # - 兩條路徑 byte-equal 才算正確(D3 驗證重點)
-        system_prompt = self._render_phase_0_plan_prompt()
+        #
+        # v0.12.0+: 對 upload-driven metadata(含 source_type='upload' 旗標),
+        # 走另一條 Phase 0 plan prompt 描述 A 段為 Pandas filter 而非 MongoDB pipeline。
+        # 既有 metadata 無 source_type key → fallthrough 走 'phase_0_plan' → byte-equal。
+        is_upload = (self.task_metadata or {}).get("source_type") == "upload"
+        prompt_key = "phase_0_plan_upload" if is_upload else "phase_0_plan"
+        system_prompt = self._render_phase_0_plan_prompt(prompt_key=prompt_key)
         # 接續分析時注入前次脈絡
         followup_preamble = build_followup_preamble(followup_context) if followup_context else ""
         user_msg = followup_preamble + f"需求:{query}\n請給出計畫:"
@@ -1869,30 +1875,36 @@ class LLMService:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def _render_phase_0_plan_prompt(self) -> str:
+    def _render_phase_0_plan_prompt(self, prompt_key: str = "phase_0_plan") -> str:
         """
         產生 Phase 0 plan system prompt。
 
         優先序:
-        1. PromptRepository.render() — 若 repo 可用且 enabled
+        1. PromptRepository.render(prompt_key) — 若 repo 可用且 enabled
         2. Inline f-string fallback — v0.2.x 行為
 
+        v0.12.0+: 加 `prompt_key` 參數
+          - "phase_0_plan"(default)— 既有 schema-driven 路徑 → inline 行為 byte-equal
+          - "phase_0_plan_upload" — Upload Workspace 路徑 → A 段描述為 Pandas filter
+
         驗證點(D3 byte-equal):
-            assert llm._render_phase_0_plan_prompt(via_repo=True) == _inline_version
+            assert llm._render_phase_0_plan_prompt() == _inline_phase_0_plan_prompt()
         """
         if self.prompt_repo is not None:
             try:
                 return self.prompt_repo.render(
-                    "phase_0_plan",
+                    prompt_key,
                     domain=self.domain,
                     domain_knowledge=self.domain_knowledge,
                 )
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning(
-                    f"Phase 0 prompt repo render 失敗,fallback to inline: {e}"
+                    f"Phase 0 prompt repo render `{prompt_key}` 失敗,fallback to inline: {e}"
                 )
-        # Inline fallback(跟 v0.2.x 完全一致)
+        # Inline fallback
+        if prompt_key == "phase_0_plan_upload":
+            return self._inline_phase_0_plan_upload_prompt()
         return self._inline_phase_0_plan_prompt()
 
     def _inline_phase_0_plan_prompt(self) -> str:
@@ -1990,6 +2002,153 @@ class LLMService:
    - 類別數 > 7 → 建議改 bar(可讀性較好),但仍走計畫不拒絕
    - 「dashboard / 執行摘要」場景 → 表格 + KPI 卡片
    ⚠️ 「pie chart 適不適合」是視覺化建議,**不是拒絕理由**;Step 3 已通過就一律走計畫。"""
+
+    # --------------------------------------------------------
+    # v0.12.0+ Phase 0 plan prompt for Upload Workspace
+    # 跟原版差別只在「A 段:資料獲取」描述為 Pandas filter,不是 MongoDB pipeline
+    # --------------------------------------------------------
+    def _inline_phase_0_plan_upload_prompt(self) -> str:
+        """v0.12.0+: Upload-driven Phase 0 plan prompt。
+
+        關鍵差異 vs `_inline_phase_0_plan_prompt`:
+        - A 段(資料獲取)描述為「從 source_df 用 Pandas filter 取 raw_df」
+          不是「從 MongoDB collection aggregate」
+        - 強調 source_df 已載入、欄位由 dynamic metadata 定義
+        - 禁止 import / 外部 IO / 新增不存在欄位
+        其他段落(Domain Knowledge / refuse 守則 / B/C 段)同 schema-driven 版本。
+        """
+        return f"""你是專業的 AI 商業智慧助理。請以上方 Domain Knowledge 為唯一依據規劃分析。
+此 dataset 是使用者上傳的檔案,**不在 MongoDB 中**,而是已以 Pandas DataFrame `source_df`
+形式載入。Phase A 不產生 MongoDB pipeline,而是產生 Pandas filter / selection code。
+
+{self.domain_knowledge}
+
+### 任務說明
+請把使用者問題拆解成三個小段,**用 markdown 三層標題包**。
+
+**A. 資料獲取 (Phase A · Pandas filter):**
+從 `source_df` 取得分析所需的明細列。
+- 只能 `filter` / `selection`(`source_df[...]` / `.loc[...]` / `.query(...)`)
+- **嚴禁** `groupby` / `agg` / `apply` 派生欄 — 那是 Phase B 的工作
+- **嚴禁** 新增 raw 沒有的欄位(`source_df['new_col'] = ...` 是 Phase B)
+- **嚴禁** `import` / `open` / `read_csv` / `os` / `subprocess` / 任何外部 IO
+- 變數名鎖死:輸出必須 `raw_df = source_df[...]` 之類
+- 若使用者問題明確列出實體值(例「Apparel 類別」「2024 年」),A 段必須帶上對應 filter
+
+**B. 資料處理 (Phase B · Pandas):**
+從 `raw_df` 計算 KPI、aggregate、轉成最終 `Q` DataFrame 給視覺化用。
+
+**C. 視覺化建議 (Phase C · ECharts/Plotly):**
+描述圖表類型 / 維度配置。
+- 類別數 ≤ 7 且 query 明確點名 pie chart → 走 pie 沒問題
+- 類別數 > 7 → 建議改 bar
+- 「dashboard / 執行摘要」場景 → 表格 + KPI 卡片
+
+### 拒絕協定 (Schema-Driven Refusal)
+若使用者問題觸犯 Domain Knowledge 中「資料限制」(missing_dimensions /
+not_supported_analysis),**第一個字元就輸出 `[REFUSE]`**,後面接說明:
+- 例:`[REFUSE] 此資料集無日期欄位,無法做趨勢分析。建議改看靜態分佈。`
+不在限制清單內的問題,即使資料品質有疑慮,也應該嘗試規劃 — Phase A/B/C 失敗會被
+retry 機制接住,**Phase 0 不該預先拒絕**。
+
+⚠️ 「pie chart 適不適合」是視覺化建議,**不是拒絕理由**;若 query 通過資料限制檢查,一律走計畫。"""
+
+    # --------------------------------------------------------
+    # v0.12.0+ Phase A · Pandas extraction(Upload Workspace)
+    # 對應 schema-driven 的 generate_pipeline,但產 Pandas code 而非 MongoDB JSON。
+    # 既有 generate_pipeline 完全不動,byte-equal 凍結條款不受影響。
+    # --------------------------------------------------------
+    def generate_pandas_extraction(
+        self,
+        query: str,
+        plan_text: str = "",
+        source_columns: list | None = None,
+        source_df_sample: str = "",
+        previous_code: str = "",
+        previous_error: str = "",
+    ) -> str:
+        """產 Pandas filter / selection code,從 `source_df` 取出 `raw_df`。
+
+        Args:
+            query: 使用者原問題
+            plan_text: Phase 0 plan output(用於提示)
+            source_columns: source_df 實際欄位 list(鎖死)
+            source_df_sample: source_df 前幾列 markdown 樣本
+            previous_code / previous_error: retry 時的回饋
+
+        Returns:
+            Python code 字串(無 ``` 圍欄,直接 exec)。caller 應在 namespace 內
+            提供 `pd` / `np` / `source_df`,exec 後檢查 `raw_df` 存在。
+        """
+        cols_info = (
+            f"`source_df` 已載入。實際欄位(鎖死,不可亂改名): {source_columns}"
+            if source_columns else "`source_df` 已載入,欄位未知。"
+        )
+        if source_df_sample:
+            cols_info += (
+                "\n\n### source_df 實際前 3 列樣本 (你必須以此為準,不要憑想像猜測):\n"
+                f"{source_df_sample}\n\n"
+                "⚠️ 上面沒列出的欄位,絕對禁止引用。"
+            )
+
+        system_prompt = f"""你是資料篩選工程師,負責 Upload Workspace 的【A. 資料獲取】。
+{cols_info}
+
+{self.domain_knowledge}
+
+### 任務
+從 `source_df` 取得分析所需的明細,輸出 `raw_df`(Pandas DataFrame)。
+Phase B 會收 `raw_df` 做後續聚合 / KPI 計算。
+
+### 實作守則 (CRITICAL FATAL RULES):
+1. 🎯【變數鎖死】最後必須有 `raw_df = ...`。Phase B 找不到 raw_df 就炸。
+2. 🚫【禁止 import】sandbox 只給 `pd`(pandas)、`np`(numpy)、`source_df`。
+   絕對禁止 `import xxx` / `from xxx import` — 寫了會直接拒絕執行。
+3. 🚫【禁止外部 IO】禁止 `open`、`read_csv`、`read_excel`、`os`、`subprocess`、
+   `requests`、`socket`、`eval`、`exec`、`__import__`。
+4. 🚫【禁止派生欄位】絕對禁止 `raw_df['new_col'] = ...` 或 `.assign(new=...)`。
+   新欄位是 Phase B 的工作;A 段只能 **filter** / **select column subset**。
+5. 🚫【禁止聚合】絕對禁止 `groupby`、`agg`、`pivot`、`merge`。同上,留給 Phase B。
+6. ✅【允許的操作】
+   - row filtering: `source_df[source_df['col']=='X']` / `.loc[...]` / `.query("...")`
+   - column subset(可選): `raw_df = source_df[['col_a', 'col_b']]`
+   - 多條件: `source_df[(source_df['a']=='X') & (source_df['b']>10)]`
+7. ✅【欄名鎖死】只能用 `source_columns` 中真實存在的欄位。
+8. 📌【Plan A 段】請嚴格遵照 Phase 0 plan 中 A 段提到的 filter 條件。
+
+### 輸出範例
+```python
+# 範例 1:單一條件 filter
+raw_df = source_df[source_df['<dim_col>'] == '<value>']
+
+# 範例 2:多條件 + 欄位 subset
+mask = (source_df['<col_a>'] == '<v1>') & (source_df['<col_b>'].notna())
+raw_df = source_df.loc[mask, ['<col_a>', '<col_b>', '<col_c>']]
+
+# 範例 3:無 filter 直接全帶(若 plan 沒列任何 filter)
+raw_df = source_df.copy()
+```
+
+請只輸出 Python code,不要前言不要 markdown。"""
+
+        user_msg = f"需求:{query}\n\n計畫:{plan_text}"
+        user_msg += self._format_retry_hint(
+            previous_code, previous_error,
+            phase="pandas_extraction",
+        )
+
+        _samp = self._resolve_phase_sampling(
+            "pipeline",   # 同 Phase A 路徑用 pipeline profile
+            is_retry=bool(previous_error),
+            fallback_temp=(0.15 if previous_error else self.default_temperature),
+        )
+        raw = self._call_llm(
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": user_msg}],
+            phase="pandas_extraction",
+            **_samp,
+        )
+        return self._strip_code_fence(raw, lang="python")
 
     # --------------------------------------------------------
     # Phase A: MongoDB pipeline
