@@ -700,6 +700,60 @@ Q = agg
 """
 
 
+_PHASE_B_BLOCK_HISTOGRAM = """
+### 📊 Histogram(分佈直方圖)骨架(query 含「分佈 / 直方圖 / histogram / distribution」)
+
+⚠️ 本場景跟一般 groupby 不一樣:沒有「分組維度」,要對**單一數值欄做 binning**,
+   產出「每個 bin 的 count」+ 可選的 marker scalar(平均 / 中位數 / P95)。
+
+✅ 標準骨架:
+```python
+import numpy as np   # ← np 已在 namespace,不需 import,只是顯示語法
+
+# 1. 抽出要分箱的數值欄(從 raw_df 取,dropna)
+_target_col = '<numeric_col>'         # 從 query / plan 推哪個欄位要看分佈
+_values = raw_df[_target_col].dropna().astype(float)
+
+# 2. 用 np.histogram 切 bins(預設 10 bins,可依資料量微調)
+_bins = 10
+_counts, _edges = np.histogram(_values, bins=_bins)
+
+# 3. 組 long-format Q,每列代表一個 bin
+_bin_labels = [
+    f"{int(_edges[i]):,}-{int(_edges[i+1]):,}"
+    for i in range(len(_counts))
+]
+_bin_midpoints = (_edges[:-1] + _edges[1:]) / 2
+
+# 4. 計 marker scalar(平均 / 中位數 / P95)— 廣播到每列
+_avg = float(_values.mean())
+_median = float(_values.median())
+_p95 = float(_values.quantile(0.95))
+
+Q = pd.DataFrame({
+    'bin_label':    _bin_labels,
+    'bin_midpoint': _bin_midpoints.tolist(),
+    'count':        _counts.tolist(),
+    f'avg_{_target_col}':    [_avg]    * len(_counts),
+    f'median_{_target_col}': [_median] * len(_counts),
+    f'p95_{_target_col}':    [_p95]    * len(_counts),
+})
+```
+
+🚫 嚴禁:
+- 把 raw_df **直接** 丟給 Phase C(`Q = raw_df.copy()`)— Phase C 不該再 bin,
+  bin 是 Phase B 的工作。
+- 用 `pd.cut` + `value_counts`(順序不穩定;`np.histogram` 才保證 edges 有序)。
+- 對「平均/中位數/P95」用 `pd.DataFrame({'avg': mean})` 這種 scalar 寫法(會炸 ValueError)。
+  用 `[scalar] * len(counts)` 廣播。
+
+⚠️ Q.columns 預期格式:
+   ['bin_label', 'bin_midpoint', 'count',
+    f'avg_<col>', f'median_<col>', f'p95_<col>']
+   Phase C 會用 `bin_midpoint` 當 x、`count` 當 y、scalar markers 畫 markLine。
+"""
+
+
 _PHASE_B_BLOCK_SIMPLE_GROUPBY = """
 ### 📊 基本 groupby + agg 骨架(default fallback)
 
@@ -736,6 +790,7 @@ _PHASE_B_INTENT_BLOCKS: dict[str, str] = {
     "stacked_wide": _PHASE_B_BLOCK_STACKED_WIDE,
     "ratio_kpi": _PHASE_B_BLOCK_RATIO_KPI,
     "time_series": _PHASE_B_BLOCK_TIME_SERIES,
+    "histogram": _PHASE_B_BLOCK_HISTOGRAM,    # v0.13.1
     "simple_groupby": _PHASE_B_BLOCK_SIMPLE_GROUPBY,
 }
 
@@ -1308,6 +1363,97 @@ option = {
 """
 
 
+_PHASE_C_BLOCK_HISTOGRAM = """
+### 📊 Histogram(分佈直方圖)配方(query 含「分佈 / 直方圖 / histogram / distribution」)
+
+🚨【ECharts 沒有 histogram type — CRITICAL FATAL v0.13.1】
+`type: "histogram"` 是 **不存在的 ECharts series type**,渲染器拿到 `undefined` 後
+`getProgressive` 在 undefined 上 throw BidiComponent Error。**絕對禁止寫 `"type": "histogram"`**。
+
+✅ 正解:用 `type: "bar"` + value-axis xAxis + bin_midpoint x 座標 + `markLine` 標記。
+
+🎯【Phase B 已做的事】Q 是 pre-binned long-format,典型 columns:
+   - `bin_label`(字串如 `"0-10000"`,用於 tooltip 顯示)
+   - `bin_midpoint`(float,bin 中點,用於 bar 的 x 座標)
+   - `count`(int,每個 bin 的筆數,用於 bar 的 y 座標)
+   - `avg_<col>` / `median_<col>` / `p95_<col>`(scalar broadcast 每列同值)
+
+🎯【你的工作】用 bar 畫 bin,用 markLine 畫 marker。
+
+✅ 標準配方:
+```python
+# 從 Q 抽 scalar markers(假設 Q.columns 含 avg_hc / median_hc / p95_hc)
+_marker_cols = [c for c in Q.columns if any(c.startswith(p) for p in ('avg_', 'median_', 'p95_'))]
+
+# 組 [x, y] pair 給 value-axis bar
+_bar_data = [
+    [float(Q['bin_midpoint'].iloc[i]), int(Q['count'].iloc[i])]
+    for i in range(len(Q))
+]
+
+option = {
+    "title": {"text": "<指標名> 分佈直方圖", "left": "center"},
+    "tooltip": {
+        "trigger": "item",
+        "formatter": "Bin: {b}<br/>Count: {c}",
+    },
+    "xAxis": {"type": "value", "name": "<value 軸名>"},
+    "yAxis": {"type": "value", "name": "頻率 / Count"},
+    "color": ["#5470c6", "#91cc75", "#fac858", "#ee6666"],
+    "series": [{
+        "name": "分佈",
+        "type": "bar",                       # ★ 永遠是 bar,不是 histogram
+        "barWidth": "95%",                   # 接近相鄰,模擬連續直方
+        "data": _bar_data,
+        "label": {"show": False},
+        "markLine": {
+            "symbol": "none",
+            "label": {
+                "position": "insideEndTop",
+                "formatter": "{b}: {c}",
+            },
+            "data": [
+                {
+                    "name": "平均",
+                    "xAxis": float(Q['avg_<col>'].iloc[0]),
+                    "lineStyle": {"color": "#91cc75", "width": 2, "type": "dashed"},
+                },
+                {
+                    "name": "中位數",
+                    "xAxis": float(Q['median_<col>'].iloc[0]),
+                    "lineStyle": {"color": "#fac858", "width": 2, "type": "dashed"},
+                },
+                {
+                    "name": "P95",
+                    "xAxis": float(Q['p95_<col>'].iloc[0]),
+                    "lineStyle": {"color": "#ee6666", "width": 2, "type": "dashed"},
+                },
+            ],
+        },
+    }],
+    "grid": {"left": 60, "right": 30, "top": 60, "bottom": 60},
+}
+```
+
+⚠️【記得替換 `<col>`】上面範例的 `Q['avg_<col>']` 必須換成 q_columns 中**實際存在**的 marker 欄名
+   (查 `_marker_cols` 或直接看 q_columns)。若 q_columns 沒有 marker 欄位(只有 bin_label/midpoint/count),
+   就不要寫 markLine,只畫 bar 就好。
+
+🚫 嚴禁:
+- ❌ `"type": "histogram"`(不存在的 type — 一定會炸 BidiComponent Error)
+- ❌ 獨立 `type: "line"` series 模擬垂直 marker(`data: [[x, 0], [x, 100]]`)
+       — yAxis range mismatch + 多餘 series 干擾 legend。**用 markLine**。
+- ❌ 把 `Q['<原始 col>'].tolist()` 當 bar.data(那是 raw 值,沒 bin 過 — Phase B 應該已 bin)。
+       若 Q 真的沒 bin 過(只有 raw),倒退用 `np.histogram(Q['<col>'])` 自己 bin 再餵 bar。
+- ❌ xAxis.type = "category" + `data: bin_labels`(markLine.xAxis 對 category axis 是 index,
+       不是 value,marker 對不齊真實值。**用 xAxis.type = "value" + bin_midpoint**)。
+
+🎨【樣式建議】
+- barWidth 用 "95%" 模擬直方圖鄰接(預設 60% 太細,看起來像離散 bar)
+- markLine 顏色:平均=綠 / 中位數=黃 / P95=紅,符合「越右越偏」直覺
+"""
+
+
 _PHASE_C_BLOCK_KPI_TABLE = """
 ### 📋 KPI Table + Cards 配方(query 含「KPI / dashboard / 一覽 / 執行摘要」)
 
@@ -1525,6 +1671,7 @@ _PHASE_C_INTENT_BLOCKS: dict[str, str] = {
     "stacked_raw_horizontal": _PHASE_C_BLOCK_STACKED_RAW_HORIZONTAL,   # v0.9.1
     "line_dual": _PHASE_C_BLOCK_LINE_DUAL,
     "heatmap": _PHASE_C_BLOCK_HEATMAP,
+    "histogram": _PHASE_C_BLOCK_HISTOGRAM,   # v0.13.1
     "bar_horizontal": _PHASE_C_BLOCK_HORIZONTAL,
     "line_single": _PHASE_C_BLOCK_LINE_SINGLE,
     "scatter": _PHASE_C_BLOCK_SCATTER,

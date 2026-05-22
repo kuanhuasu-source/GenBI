@@ -1114,6 +1114,14 @@ _CHART_KPI_TABLE_WORDS = ('kpi 一覽', 'dashboard', '儀表板', '執行摘要'
                             'executive summary')
 _CHART_GROUPED_WORDS = ('並排', 'grouped', 'side-by-side', '分別看',
                          '分組比較')
+# v0.13.1:Histogram(分佈直方圖)— ECharts 沒有 histogram type,
+# 需要 Phase B 用 np.histogram 預 bin,Phase C 用 bar + markLine
+_CHART_HISTOGRAM_WORDS = ('直方圖', '分佈圖', '分布圖', 'histogram',
+                           'distribution plot', 'frequency distribution',
+                           '頻率分佈', '頻率分布', '頻次分佈', '頻次分布',
+                           '分佈直方', '分布直方')
+# 註:不加單字「分佈」/「distribution」— 太 ambiguous,
+# 可能是 stacked / pie / histogram。需明確 compound 詞(直方圖 / distribution plot)才觸發。
 
 
 def _has_any(haystack: str, needles: tuple) -> bool:
@@ -1196,6 +1204,9 @@ def _detect_chart_intent(query: str) -> str:
     # ━━━ Tier 2:強單關鍵字(明示圖型)━━━
     if _has_any(query, _CHART_HEATMAP_WORDS):
         return "heatmap"
+    # v0.13.1:histogram 是強信號(直方圖 / distribution 都明示),優先於 pie / scatter / bar
+    if _has_any(query, _CHART_HISTOGRAM_WORDS):
+        return "histogram"
     if _has_any(query, _CHART_PIE_WORDS):
         return "pie"
     if _has_any(query, _CHART_SCATTER_WORDS):
@@ -1299,6 +1310,10 @@ def _detect_preprocess_intent(query: str,
         return "stacked_long_pct"
     if has_stack:
         return "stacked_wide"
+
+    # v0.13.1:histogram 需特殊 binning 預處理(np.histogram),優先於其他 intent
+    if _has_any(query, _CHART_HISTOGRAM_WORDS):
+        return "histogram"
 
     # time_series 需要 schema-level 確認(domain 沒時間欄不該走這條)
     if _has_any(query, _TIMESERIES_WORDS) and _metadata_has_time_col(metadata):
