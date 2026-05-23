@@ -418,7 +418,33 @@ def build_metadata(
     for prof, sem in zip(column_profiles, enriched_results):
         col_name = prof["name"]
         role = sem.get("role", "unknown")
-        props = ROLE_PROPERTIES.get(role, ROLE_PROPERTIES["unknown"])
+
+        # M4b+: PII override — pii_info.is_pii=True 強制蓋成 semantic_role='pii'
+        # 並把 pii_info 寫進 field metadata 給 LLM prompt 用
+        pii_info = prof.get("pii_info") or {}
+        is_pii = bool(pii_info.get("is_pii"))
+        if is_pii:
+            role = "pii"
+            sem["role"] = "pii"
+            sem["confidence"] = max(sem.get("confidence", 0.0),
+                                      float(pii_info.get("confidence", 0.0)))
+            sem["reason"] = (
+                f"PII detected ({pii_info.get('pii_type')}): "
+                f"{pii_info.get('reason', '')}"
+            )
+
+        props = ROLE_PROPERTIES.get(role, ROLE_PROPERTIES.get("unknown"))
+        # M4b+: PII role 沒在 ROLE_PROPERTIES,sentinel(LLM prompt 看到 pii 就跳過 chart label)
+        if role == "pii" and (not props or "default_aggregation" not in props):
+            props = {
+                "default_aggregation": "no_agg",
+                "recommended_use": ["label_only", "count_distinct"],
+                "not_recommended_use": ["display_in_chart", "list_in_insight",
+                                          "sum", "average"],
+                "is_dimension": False,
+                "is_measure": False,
+                "is_identifier": True,   # PII 通常含 identifier 性質
+            }
 
         # allowed_values 從 categorical_status / boolean_flag 自動補
         allowed_values = None

@@ -234,6 +234,23 @@ def profile_column(series: pd.Series, column_name: str) -> dict[str, Any]:
         warnings.append("high_null")
 
     profile["warnings"] = warnings
+
+    # M4b+: PII 偵測 — 結果存 pii_info 子欄位
+    try:
+        from pii_detector import detect_pii_in_column
+        profile["pii_info"] = detect_pii_in_column(
+            column_name=column_name,
+            sample_values=profile.get("sample_values", []),
+            physical_type=physical_type,
+        )
+    except Exception as _pe:
+        # pii detector 失敗不該擋 profiling
+        logger.warning(f"pii_detector failed for `{column_name}`: {_pe}")
+        profile["pii_info"] = {
+            "is_pii": False, "pii_type": None,
+            "confidence": 0.0, "reason": "",
+        }
+
     return profile
 
 
