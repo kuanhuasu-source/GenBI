@@ -1,0 +1,11 @@
+project_id,start_date,end_date,leadtime,status
+PRJ-001,2025-01-15,2025-02-26,42,Completed
+PRJ-002,2025-01-20,2025-05-28,128,Completed
+PRJ-003,2025-02-10,,210,InProgress
+PRJ-004,2025-03-01,2025-05-07,67,Completed
+PRJ-005,2025-03-15,2025-06-18,95,Completed
+PRJ-006,2025-04-01,2025-05-09,38,Completed
+PRJ-007,2025-04-10,,150,InProgress
+PRJ-008,2025-05-02,2025-05-30,28,Completed
+PRJ-009,2025-05-15,,180,InProgress
+PRJ-010,2025-06-01,2025-07-26,55,Completed

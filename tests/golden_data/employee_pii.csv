@@ -1,0 +1,9 @@
+employee_id,full_name,email,phone,department,salary
+E1001,Alice Chen,alice.chen@example.com,0912-345-678,Engineering,95000
+E1002,Bob Wang,bob.w@company.org,0987-654-321,Marketing,72000
+E1003,Carol Lin,carol.lin@example.com,0922-111-222,Engineering,110000
+E1004,Dave Liu,dave.liu@company.org,0933-444-555,Sales,68000
+E1005,Eve Wu,eve@example.com,0966-777-888,Engineering,88000
+E1006,Frank Wang,frank.w@company.org,0911-222-333,Marketing,75000
+E1007,Grace Lee,grace.lee@example.com,0955-666-999,Sales,82000
+E1008,Henry Tsai,henry.tsai@company.org,0977-888-444,Engineering,105000

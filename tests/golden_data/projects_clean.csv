@@ -1,0 +1,16 @@
+project_id,project_name,leadtime,status,category,owner
+PRJ-001,Customer portal redesign,42,Completed,Web,Alice
+PRJ-002,Mobile app v2,128,Completed,Mobile,Bob
+PRJ-003,Data warehouse migration,210,InProgress,Infra,Carol
+PRJ-004,Legacy decommission,67,Completed,Infra,Dave
+PRJ-005,New CRM integration,95,Completed,Backend,Eve
+PRJ-006,Marketing dashboard,38,Completed,Web,Alice
+PRJ-007,Inventory sync API,150,InProgress,Backend,Bob
+PRJ-008,Mobile push notifications,28,Completed,Mobile,Carol
+PRJ-009,Search service v3,180,InProgress,Backend,Dave
+PRJ-010,Help center revamp,55,Completed,Web,Eve
+PRJ-011,Analytics pipeline,134,Completed,Infra,Alice
+PRJ-012,Payment gateway upgrade,72,Completed,Backend,Bob
+PRJ-013,User onboarding flow,46,Completed,Web,Carol
+PRJ-014,Notification service,110,InProgress,Backend,Dave
+PRJ-015,Mobile offline sync,90,Completed,Mobile,Eve

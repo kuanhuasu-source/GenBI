@@ -1,0 +1,11 @@
+record_id,score,note
+R-001,87,passed
+R-002,92,passed
+R-003,TBD,abnormal
+R-004,76,passed
+R-005,TBD,abnormal
+R-006,88,passed
+R-007,45,failed
+R-008,TBD,abnormal
+R-009,91,passed
+R-010,68,passed

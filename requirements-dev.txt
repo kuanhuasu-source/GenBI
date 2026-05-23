@@ -1,0 +1,5 @@
+# Test / dev-only dependencies(M4a+)
+# 線上 production 不需要,本機跑測試才裝
+pytest>=7.4.0
+pytest-cov>=4.1.0
+mongomock>=4.1.0   # MongoDB in-memory mock,unit test 不需要本機 mongod

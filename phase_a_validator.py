@@ -60,8 +60,10 @@ logger = logging.getLogger(__name__)
 # Forbidden tokens
 # ============================================================
 # Module import 系列(任何形式)
+# - `import xxx` / `from xxx import yyy` 必須行首
+# - `__import__(...)` 任何位置都不允許(常見繞道手法)
 _FORBIDDEN_IMPORT_RE = re.compile(
-    r"^\s*(?:import\s+\w+|from\s+\w+\s+import|__import__\s*\()",
+    r"^\s*(?:import\s+\w+|from\s+\w+\s+import)|__import__\s*\(",
     re.MULTILINE,
 )
 
@@ -190,7 +192,8 @@ def _check_no_derived_columns(code: str) -> list[str]:
     # `raw_df['x'] = ...` (excluding read which is different syntax)
     if re.search(r"raw_df\s*\[\s*['\"][^'\"]+['\"]\s*\]\s*=", code):
         derived_hits.append("raw_df['<col>'] = ...")
-    if re.search(r"raw_df\.assign\s*\(", code):
+    # `.assign(` 任何 DataFrame(raw_df / source_df)都不該派生 — generic
+    if re.search(r"\.assign\s*\(", code):
         derived_hits.append(".assign(...)")
     if re.search(r"\.groupby\s*\(", code):
         derived_hits.append(".groupby(...)")

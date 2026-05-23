@@ -1,0 +1,9 @@
+project_id,leadtime,category,owner
+PRJ-001,42,Web,Alice
+PRJ-002,128,Mobile,Bob
+PRJ-003,210,Infra,Carol
+PRJ-004,67,Infra,Dave
+PRJ-005,95,Backend,Eve
+PRJ-006,38,Web,Alice
+PRJ-007,150,Backend,Bob
+PRJ-008,28,Mobile,Carol
