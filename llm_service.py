@@ -1433,7 +1433,8 @@ class LLMService:
                  task_metadata: dict | None = None,
                  prompt_repo=None,
                  domain: str = "tflex",
-                 model_profile: dict | None = None):
+                 model_profile: dict | None = None,
+                 disable_thinking: bool = False):
         """
         參數預設指向 Ollama (localhost:11434);
         若你在用 vLLM,把 api_url 改成 http://localhost:8000/v1/chat/completions、
@@ -1465,6 +1466,9 @@ class LLMService:
         self.domain = domain
         # v0.10.6+ phase → sampling profile;None = legacy hardcoded fallback
         self.model_profile = model_profile or {}
+        # v0.13.3+: Ollama Qwen 3.6 thinking toggle(對 Qwen 3.6 等 thinking 模型有效)
+        # default False = 既有 schema-driven byte-equal,不加 extra_body
+        self.disable_thinking = bool(disable_thinking)
 
         # ── 載入並組裝 domain knowledge / few-shot ──
         if task_metadata is None:
@@ -1599,6 +1603,12 @@ class LLMService:
         }
         if presence_penalty is not None:
             _create_kwargs["presence_penalty"] = presence_penalty
+        # v0.13.3+: Ollama Qwen 3.6 thinking toggle
+        # 對 thinking 模型(/no_think prompt directive 在 Qwen 3.6 失效),
+        # 必須走 Ollama API extra_body={"think": False}。對不支援此 key 的 backend
+        # (OpenAI 雲端 / vLLM 部分版本)會被 ignore,不影響;對 Ollama Qwen 3.6 才真關。
+        if self.disable_thinking:
+            _create_kwargs["extra_body"] = {"think": False}
         t0 = time.time()
         try:
             response = self.client.chat.completions.create(**_create_kwargs)

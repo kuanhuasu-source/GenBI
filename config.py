@@ -157,6 +157,15 @@ LLM_TIMEOUT_S: float = float(
 
 LLM_TEMPERATURE: float = float(os.getenv("HRDA_MODEL_TEMPERATURE", "0.0"))
 
+# v0.13.3+: Ollama Qwen 3.6 thinking toggle
+# 對 thinking 模型(如 qwen3.6:27b),Ollama API 走 extra_body={"think": False}
+# 才能真關 thinking(legacy /no_think directive 只 work 在 Qwen 3.5)。
+# Default False — 既有 schema-driven 行為 byte-equal,不影響 baseline。
+# 對 Qwen 3.6 / 其他 thinking 模型才設 true 省 token + latency。
+LLM_DISABLE_THINKING: bool = os.getenv(
+    "HRDA_MODEL_DISABLE_THINKING", "false",
+).lower() in ("true", "1", "yes")
+
 
 def llm_service_kwargs() -> dict:
     """回傳可直接 `LLMService(**kwargs)` 使用的 dict。
@@ -175,6 +184,7 @@ def llm_service_kwargs() -> dict:
         "timeout_s": LLM_TIMEOUT_S,
         "default_temperature": LLM_TEMPERATURE,
         "model_profile": MODEL_PROFILE,
+        "disable_thinking": LLM_DISABLE_THINKING,    # v0.13.3+
     }
 
 
@@ -248,6 +258,7 @@ def print_summary() -> None:
     print(f"  LLM api_key      : {mask_secret(LLM_API_KEY)}")
     print(f"  LLM temperature  : {LLM_TEMPERATURE}")
     print(f"  LLM profile      : {MODEL_PROFILE_NAME}")
+    print(f"  Disable thinking : {LLM_DISABLE_THINKING}")
     print(f"  MongoDB URI      : {MONGO_URI}")
     print(f"  MongoDB DB       : {MONGO_DB}")
     print(f"  Mongo app coll   : {MONGO_COLL_APPLICATIONS}")

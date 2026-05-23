@@ -1471,6 +1471,7 @@ def main() -> int:
         prompt_repo=prompt_repo,
         domain=args.domain,
         model_profile=LLM_MODEL_PROFILE,  # v0.10.6.1
+        disable_thinking=config.LLM_DISABLE_THINKING,  # v0.13.3
     )
 
     results = []

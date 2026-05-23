@@ -852,6 +852,7 @@ def _get_upload_llm_service(_dataset_id: str, _md_version: int, _mongo_db):
         prompt_repo=None,
         domain=_dataset_id,
         model_profile=config.MODEL_PROFILE,
+        disable_thinking=config.LLM_DISABLE_THINKING,  # v0.13.3
     )
 
 
