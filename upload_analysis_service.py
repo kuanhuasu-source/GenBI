@@ -61,6 +61,7 @@ import file_parser
 import phase_a_validator
 import phase_b_validator
 import phase_c_validator
+from safe_exec import safe_exec_pandas, check_dataframe_limits
 from llm_service import (
     is_dashboard_query,
     sanitize_pipeline,
@@ -326,6 +327,12 @@ class UploadAnalysisService:
         except Exception:
             source_sample_md = source_df.head(3).to_string(index=False)
 
+        # v0.14.2+: 檢查 source_df 沒爆 row/col limit(MVP 100K rows)
+        ok, limit_err = check_dataframe_limits(source_df, max_rows=100_000)
+        if not ok:
+            trace.finalize(status="failed", error=limit_err)
+            return self._error_result(limit_err, trace=trace)
+
         phase_a_code = None
         phase_a_err = None
         raw_df: pd.DataFrame | None = None
@@ -343,14 +350,30 @@ class UploadAnalysisService:
                         previous_error=phase_a_err if attempt > 0 else "",
                     )
 
-                ns = _build_phase_a_namespace(source_df)
+                # v0.14.2+: 走 safe_exec sandbox(restricted builtins + timeout +
+                # output validation),取代裸 exec
                 with trace.step(f"phase_a_exec_attempt_{attempt + 1}"):
-                    exec(phase_a_code, ns, ns)
+                    exec_result = safe_exec_pandas(
+                        code=phase_a_code,
+                        inputs={"source_df": source_df},
+                        expected_output_var="raw_df",
+                        timeout_s=30.0,
+                        max_rows=100_000,
+                    )
+                if not exec_result.success:
+                    # safe_exec 失敗 → 轉成 exception 走 retry loop
+                    raise RuntimeError(
+                        f"[{exec_result.error_type}] {exec_result.error}"
+                    )
 
-                # Validator
+                # Validator(static check on code + dynamic check on ns)
+                _validator_ns = {
+                    "raw_df": exec_result.output,
+                    "source_df": source_df,
+                }
                 issues = phase_a_validator.validate_phase_a_output(
                     code=phase_a_code,
-                    exec_namespace=ns,
+                    exec_namespace=_validator_ns,
                     source_columns=source_columns,
                 )
                 if issues and attempt < 2:
@@ -360,14 +383,7 @@ class UploadAnalysisService:
                 elif issues:
                     logger.warning(f"Phase A validator 3 次都失敗:{issues}")
 
-                raw_df = ns.get("raw_df")
-                if not isinstance(raw_df, pd.DataFrame) or len(raw_df) == 0:
-                    if attempt < 2:
-                        phase_a_err = (
-                            "[A_NO_RAW_DF] 執行後 raw_df 不存在 或為空 DataFrame"
-                        )
-                        continue
-                    raise ValueError("Phase A 3 次都產空 raw_df")
+                raw_df = exec_result.output
                 break
             except Exception:
                 phase_a_err = traceback.format_exc()
@@ -385,6 +401,7 @@ class UploadAnalysisService:
 
         # ────────────────────────────────────────
         # Phase B: Pandas processing(reuse 既有 generate_preprocess_code)
+        # v0.14.2+: 走 safe_exec(同 Phase A)
         # ────────────────────────────────────────
         workflow_ns: dict = {"pd": pd, "np": np, "raw_df": raw_df}
         dashboard_mode = is_dashboard_query(query)
@@ -412,14 +429,20 @@ class UploadAnalysisService:
                     )
 
                 with trace.step(f"phase_b_exec_attempt_{attempt + 1}"):
-                    exec(phase_b_code, workflow_ns, workflow_ns)
-
-                Q = workflow_ns.get("Q")
-                if Q is None:
-                    raise ValueError("Phase B 未產生 Q")
-                if isinstance(Q, pd.Series):
-                    Q = Q.to_frame().reset_index()
-                    workflow_ns["Q"] = Q
+                    exec_result = safe_exec_pandas(
+                        code=phase_b_code,
+                        inputs={"raw_df": raw_df},
+                        expected_output_var="Q",
+                        timeout_s=60.0,    # Phase B 比 A 重(groupby/agg)
+                        max_rows=100_000,
+                    )
+                if not exec_result.success:
+                    raise RuntimeError(
+                        f"[{exec_result.error_type}] {exec_result.error}"
+                    )
+                Q = exec_result.output
+                # safe_exec 已自動 Series → DataFrame,workflow_ns 同步
+                workflow_ns["Q"] = Q
 
                 # Phase B semantic validator
                 issues = phase_b_validator.validate_phase_b_output(

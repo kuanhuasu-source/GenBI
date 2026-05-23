@@ -1287,6 +1287,196 @@ if last_result and last_result.get("status") == "completed":
         "🔗 已保存的 assets 在 **Saved Assets** page 瀏覽 / 重執行 / 重命名 / 刪除。"
     )
 
+st.divider()
+
+# ============================================================
+# 1️⃣2️⃣ · Debug Panel(M4c · spec §15)
+# ============================================================
+# 統一彙整本 page 各 phase / session / metadata / asset 的觀測點,給開發者除錯
+# + 給使用者看分析過程透明度
+st.markdown("### 1️⃣2️⃣ Debug Panel")
+
+debug_tabs = st.tabs([
+    "🗂 Dataset / Session",
+    "📜 Metadata history",
+    "🤖 Last analysis trace",
+    "💾 Assets summary",
+    "⚙️ System status",
+])
+
+# ── Tab 1:Dataset / Session 基本資訊 ──
+with debug_tabs[0]:
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Dataset", selected_id[:24] + "…" if len(selected_id) > 24 else selected_id)
+    col_b.metric("Tables", len(tables))
+    col_c.metric("Metadata version", md_version)
+    col_d.metric("Status", md_status)
+    if active_sid:
+        st.caption(f"📍 Active session: `{active_sid}` · "
+                   f"messages: {len(session_doc.get('messages', []))} · "
+                   f"created_at: {session_doc.get('created_at')}")
+        with st.expander("Session raw doc(JSON)", expanded=False):
+            # 拿掉 messages 細節以免太大
+            display_doc = {k: v for k, v in session_doc.items() if k != "messages"}
+            display_doc["messages_count"] = len(session_doc.get("messages", []))
+            st.json(display_doc, expanded=False)
+
+# ── Tab 2:Metadata version 歷史 ──
+with debug_tabs[1]:
+    versions = repo.list_metadata_versions(selected_id)
+    if not versions:
+        st.caption("尚無 metadata version")
+    else:
+        rows = []
+        for v in versions:
+            rows.append({
+                "version": v["version"],
+                "active": "✅" if v.get("is_active") else "",
+                "status": v.get("confirmation_status", "?"),
+                "by": v.get("confirmed_by") or v.get("created_by", "system"),
+                "created_at": v.get("created_at"),
+                "notes": (v.get("notes") or "")[:60],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                      hide_index=True, height=min(35 + len(rows) * 35, 320))
+    # User corrections audit
+    corrections = repo.list_corrections(selected_id)
+    if corrections:
+        st.markdown(f"**📝 User corrections audit ({len(corrections)} entries)**")
+        with st.expander("展開 correction 詳細", expanded=False):
+            for c in corrections[:10]:
+                st.caption(
+                    f"v{c.get('metadata_version_before')} → v{c.get('metadata_version_after')} · "
+                    f"{c.get('created_by')} · {c.get('created_at')}"
+                )
+                for delta in c.get("corrections", [])[:5]:
+                    st.code(
+                        f"  {delta.get('target')}: "
+                        f"{delta.get('old_value')!r} → {delta.get('new_value')!r}",
+                        language="text",
+                    )
+
+# ── Tab 3:Last analysis trace(spec §15 phase outputs / retry logs / tokens) ──
+with debug_tabs[2]:
+    last_res = st.session_state.get(f"_last_result_{active_sid}")
+    if not last_res:
+        st.caption("尚無分析結果 — 在 Section 10 跑一個 query 後此處會顯示細節")
+    else:
+        status = last_res.get("status", "?")
+        trace_id = last_res.get("trace_id", "—")
+        col_s, col_t = st.columns(2)
+        col_s.metric("Status", status)
+        col_t.metric("Trace ID", trace_id[:12] if trace_id else "—")
+        # Phase outputs sizes
+        phase_sizes = {
+            "Phase 0 plan": len(last_res.get("plan_text") or ""),
+            "Phase A code": len(last_res.get("phase_a_code") or ""),
+            "Phase B code": len(last_res.get("phase_b_code") or ""),
+            "Phase C code": len(last_res.get("phase_c_code") or ""),
+            "Insight": len(last_res.get("insight") or ""),
+        }
+        st.markdown("**Phase output size (chars)**")
+        st.dataframe(pd.DataFrame(
+            list(phase_sizes.items()), columns=["Phase", "Size"]
+        ), use_container_width=True, hide_index=True)
+        # Q info
+        q_info = last_res.get("Q_info") or {}
+        if q_info:
+            st.markdown(
+                f"**Q after Phase B**: {q_info.get('n_rows', 0):,} rows × "
+                f"{len(q_info.get('columns', []))} cols → "
+                f"`{q_info.get('columns', [])}`"
+            )
+        # Raw_df info
+        rdf_info = last_res.get("raw_df_info") or {}
+        if rdf_info:
+            st.markdown(
+                f"**raw_df after Phase A**: {rdf_info.get('n_rows', 0):,} rows × "
+                f"{len(rdf_info.get('columns', []))} cols"
+            )
+        # Fallback reason
+        if last_res.get("use_table_fallback"):
+            st.warning("⚠️ Phase C 降級為 table fallback — LLM 3 次未產出有效 chart")
+        # Connect to Task Traces page
+        if trace_id and trace_id != "—":
+            st.caption(
+                f"🔍 完整 LLM messages + tokens 請見 **Task Traces** page, "
+                f"trace_id=`{trace_id}`"
+            )
+
+# ── Tab 4:Assets summary ──
+with debug_tabs[3]:
+    all_assets = repo.list_assets(dataset_id=selected_id, include_inactive=True)
+    if not all_assets:
+        st.caption("尚無 saved asset")
+    else:
+        by_type: dict[str, int] = {}
+        active_count = 0
+        for a in all_assets:
+            t = a.get("asset_type", "?")
+            by_type[t] = by_type.get(t, 0) + 1
+            if a.get("is_active"):
+                active_count += 1
+        col_t, col_a = st.columns(2)
+        col_t.metric("Total assets", len(all_assets),
+                      f"{active_count} active")
+        col_a.metric("By type",
+                      " / ".join(f"{k}:{v}" for k, v in by_type.items()))
+        with st.expander("Asset list (latest 10)", expanded=False):
+            asset_rows = [
+                {
+                    "id": a["_id"][:24] + "…" if len(a["_id"]) > 24 else a["_id"],
+                    "type": a.get("asset_type"),
+                    "name": a.get("name"),
+                    "md_v": a.get("metadata_version"),
+                    "active": "✅" if a.get("is_active") else "—",
+                    "created_at": a.get("created_at"),
+                }
+                for a in all_assets[:10]
+            ]
+            st.dataframe(pd.DataFrame(asset_rows),
+                          use_container_width=True, hide_index=True)
+
+# ── Tab 5:System status(spec §14 / §15 security limits) ──
+with debug_tabs[4]:
+    col_l, col_t = st.columns(2)
+    with col_l:
+        st.markdown("**🔒 Safety limits**")
+        st.code(
+            "Max upload size : 100 MB\n"
+            "Phase A timeout : 30s\n"
+            "Phase B timeout : 60s\n"
+            "Row limit       : 100,000\n"
+            "Col limit       : 500\n"
+            "Forbidden ops   : open / exec / eval / __import__ / "
+            "os / subprocess / requests / socket",
+            language="text",
+        )
+    with col_t:
+        st.markdown("**🤖 LLM config**")
+        st.code(
+            f"Provider     : {config.LLM_PROVIDER}\n"
+            f"Endpoint     : {config.LLM_BASE_URL}\n"
+            f"Model        : {config.LLM_MODEL}\n"
+            f"Timeout      : {config.LLM_TIMEOUT_S}s\n"
+            f"Profile      : {config.MODEL_PROFILE_NAME}\n"
+            f"Thinking off : {config.LLM_DISABLE_THINKING}\n"
+            f"Prompt repo  : {'ON' if config.PROMPT_REPO_ENABLED else 'OFF'}",
+            language="text",
+        )
+    st.markdown("**📦 MongoDB collections in use**")
+    coll_names = [
+        "uploaded_datasets", "upload_tables", "upload_profiles",
+        "upload_metadata_versions", "upload_user_corrections",
+        "analysis_sessions", "analysis_assets", "task_traces",
+    ]
+    coll_rows = [
+        {"collection": c, "count": mongo_db[c].count_documents({})}
+        for c in coll_names
+    ]
+    st.dataframe(pd.DataFrame(coll_rows), use_container_width=True,
+                  hide_index=True, height=320)
+
 st.caption(
-    "✅ M3A — Saved Chart / Saved Metric / Analysis Template + Saved Assets Panel"
+    "✅ M4c — safe_exec wired + Debug Panel + Acceptance suite"
 )
