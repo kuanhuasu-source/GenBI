@@ -42,7 +42,8 @@ logger = logging.getLogger(__name__)
 # 規格常量
 # ============================================================
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
-ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+# v0.15.0+: 直接 parquet upload(spec §4.2 item 8)
+ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".parquet"}
 
 
 class FileParseError(Exception):
@@ -139,18 +140,16 @@ def parse_csv(source_path: Path) -> pd.DataFrame:
 
 
 def parse_excel(source_path: Path) -> tuple[pd.DataFrame, str, bool]:
-    """讀 Excel single sheet。
+    """讀 Excel single sheet(legacy MVP 介面,保留 backward compat)。
+
+    新 caller 用 parse_excel_all_sheets 拿 multi-sheet dict。
 
     Returns:
         (df, sheet_name, has_multiple_sheets)
-        - df: 第一個 sheet 的 DataFrame
-        - sheet_name: 該 sheet 的原名
-        - has_multiple_sheets: True 表示 Excel 有 >1 sheet,但 MVP 只讀第一個
     """
     try:
         excel = pd.ExcelFile(source_path, engine="openpyxl")
-    except Exception as e:
-        # xlrd / openpyxl 對舊版 .xls 不支援,可能要 fallback
+    except Exception:
         try:
             excel = pd.ExcelFile(source_path)
         except Exception as e2:
@@ -168,6 +167,76 @@ def parse_excel(source_path: Path) -> tuple[pd.DataFrame, str, bool]:
 
     has_multiple = len(sheet_names) > 1
     return df, first_sheet, has_multiple
+
+
+def parse_excel_all_sheets(
+    source_path: Path,
+    max_sheets: int = 20,
+) -> dict[str, pd.DataFrame]:
+    """v0.15.0+ (M5.1):讀 Excel 全部 sheet,回 {sheet_name: df} dict。
+
+    Args:
+        max_sheets:protection,Excel 含 sheet 超過此數 → 只讀前 N 個 + warning。
+
+    Returns:
+        {sheet_name: DataFrame}(順序按 Excel 內定義)
+
+    Raises:
+        FileParseError:Excel 無法開啟,或全部 sheet 解析都失敗
+    """
+    try:
+        excel = pd.ExcelFile(source_path, engine="openpyxl")
+    except Exception:
+        try:
+            excel = pd.ExcelFile(source_path)
+        except Exception as e2:
+            raise FileParseError(f"Excel 無法開啟: {e2}")
+
+    sheet_names = excel.sheet_names
+    if not sheet_names:
+        raise FileParseError("Excel 內 0 個 sheet")
+
+    if len(sheet_names) > max_sheets:
+        logger.warning(
+            f"Excel 含 {len(sheet_names)} 個 sheet,超過 max_sheets={max_sheets}。"
+            f"只讀前 {max_sheets} 個。"
+        )
+        sheet_names = sheet_names[:max_sheets]
+
+    parsed: dict[str, pd.DataFrame] = {}
+    parse_errors: list[str] = []
+    for name in sheet_names:
+        try:
+            df = excel.parse(name)
+            # 跳過空 sheet
+            if df.shape[0] == 0:
+                logger.warning(f"Sheet `{name}` 0 列,跳過")
+                continue
+            parsed[name] = df
+        except Exception as e:
+            parse_errors.append(f"{name}: {e}")
+            logger.warning(f"Sheet `{name}` 解析失敗:{e}")
+
+    if not parsed:
+        raise FileParseError(
+            f"Excel 全部 sheet 解析失敗 / 都是空 sheet。錯誤:{parse_errors}"
+        )
+    return parsed
+
+
+def parse_parquet_direct(source_path: Path) -> pd.DataFrame:
+    """v0.15.0+ (M5.1):直接讀 .parquet 上傳檔(skip CSV/Excel 流程)。
+
+    Parquet 已有 schema/dtype,不需要 normalize 後再轉 parquet。
+    但我們仍會 normalize 欄名(避免空白/特殊符號)。
+    """
+    try:
+        df = pd.read_parquet(source_path)
+    except Exception as e:
+        raise FileParseError(f"Parquet 解析失敗:{e}")
+    if df.shape[0] == 0:
+        raise FileParseError("Parquet 內 0 列")
+    return df
 
 
 # ============================================================
@@ -198,7 +267,13 @@ def validate_file(source_path: Path) -> tuple[str, int]:
         raise FileParseError(
             f"副檔名 `{ext}` 不允許,可接受:{sorted(ALLOWED_EXTENSIONS)}"
         )
-    file_type = "csv" if ext == ".csv" else "excel"
+    # v0.15.0+ M5.1:加 parquet file_type(.parquet 直接上傳)
+    if ext == ".csv":
+        file_type = "csv"
+    elif ext == ".parquet":
+        file_type = "parquet"
+    else:
+        file_type = "excel"   # .xlsx / .xls
     return file_type, size
 
 
@@ -240,13 +315,17 @@ def parse_to_parquet(
     if file_type == "csv":
         df = parse_csv(source_path)
         table_name = source_path.name
+    elif file_type == "parquet":
+        # v0.15.0+ M5.1:直接 parquet upload
+        df = parse_parquet_direct(source_path)
+        table_name = source_path.name
     else:  # excel
         df, sheet_name, has_multi = parse_excel(source_path)
         table_name = sheet_name
         if has_multi:
             warnings.append(
-                f"Excel 含多個 sheet,MVP 僅讀第一個 (`{sheet_name}`)。"
-                "Multi-sheet 支援見 Phase 2。"
+                f"Excel 含多個 sheet,MVP single-sheet 介面只讀第一個 (`{sheet_name}`)。"
+                "請改用 parse_excel_to_parquet_multi() 處理多 sheet(M5.1+)。"
             )
 
     if df.shape[0] == 0:
@@ -281,3 +360,70 @@ def parse_to_parquet(
 def load_parquet(parquet_path: str | Path) -> pd.DataFrame:
     """讀回 parquet → DataFrame(profiler / analysis 用)。"""
     return pd.read_parquet(parquet_path)
+
+
+def parse_excel_to_parquet_multi(
+    source_path: Path,
+    parquet_dir: Path,
+    max_sheets: int = 20,
+) -> list[dict[str, Any]]:
+    """v0.15.0+ (M5.1):Excel multi-sheet → 多個 parquet 檔案。
+
+    對應 spec §4.2 item 1。每個 sheet 對應一個 upload_table。
+
+    Returns:
+        list of dicts(每 sheet 一筆),每筆同 parse_to_parquet 結構:
+        [
+          {table_id, table_name, row_count, column_count,
+           normalized_columns, original_to_normalized,
+           storage, file_type='excel', warnings},
+          ...
+        ]
+    """
+    file_type, _size = validate_file(source_path)
+    if file_type != "excel":
+        raise FileParseError(
+            f"parse_excel_to_parquet_multi 只接受 Excel,實際 file_type={file_type}"
+        )
+
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+    sheet_dfs = parse_excel_all_sheets(source_path, max_sheets=max_sheets)
+
+    results: list[dict[str, Any]] = []
+    used_table_ids: set[str] = set()
+
+    for sheet_name, df in sheet_dfs.items():
+        # Normalize sheet_name → safe table_id
+        table_id_base = normalize_column_name(sheet_name) or "sheet"
+        table_id = table_id_base
+        # Resolve table_id 衝突
+        suffix = 2
+        while table_id in used_table_ids:
+            table_id = f"{table_id_base}_{suffix}"
+            suffix += 1
+        used_table_ids.add(table_id)
+
+        # Normalize 欄名
+        df_norm, mapping = normalize_dataframe_columns(df)
+        # 寫 parquet
+        parquet_path = parquet_dir / f"{table_id}.parquet"
+        try:
+            df_norm.to_parquet(parquet_path, index=False)
+        except Exception as e:
+            raise FileParseError(f"sheet `{sheet_name}` 寫 parquet 失敗: {e}")
+
+        results.append({
+            "table_id": table_id,
+            "table_name": sheet_name,
+            "row_count": int(df_norm.shape[0]),
+            "column_count": int(df_norm.shape[1]),
+            "normalized_columns": list(df_norm.columns),
+            "original_to_normalized": mapping,
+            "storage": {"format": "parquet", "path": str(parquet_path)},
+            "file_type": "excel",
+            "warnings": [],
+        })
+
+    if not results:
+        raise FileParseError("Excel 所有 sheet 都解析失敗或空")
+    return results

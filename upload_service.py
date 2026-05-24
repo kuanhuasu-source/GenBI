@@ -107,6 +107,7 @@ class UploadService:
         filename: str,
         owner: str,
         table_id: str = "sheet1",
+        excel_multi_sheet: bool = False,
     ) -> str:
         """端到端:接檔 → 解析 → 寫 parquet → profile → 寫 MongoDB。
 
@@ -186,25 +187,47 @@ class UploadService:
             raise RuntimeError(f"寫 uploaded_datasets 失敗: {e}") from e
 
         # ── 4-6. Parse → parquet → upload_tables ──
+        # v0.15.0+ M5.1:Excel + excel_multi_sheet=True → 處理全部 sheet
+        # 否則 fall back single-sheet 行為(MVP/M1B 路徑)
         try:
             self.repo.update_status(dataset_id, "parsing")
-            parse_result = file_parser.parse_to_parquet(
-                source_path=staging_path,
-                parquet_dir=dataset_dir,
-                table_id=table_id,
-            )
-            table_doc = {
-                "dataset_id": dataset_id,
-                "table_id": parse_result["table_id"],
-                "table_name": parse_result["table_name"],
-                "row_count": parse_result["row_count"],
-                "column_count": parse_result["column_count"],
-                "normalized_columns": parse_result["normalized_columns"],
-                "original_to_normalized": parse_result["original_to_normalized"],
-                "storage": parse_result["storage"],
-                "warnings": parse_result["warnings"],
-            }
-            self.repo.create_table(table_doc)
+            is_excel = ext in (".xlsx", ".xls")
+            if is_excel and excel_multi_sheet:
+                parse_results = file_parser.parse_excel_to_parquet_multi(
+                    source_path=staging_path,
+                    parquet_dir=dataset_dir,
+                )
+                for pr in parse_results:
+                    self.repo.create_table({
+                        "dataset_id": dataset_id,
+                        "table_id": pr["table_id"],
+                        "table_name": pr["table_name"],
+                        "row_count": pr["row_count"],
+                        "column_count": pr["column_count"],
+                        "normalized_columns": pr["normalized_columns"],
+                        "original_to_normalized": pr["original_to_normalized"],
+                        "storage": pr["storage"],
+                        "warnings": pr["warnings"],
+                    })
+                # 留第一筆給 metadata profile 入口(profile_dataset 會收 list)
+                parse_result = parse_results[0]
+            else:
+                parse_result = file_parser.parse_to_parquet(
+                    source_path=staging_path,
+                    parquet_dir=dataset_dir,
+                    table_id=table_id,
+                )
+                self.repo.create_table({
+                    "dataset_id": dataset_id,
+                    "table_id": parse_result["table_id"],
+                    "table_name": parse_result["table_name"],
+                    "row_count": parse_result["row_count"],
+                    "column_count": parse_result["column_count"],
+                    "normalized_columns": parse_result["normalized_columns"],
+                    "original_to_normalized": parse_result["original_to_normalized"],
+                    "storage": parse_result["storage"],
+                    "warnings": parse_result["warnings"],
+                })
             self.repo.update_status(dataset_id, "parsed")
         except file_parser.FileParseError as e:
             self.repo.update_status(dataset_id, "error", error_message=str(e))
@@ -217,11 +240,14 @@ class UploadService:
             raise
 
         # ── 7-9. Profile → save_profile → status='profiled' ──
+        # v0.15.0+ M5.1:multi-sheet → profile 每張 table
         try:
-            df = file_parser.load_parquet(parse_result["storage"]["path"])
-            profile = data_profiler.profile_dataset(
-                tables=[(parse_result["table_id"], df)],
-            )
+            tables = self.repo.list_tables(dataset_id)
+            tables_for_profile = []
+            for t in tables:
+                df_t = file_parser.load_parquet(t["storage"]["path"])
+                tables_for_profile.append((t["table_id"], df_t))
+            profile = data_profiler.profile_dataset(tables=tables_for_profile)
             self.repo.save_profile(dataset_id, profile)
             self.repo.update_status(
                 dataset_id, "profiled",

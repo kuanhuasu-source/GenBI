@@ -1301,6 +1301,7 @@ debug_tabs = st.tabs([
     "📜 Metadata history",
     "🤖 Last analysis trace",
     "💾 Assets summary",
+    "🔗 Relationships",
     "⚙️ System status",
 ])
 
@@ -1321,7 +1322,7 @@ with debug_tabs[0]:
             display_doc["messages_count"] = len(session_doc.get("messages", []))
             st.json(display_doc, expanded=False)
 
-# ── Tab 2:Metadata version 歷史 ──
+# ── Tab 2:Metadata version 歷史(M5.2:加 activate + re-profile)──
 with debug_tabs[1]:
     versions = repo.list_metadata_versions(selected_id)
     if not versions:
@@ -1339,6 +1340,70 @@ with debug_tabs[1]:
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True,
                       hide_index=True, height=min(35 + len(rows) * 35, 320))
+
+        # M5.2:Activate 舊 version + 重 regenerate
+        st.markdown("**🔄 Version actions(M5.2)**")
+        col_act, col_re = st.columns(2)
+        with col_act:
+            inactive_versions = [v["version"] for v in versions if not v.get("is_active")]
+            if inactive_versions:
+                target_v = st.selectbox(
+                    "Activate previous version",
+                    options=inactive_versions,
+                    format_func=lambda x: f"v{x}",
+                    key=f"_activate_v_{selected_id}",
+                )
+                if st.button(
+                    f"切回 v{target_v} 為 active",
+                    type="secondary", use_container_width=True,
+                    help="這 dataset 的後續分析會用此版 metadata。Saved Asset 的 drift check 也會比對此 version。",
+                ):
+                    ok = repo.activate_metadata_version(selected_id, target_v)
+                    if ok:
+                        st.toast(f"✅ v{target_v} 已 active", icon="🔄")
+                        # 清 LLM cache 確保下次 query 用新 metadata
+                        try:
+                            st.cache_resource.clear()
+                        except Exception:
+                            pass
+                        st.rerun()
+                    else:
+                        st.error(f"Activate v{target_v} 失敗")
+            else:
+                st.caption("沒有可切換的舊 version(只有 1 個)")
+
+        with col_re:
+            if st.button(
+                "🔄 重跑 semantic profile(rule-based)",
+                type="secondary", use_container_width=True,
+                help=("從目前 profile 重跑 semantic 推論,產新 metadata version。"
+                      "用於:既有 dataset 想吃到新版 PII detector / role 推論 logic。"),
+            ):
+                try:
+                    new_v = service.regenerate_metadata(selected_id, use_llm=False)
+                    st.toast(f"✅ 已生成 v{new_v} draft", icon="🔄")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Regenerate 失敗:{e}")
+
+        # Profile version history(M5.2:read-only)
+        profile_versions = repo.list_profile_versions(selected_id)
+        if len(profile_versions) > 1:
+            st.markdown("**📊 Profile version history**")
+            with st.expander(f"展開 {len(profile_versions)} 個 profile version",
+                              expanded=False):
+                p_rows = [
+                    {"profile_version": pv["profile_version"],
+                     "tables": len(pv.get("tables", [])),
+                     "created_at": pv.get("created_at")}
+                    for pv in profile_versions
+                ]
+                st.dataframe(pd.DataFrame(p_rows),
+                              use_container_width=True, hide_index=True)
+                st.caption(
+                    "Profile 自動 versioning,latest 永遠是 active。"
+                    "若要重新 profile(例:資料改了),需先 delete dataset 再上傳。"
+                )
     # User corrections audit
     corrections = repo.list_corrections(selected_id)
     if corrections:
@@ -1437,8 +1502,69 @@ with debug_tabs[3]:
             st.dataframe(pd.DataFrame(asset_rows),
                           use_container_width=True, hide_index=True)
 
-# ── Tab 5:System status(spec §14 / §15 security limits) ──
+# ── Tab 5:Relationships(M5.3:跨 sheet relationship 偵測 + 確認)──
 with debug_tabs[4]:
+    if len(tables) < 2:
+        st.caption(
+            "此 dataset 只有 1 個 table — relationship 偵測需要 ≥2 個 table。\n\n"
+            "上傳 Excel multi-sheet(M5.1)或多 CSV 才會出現 relationships。"
+        )
+    else:
+        from relationship_profiler import detect_relationships, apply_user_confirmation
+
+        # 預先 load 全部 table data
+        @st.cache_data(show_spinner=False)
+        def _detect_rels_cached(_ds_id: str, table_ids: tuple):
+            t_list = []
+            for tid in table_ids:
+                t = repo.get_table(_ds_id, tid)
+                if t:
+                    df_t = file_parser.load_parquet(t["storage"]["path"])
+                    t_list.append((tid, df_t))
+            return detect_relationships(t_list)
+
+        if st.button("🔍 偵測 relationships", use_container_width=False):
+            tids = tuple(t["table_id"] for t in tables)
+            result = _detect_rels_cached(selected_id, tids)
+            st.session_state[f"_rel_result_{selected_id}"] = result
+            st.rerun()
+
+        rel_result = st.session_state.get(f"_rel_result_{selected_id}")
+        if not rel_result:
+            st.caption(
+                "尚未偵測。按上方按鈕。偵測完每對 table 兩兩比對欄名 + 值域。"
+            )
+        else:
+            st.caption(
+                f"📊 偵測 {rel_result['n_pairs_scanned']} pairs · "
+                f"找到 {rel_result['n_relationships_found']} 條 relationship"
+            )
+            if not rel_result["relationships"]:
+                st.info("沒偵測到 cross-table relationship(欄名沒共通 + 值域沒重疊)")
+            else:
+                rel_rows = []
+                for i, r in enumerate(rel_result["relationships"]):
+                    rel_rows.append({
+                        "#": i,
+                        "from": f"{r['from_table']}.{r['from_field']}",
+                        "to": f"{r['to_table']}.{r['to_field']}",
+                        "type": r["relationship_type"],
+                        "confidence": r["confidence"],
+                        "right_is_pk": r["evidence"].get("right_is_pk", False),
+                        "overlap_%": r["evidence"].get("value_overlap_pct", 0),
+                    })
+                st.dataframe(pd.DataFrame(rel_rows),
+                              use_container_width=True, hide_index=True)
+                st.caption(
+                    "🚧 User confirmation UI 簡化版:目前只顯示偵測結果,"
+                    "Confirm / Edit / Reject 等動作預留 M5.3+ phase 2。"
+                    "目前 relationship 不會自動寫進 metadata.relationships,"
+                    "需要 user 手動編輯 metadata Section 8(下個 milestone 接通)。"
+                )
+
+
+# ── Tab 6:System status(spec §14 / §15 security limits) ──
+with debug_tabs[5]:
     col_l, col_t = st.columns(2)
     with col_l:
         st.markdown("**🔒 Safety limits**")

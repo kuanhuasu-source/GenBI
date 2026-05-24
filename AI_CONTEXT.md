@@ -855,4 +855,146 @@ Backfill script:`scripts/backfill_task_traces_datetime.py`(dry-run by default,`-
 
 ---
 
+## 22. v0.12 – v0.15 · Upload Workspace(第二條 BYOD 路徑)
+
+從 v0.12 開始 GenBI 長出第二條主線:**Upload-driven Workspace**(BYOD = Bring Your Own Data)。使用者上傳 CSV / Excel / Parquet,系統自動 profile → 推 semantic metadata → 使用者 review/confirm → 進入 5-phase agentic workflow → 沉澱為 Saved Chart / Metric / Template。整套跟既有 schema-driven 主線**平行解耦**,實作上強守「凍結條款」:既有 tflex / ecommerce / healthcare 行為 0 改動,baseline 不被打。
+
+### 22.1 兩條路徑對照
+
+| 維度 | Schema-driven(既有) | Upload-driven(v0.12+) |
+|---|---|---|
+| 資料來源 | MongoDB(`tflex_applications` 等)| `upload_tables.parquet` 本機 staging |
+| Metadata 來源 | 人工維護的 `tflex_task_metadata_agent_v3.py` / `domain_metadata` collection | Dynamic profile + LLM-assisted + user confirm,寫 `upload_metadata_versions` |
+| Phase A | `generate_pipeline` → MongoDB JSON pipeline | `generate_pandas_extraction` → Pandas filter,或 `duckdb_engine.execute_safe` → SQL |
+| Phase 0 plan prompt | `phase_0_plan`(描述 A 段為 MongoDB)| `phase_0_plan_upload`(描述 A 段為 Pandas filter)|
+| Sandbox | `sanitize_pipeline` strip 派生 operator | `safe_exec_pandas`(restricted builtins + timeout + row limit)+ `phase_a_validator`(static check) |
+| Chat orchestrator | `app.py` 主對話 | `pages/07_upload_workspace.py` Section 10 + `upload_analysis_service.py` |
+| 資產化 | (無) | Saved Chart / Saved Metric(寫回 kpi_definitions) / Analysis Template |
+| Test runner | `test_runner.py`(26 case baseline)| 路徑與 upload **零交集**,baseline 不受影響 |
+
+### 22.2 v0.12 → v0.15 版本軌跡
+
+| Version | 主要內容 |
+|---|---|
+| `v0.12.0` | **M1A** MetadataProvider 抽象層 + **M1B** Upload + Parse + Profile + **M2** Semantic Metadata + Review UI |
+| `v0.13.0` | **M3** Analysis Workflow Integration(5-phase + Pandas Phase A) |
+| `v0.13.1` | hotfix · histogram intent + Phase B/C prompts(ECharts 沒 `histogram` type,改用 bar + markLine) |
+| `v0.13.2` | **M3A** Analysis Assets(Saved Chart / Metric / Template + Saved Assets page) |
+| `v0.13.3` | hotfix · `LLM_DISABLE_THINKING` env + extra_body(for future vLLM,Qwen 3.6 distilled 經驗教訓:`/no_think` 不適用) |
+| `v0.14.0` | **M4a** Golden datasets + 165 unit tests |
+| `v0.14.1` | **M4b** PII detector + safe_exec module + integration tests(230 tests pass) |
+| `v0.14.2` | **M4c** safe_exec wired into Phase A/B + Debug Panel + Acceptance suite(244 tests) |
+| `v0.15.0` | **M5** Phase 2:Excel multi-sheet + Parquet upload + Profile versioning + Relationship profiler + Export to domain + DuckDB engine + Cross-dataset template(325 tests) |
+
+### 22.3 新模組(MVP + Phase 2 全套)
+
+```
+metadata_provider.py             — ABC + StaticDomainMetadataProvider / UploadMetadataProvider
+upload_repository.py             — 7 collection CRUD(uploaded_datasets / upload_tables /
+                                    upload_profiles / upload_metadata_versions /
+                                    upload_user_corrections / analysis_sessions / analysis_assets)
+upload_service.py                — upload → parse → parquet → profile → metadata v1 draft 端到端
+upload_analysis_service.py       — Upload Workspace 5-phase orchestrator + safe_exec wired
+
+file_parser.py                   — CSV / Excel(single & multi-sheet)/ Parquet 解析 + 欄名 normalize
+data_profiler.py                 — physical profile + 9 種 DQ warnings + PII detection 注入
+semantic_profiler.py             — 12 種 semantic_role rule-based + LLM-assisted refine
+upload_metadata_generator.py     — profile + semantic → GenBI metadata + grain / KPI / limitations
+metadata_correction_service.py   — path-based corrections + version up + audit
+analysis_asset_service.py        — Save Chart / Metric(寫回 kpi_definitions)/ Template + rerun
+                                    + drift check
+
+pii_detector.py                  — 6 種 PII pattern(email / phone / national_id /
+                                    employee_id / name_like / address)
+safe_exec.py                     — Pandas code execution sandbox(restricted builtins +
+                                    timeout + row/col limit + output validation)
+phase_a_validator.py             — Phase A static check(5 check + cheatsheet)
+
+relationship_profiler.py         — 跨 table relationship 偵測(欄名相同 + 值域 overlap)
+upload_to_domain_exporter.py     — 把 confirmed upload metadata 寫成 schema-driven domain
+duckdb_engine.py                 — DuckDB SQL engine(大檔 >100K row 走 SQL path) + safety
+template_compatibility.py        — Analysis Template 跨 dataset compatibility 評估
+
+pages/07_upload_workspace.py     — Streamlit UI(Section 1-12:Upload / Profile /
+                                    Field Review / Status Code / Grain / Confirm /
+                                    Chat / Save Asset / Debug Panel)
+pages/08_saved_assets.py         — Saved Chart / Metric / Template 瀏覽 + rerun / rename / 軟刪除
+```
+
+### 22.4 7 個新 MongoDB collection
+
+| Collection | 用途 |
+|---|---|
+| `uploaded_datasets` | dataset 主檔(owner / file metadata / status / active_metadata_version) |
+| `upload_tables` | 每 table / sheet 的描述(row/col count / parquet path) |
+| `upload_profiles` | physical profile(per-column stats + DQ warnings + PII info)|
+| `upload_metadata_versions` | versioned metadata + confirmation status |
+| `upload_user_corrections` | user 修正 audit log |
+| `analysis_sessions` | chat 對話 + last_analysis 接續上下文 |
+| `analysis_assets` | Saved Chart / Saved Metric / Analysis Template |
+
+### 22.5 LLMService 新增 surface(v0.13.0+)
+
+```python
+# 新方法(不動既有 generate_pipeline 等)
+def generate_pandas_extraction(query, plan_text, source_columns,
+                                 source_df_sample, previous_code, previous_error) -> str
+
+# generate_plan 加 source_type branch(byte-equal 對既有 metadata)
+def generate_plan(query, followup_context=None):
+    is_upload = (self.task_metadata or {}).get("source_type") == "upload"
+    prompt_key = "phase_0_plan_upload" if is_upload else "phase_0_plan"
+    # ... 後面跟既有完全一樣
+
+# __init__ 加 optional disable_thinking flag(default False = byte-equal)
+def __init__(..., disable_thinking: bool = False)
+```
+
+### 22.6 設計原則延伸(v0.12+ 新增)
+
+1. **凍結條款絕對遵守**:每個 milestone 結束跑 `test_runner.py && compare_baseline.py`,要求 17-21 噪聲帶內無 hard regression。改 `llm_service.py` 等 critical 檔時用 surgical edit,加 optional kwarg 維持 backward compat。
+2. **新 path 走獨立 collection / module**:Upload 路徑用 `upload_*` collection,Phase 2 graduate 才寫 `domain_metadata`(走既有 schema-driven 路徑)。
+3. **三層測試**:M4 建立 unit(218)+ integration(12)+ acceptance(14)= 244 layered test suite,M5 後 325。
+4. **驗證 baseline noise 為基線屬性**:8 輪 baseline 跑下來(M1A~M4c),pass count 在 16-21 帶內擺,4-5 case 是 Ollama 在 borderline case 上的固有 variance,不是 GenBI regression。
+5. **雙層 safety**:Phase A `phase_a_validator`(static)+ `safe_exec_pandas`(runtime)= 兩道防禦同時擋。
+
+### 22.7 環境變數(v0.12+ 新增)
+
+| Env Var | Default | 說明 |
+|---|---|---|
+| `HRDA_MODEL_DISABLE_THINKING` | `false` | `true` 時 `_call_llm` 注入 `extra_body={"think": False}`(對 vLLM 有效;Ollama OpenAI-compat 已實測 silently ignore)|
+| (其他 `HRDA_MODEL_*` 沿用)| | |
+
+### 22.8 一句話「Upload Workspace 怎麼跑」
+
+```bash
+# 1. 啟動(同 MVP)
+streamlit run app.py
+# 2. 左上 sidebar 切到「07 upload workspace」page
+# 3. 上傳 CSV / Excel / Parquet → 自動 profile + 產 metadata v1 draft
+# 4. Field Review Table 改 semantic_role / unit / description → Apply edits → v2 draft
+# 5. 點 ✅ Confirm metadata → v3 confirmed → 解鎖 Section 10 Chat
+# 6. 對話分析 → 5-phase pipeline 跑完 → Save Chart / Save Metric(寫回 kpi_definitions)
+# 7. Saved Assets page 瀏覽 / rerun / rename / delete
+# 8. Section 12 Debug Panel 看 metadata 版本 / Phase trace / Asset summary / Relationships
+```
+
+### 22.9 完整測試一覽
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest tests/ -v
+# 預期:325 passed in ~5s
+```
+
+```
+tests/
+├── golden_data/           # 7 個 CSV(spec §16.3)
+├── unit/                  # 13 個 module × ~25 tests/module
+├── integration/           # 12 條 end-to-end + setup_confirmed_dataset fixture
+└── acceptance/            # 14 條 spec §16.4/16.5 acceptance criteria
+```
+
+---
+
 # (以下為文件結束)

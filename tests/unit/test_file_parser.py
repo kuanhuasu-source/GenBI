@@ -202,6 +202,103 @@ class TestConstants:
         assert ".csv" in ALLOWED_EXTENSIONS
         assert ".xlsx" in ALLOWED_EXTENSIONS
         assert ".xls" in ALLOWED_EXTENSIONS
+        # v0.15.0+ (M5.1):.parquet 也加入
+        assert ".parquet" in ALLOWED_EXTENSIONS
         # 危險副檔名不該在內
         assert ".exe" not in ALLOWED_EXTENSIONS
         assert ".sh" not in ALLOWED_EXTENSIONS
+
+
+# ============================================================
+# M5.1:Excel multi-sheet + Parquet direct
+# ============================================================
+class TestExcelMultiSheet:
+    def test_parse_excel_all_sheets(self, tmp_path):
+        """v0.15.0+ (M5.1):多 sheet 該全部解析"""
+        from file_parser import parse_excel_all_sheets
+
+        f = tmp_path / "multi.xlsx"
+        with pd.ExcelWriter(f, engine="openpyxl") as w:
+            pd.DataFrame({"a": [1, 2]}).to_excel(w, sheet_name="Orders", index=False)
+            pd.DataFrame({"b": [3, 4]}).to_excel(w, sheet_name="Customers", index=False)
+
+        sheets = parse_excel_all_sheets(f)
+        assert len(sheets) == 2
+        assert "Orders" in sheets
+        assert "Customers" in sheets
+        assert list(sheets["Orders"].columns) == ["a"]
+        assert list(sheets["Customers"].columns) == ["b"]
+
+    def test_skip_empty_sheets(self, tmp_path):
+        from file_parser import parse_excel_all_sheets
+
+        f = tmp_path / "with_empty.xlsx"
+        with pd.ExcelWriter(f, engine="openpyxl") as w:
+            pd.DataFrame({"a": [1]}).to_excel(w, sheet_name="HasData", index=False)
+            # Empty sheet — pd.ExcelWriter 寫空 DataFrame 會留 header row,
+            # 我們的 parse_excel_all_sheets 看到 0 列 data 才會跳過
+
+        sheets = parse_excel_all_sheets(f)
+        # 至少有 HasData
+        assert "HasData" in sheets
+
+    def test_max_sheets_protection(self, tmp_path):
+        from file_parser import parse_excel_all_sheets
+
+        f = tmp_path / "many.xlsx"
+        with pd.ExcelWriter(f, engine="openpyxl") as w:
+            for i in range(5):
+                pd.DataFrame({"x": [1]}).to_excel(w, sheet_name=f"S{i}", index=False)
+
+        sheets = parse_excel_all_sheets(f, max_sheets=3)
+        # 只應讀前 3 個
+        assert len(sheets) == 3
+
+    def test_parse_excel_to_parquet_multi(self, tmp_path):
+        from file_parser import parse_excel_to_parquet_multi
+
+        f = tmp_path / "biz.xlsx"
+        with pd.ExcelWriter(f, engine="openpyxl") as w:
+            pd.DataFrame({"order_id": [1, 2], "amount": [100, 200]}).to_excel(
+                w, sheet_name="Orders", index=False,
+            )
+            pd.DataFrame({"customer_id": [1, 2], "name": ["A", "B"]}).to_excel(
+                w, sheet_name="Customers", index=False,
+            )
+        parquet_dir = tmp_path / "out"
+        results = parse_excel_to_parquet_multi(f, parquet_dir)
+        assert len(results) == 2
+        # 兩個 table 都該有 parquet 寫出
+        for r in results:
+            assert Path(r["storage"]["path"]).exists()
+        # Table_id 該被 normalize(大寫 → 小寫)
+        ids = [r["table_id"] for r in results]
+        assert "orders" in ids
+        assert "customers" in ids
+
+
+class TestParquetDirect:
+    def test_parquet_upload(self, tmp_path):
+        """v0.15.0+ (M5.1):.parquet 該直接走 parse_to_parquet"""
+        from file_parser import parse_to_parquet, validate_file
+
+        src = tmp_path / "data.parquet"
+        df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        df.to_parquet(src, index=False)
+
+        # validate_file 該回 parquet
+        ft, _ = validate_file(src)
+        assert ft == "parquet"
+
+        # parse_to_parquet 全 pipeline
+        result = parse_to_parquet(src, tmp_path / "out", table_id="sheet1")
+        assert result["row_count"] == 3
+        assert result["file_type"] == "parquet"
+
+    def test_parse_parquet_direct(self, tmp_path):
+        from file_parser import parse_parquet_direct
+
+        f = tmp_path / "x.parquet"
+        pd.DataFrame({"a": [1, 2]}).to_parquet(f, index=False)
+        df = parse_parquet_direct(f)
+        assert len(df) == 2
