@@ -1052,6 +1052,211 @@ Upload Workspace Section 12 Debug Panel 加新 tab:**🧠 RAG context**
 
 ---
 
+## 24. 地端部署規格(On-premise / Air-gapped)
+
+本系統設計為**完全地端 CPU 部署**,跟既有 GenBI(Ollama 本機 LLM + 本機 MongoDB)
+同條船。零雲端依賴,適合內網 / 資安要求高 / 離線環境。
+
+### 24.1 部署元件清單
+
+| 元件 | 部署路徑 | Disk size | 需網路? |
+|---|---|---:|---|
+| `sentence-transformers/all-MiniLM-L6-v2` model | `~/.cache/huggingface/sentence-transformers/` | ~90 MB | **僅首次 download**,之後完全離線 |
+| `sentence-transformers` Python lib | venv 內 | ~5 MB(連依賴 ~700 MB,含 torch) | pip install 一次 |
+| `chromadb` Python lib | venv 內 | ~50 MB | pip install 一次 |
+| Chroma vector DB data | `<project>/rag_indices/chroma.db` | 10 MB ~ 1 GB(依 doc 量) | 否 — local file |
+| `pytorch` (sentence-transformers 依賴) | venv 內 | ~700 MB CPU-only / ~2 GB CUDA | pip install 一次 |
+
+**最低 spec 增量**(加在現有 GenBI venv 之上):
+- 額外 disk:**~1 GB**(venv libs + model cache)
+- 額外 RAM:**~500 MB**(model 載入 + Chroma in-memory cache)
+- 額外 CPU:**~10-20% spike** 在 retrieval 時(<200ms),idle 時 0
+
+### 24.2 安裝流程
+
+#### 24.2.1 有網路環境(首次 setup)
+
+```bash
+cd ~/Documents/Claude/Projects/GenBI
+source .venv/bin/activate
+
+# 1. 加 RAG dependency
+pip install sentence-transformers chromadb
+
+# 2. 預下載 model(避免 production 首次 query 才 download)
+python3 -c "
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+print(f'Model cached at: {m._model_card_text}')
+"
+# 預期:download ~90 MB 到 ~/.cache/huggingface/
+
+# 3. 建初始 Chroma 目錄
+mkdir -p rag_indices/chroma.db
+
+# 4. 跑 nightly build script 初始化 4 個 index
+python3 scripts/build_rag_indices.py --full-rebuild
+
+# 5. 啟用 RAG(default off,顯式開)
+echo "GENBI_RAG_ENABLED=true" >> .env
+```
+
+#### 24.2.2 Air-gapped 環境(內網部署)
+
+對沒網路的 production server,要在**有網路的 staging 機器**先把 model + venv 打包過去:
+
+```bash
+# Staging 機器(有網路):
+pip download sentence-transformers chromadb -d ./offline_wheels
+python3 -c "from sentence_transformers import SentenceTransformer; \
+            SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+tar czf hf_cache.tar.gz ~/.cache/huggingface/
+tar czf rag_wheels.tar.gz offline_wheels/
+
+# scp 到 production(內網):
+scp hf_cache.tar.gz rag_wheels.tar.gz prod:~/
+
+# Production 機器(離線):
+cd ~/Documents/Claude/Projects/GenBI
+source .venv/bin/activate
+tar xzf ~/rag_wheels.tar.gz
+pip install --no-index --find-links=./offline_wheels sentence-transformers chromadb
+tar xzf ~/hf_cache.tar.gz -C ~/
+
+# 驗證離線可載入
+python3 -c "
+import os
+os.environ['HF_HUB_OFFLINE'] = '1'    # 強制離線
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+print('✅ Offline load OK')
+"
+```
+
+⚠️ **環境變數**:production 設 `HF_HUB_OFFLINE=1` 強制 huggingface lib 不打網路,
+避免運行中誤觸 outbound request(資安 audit 重要)。
+
+### 24.3 CPU 效能規劃
+
+#### 24.3.1 Latency 估算(per-query e2e)
+
+| 機器 | Model load(cold) | Embed 1 query | Chroma top-5 | Parallel 5-index retrieve(p95) |
+|---|---:|---:|---:|---:|
+| M-series Mac(8 core) | 3-5s | ~30 ms | ~10 ms | ~150 ms |
+| Intel i7-12gen(8 core) | 5-8s | ~60 ms | ~15 ms | ~250 ms |
+| AWS c6i.2xlarge(8 vCPU) | 4-6s | ~50 ms | ~12 ms | ~200 ms |
+| AWS c6i.xlarge(4 vCPU) | 6-10s | ~120 ms | ~25 ms | ~400 ms |
+
+**結論**:per-query RAG overhead < 500 ms 全 CPU,跟 LLM call(~5-10s)比可忽略。
+
+#### 24.3.2 Cold-start 對策
+
+Model load 3-10s 太慢,production 該:
+
+- **Streamlit `@st.cache_resource`** 載 model 一次,整個 session 共用
+- **Embed 用 batch**:5 個 index 並行時不該各自 load model,share 同個 instance
+- 用 module-level singleton:
+
+```python
+# embedding_pipeline.py
+_model_singleton = None
+
+def get_embedding_model():
+    global _model_singleton
+    if _model_singleton is None:
+        _model_singleton = SentenceTransformer(...)
+    return _model_singleton
+```
+
+#### 24.3.3 Memory 預算
+
+| 項目 | RAM |
+|---|---:|
+| Embedding model loaded | ~150 MB |
+| Chroma in-memory cache(預設) | ~100 MB / 10K docs |
+| 5 個 index 共存 | ~500 MB |
+| Embedding inference(per-query peak) | ~+50 MB |
+
+**總計**:**~600-700 MB**(加在 GenBI 既有 ~2 GB 之上,production server 4 GB RAM 仍綽綽有餘)。
+
+### 24.4 跟既有 Ollama 部署整合
+
+GenBI 既有部署(對齊 `DEPLOY_A100_QWEN36_27B.md`):
+
+```
+Production server
+├── ollama serve(或 vLLM)  ← LLM,~30 GB(qwen3-coder:30b)
+├── mongod                  ← MongoDB
+├── streamlit run app.py   ← GenBI Python process
+│   └── + sentence-transformers + chromadb(本提案新增)
+│       └── 載 ~/.cache/huggingface/ 的 all-MiniLM-L6-v2
+│       └── 讀 ./rag_indices/chroma.db
+└── 全部本機 / 無 outbound
+```
+
+**部署順序**(zero-downtime upgrade):
+
+1. 停 Streamlit(`pkill streamlit`)— Ollama / MongoDB 不動
+2. `git pull`(拿 v0.16+ code)
+3. `pip install -r requirements.txt`(新加 sentence-transformers / chromadb)
+4. `python3 scripts/build_rag_indices.py --full-rebuild`(初始 index,可能 ~5-10 分鐘 if 多 domain)
+5. 編 `.env` 加 `GENBI_RAG_ENABLED=true`
+6. `streamlit run app.py`
+
+整段 downtime < 15 分鐘(主要是 step 4 build index)。
+
+### 24.5 Disaster Recovery
+
+向量 index 是 derivable artifact(可從 `task_traces` + `learning_instincts` + `domain_metadata`
+重 build),不算 critical state,但仍該備份避免每次都 rebuild:
+
+```bash
+# Nightly backup(加進既有 mongodump cron)
+tar czf "rag_indices_$(date +%Y%m%d).tar.gz" rag_indices/
+
+# Restore(若 corrupt)
+tar xzf rag_indices_20260601.tar.gz -C .
+# 或乾脆重 build
+python3 scripts/build_rag_indices.py --full-rebuild
+```
+
+### 24.6 Embedding 模型升級路徑
+
+若 future 換 model(例 `BAAI/bge-m3` 效果更好):
+
+1. doc 內存的 `embedding_model` field 跟新 model 不一致 → nightly job 偵測 → 自動 re-embed
+2. 過程中 vector DB 保持 dual-version(舊版仍 serve query,新版 build 中)
+3. 全部 doc re-embed 完 → swap pointer → 舊版 deprecate
+
+**避免**:不該硬切換,新舊 doc 混存會讓 similarity 計算誤判。
+
+### 24.7 Air-gapped 模式驗證(部署 sanity check)
+
+```bash
+# 1. 斷網路(模擬 air-gap)
+sudo iptables -A OUTPUT -j DROP   # ⚠️ 測試完記得 -D 復原
+
+# 2. 跑 GenBI
+streamlit run app.py
+# 在 Upload Workspace 上傳 CSV → confirm metadata → chat query
+
+# 3. 預期:全程 OK,無 outbound network attempt
+# 在 log 內 grep 確認沒有 HTTP request 嘗試打外面
+```
+
+### 24.8 Future:GPU acceleration(Phase 3 optional)
+
+CPU 模式對 < 100K doc index 夠用。若 doc 量爆(企業 dataset 跨 100+ domain
+×百欄位 → 10K-100K schema doc),embedding latency 可能變痛:
+
+- **GPU embedding**:同個 sentence-transformers model 可走 `device='cuda'`,latency 降 5-10x
+- 但需要 production server 有 GPU(目前 DEPLOY 文件假設 A100,本來就有)
+- 切換點:`embedding_pipeline.get_model(device='cuda')` 一行改
+
+**MVP 不做** — CPU 模式對 GenBI 預期規模(< 10K docs 跨 4 個 index)綽綽有餘。
+
+---
+
 ## 23. 結論
 
 本 spec 提出把 GenBI 的 prompt 從「靜態 monolithic 6-12K」走向「**hard-coded critical + RAG-injected dynamic 3K**」。3 個閉環:
