@@ -1434,7 +1434,9 @@ class LLMService:
                  prompt_repo=None,
                  domain: str = "tflex",
                  model_profile: dict | None = None,
-                 disable_thinking: bool = False):
+                 disable_thinking: bool = False,
+                 retrieval_orchestrator=None,
+                 rag_enabled: bool = False):
         """
         參數預設指向 Ollama (localhost:11434);
         若你在用 vLLM,把 api_url 改成 http://localhost:8000/v1/chat/completions、
@@ -1504,6 +1506,24 @@ class LLMService:
                 self.prompt_repo = None
         else:
             self.prompt_repo = prompt_repo
+
+        # ── v0.16.0+ RAG dynamic prompt(M6.2 Sprint 1)──
+        # retrieval_orchestrator=None + rag_enabled=False(default)→ 完全 byte-equal v0.15
+        # caller 注入 RetrievalOrchestrator 並設 rag_enabled=True 才會跑 RAG
+        self.retrieval_orchestrator = retrieval_orchestrator
+        self.rag_enabled = bool(rag_enabled) and (retrieval_orchestrator is not None)
+        # ── v0.16.0+ M6.3 Sprint 3 結論:Phase B/C RAG 分開 gate ──
+        # 預設關閉(Sprint 3 實測 -2 cases vs Sprint 2);需要時用 env / kwarg 開
+        try:
+            import config as _cfg
+            self.rag_phase_bc_enabled = bool(
+                getattr(_cfg, "RAG_PHASE_BC_ENABLED", False)
+            )
+        except Exception:
+            self.rag_phase_bc_enabled = False
+        # last_query 由 generate_plan/pipeline/insight 在進 LLM call 前 set,
+        # 給 _render_phase_X 拿來當 RAG query string(避免改 _render 簽章)。
+        self._last_query: str = ""
 
     def classify_intent_for_query(
         self, query: str, last_analysis: dict | None = None
@@ -1886,6 +1906,7 @@ class LLMService:
         # 既有 metadata 無 source_type key → fallthrough 走 'phase_0_plan' → byte-equal。
         is_upload = (self.task_metadata or {}).get("source_type") == "upload"
         prompt_key = "phase_0_plan_upload" if is_upload else "phase_0_plan"
+        self._last_query = query
         system_prompt = self._render_phase_0_plan_prompt(prompt_key=prompt_key)
         # 接續分析時注入前次脈絡
         followup_preamble = build_followup_preamble(followup_context) if followup_context else ""
@@ -1917,10 +1938,12 @@ class LLMService:
         """
         if self.prompt_repo is not None:
             try:
+                rag_kwargs = self._retrieve_rag_slots("phase_0_plan")
                 return self.prompt_repo.render(
                     prompt_key,
                     domain=self.domain,
                     domain_knowledge=self.domain_knowledge,
+                    **rag_kwargs,
                 )
             except Exception as e:
                 import logging
@@ -1931,6 +1954,45 @@ class LLMService:
         if prompt_key == "phase_0_plan_upload":
             return self._inline_phase_0_plan_upload_prompt()
         return self._inline_phase_0_plan_prompt()
+
+    # ============================================================
+    # v0.16.0+ RAG slot retrieval helper
+    # ============================================================
+    def _retrieve_rag_slots(self, phase: str,
+                              extra_filters: dict | None = None) -> dict:
+        """從 RetrievalOrchestrator 抽 RAG slots,回 `dict[rag_slot_name -> str]`。
+
+        rag_enabled=False / orchestrator=None / 無 query / 任何錯誤 → 回 {}。
+        prompt_repo.render() 會 auto-inject 空字串 default,所以空 dict OK。
+
+        Args:
+            phase: phase id(對齊 RetrievalOrchestrator 的 phase_policy keys)
+            extra_filters: 額外 filter,合併進 orchestrator filter
+                (eg Phase C 帶 {"intent": "pie"} 過濾 chart_recipe)
+        """
+        if not self.rag_enabled or self.retrieval_orchestrator is None:
+            return {}
+        # v0.16.0+ M6.3 Sprint 3:Phase B/C 分開 gate(預設關)
+        if phase in ("phase_b_preprocess", "phase_c_chart") and \
+                not self.rag_phase_bc_enabled:
+            return {}
+        query = (self._last_query or "").strip()
+        if not query:
+            return {}
+        try:
+            return self.retrieval_orchestrator.retrieve_for_phase(
+                phase=phase,
+                query=query,
+                domain=self.domain,
+                rag_enabled=True,
+                extra_filters=extra_filters,
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"RAG retrieve failed for phase={phase}: {e}. RAG slots skipped."
+            )
+            return {}
 
     def _inline_phase_0_plan_prompt(self) -> str:
         """v0.2.x 行為的 inline f-string 副本 — repo 失敗時的最終救援。"""
@@ -2188,6 +2250,7 @@ raw_df = source_df.copy()
         - 加 retry loop:JSON parse 失敗時帶錯誤訊息重生(最多 2 次,共 3 attempts)
         """
         import json as _json
+        self._last_query = query
         system_prompt = self._render_phase_a_pipeline_prompt()
         user_msg = f"需求:{query}\n計畫:{plan_text}"
         user_msg += self._format_retry_hint(previous_code, previous_error,
@@ -2244,10 +2307,16 @@ raw_df = source_df.copy()
         """產生 Phase A pipeline system prompt(repo → inline fallback)。"""
         if self.prompt_repo is not None:
             try:
+                # v0.16.0+ M6.3 fix:anti_pattern 該只取 phase_a 的
+                rag_kwargs = self._retrieve_rag_slots(
+                    "phase_a_pipeline",
+                    extra_filters={"applies_to_phase": "phase_a"},
+                )
                 return self.prompt_repo.render(
                     "phase_a_pipeline",
                     domain=self.domain,
                     domain_knowledge=self.domain_knowledge,
+                    **rag_kwargs,
                 )
             except Exception as e:
                 import logging
@@ -2332,6 +2401,7 @@ raw_df = source_df.copy()
                                   raw_df_sample: str = "",
                                   dashboard_hint: bool = False,
                                   previous_code: str = "", previous_error: str = ""):
+        self._last_query = query   # v0.16.0+ M6.3:給 _retrieve_rag_slots 用
         cols_info = (
             f"目前 raw_df 的欄位 (鎖死,不可亂改名): {available_columns}"
             if available_columns else "欄位未知。"
@@ -2413,11 +2483,19 @@ Q['is_<state_b>'] = (Q['<status_col>'] == '<val_b>')
         的好處,production migration 留 v0.6.1。
         """
         from embedded_prompts import compose_phase_b_prompt_modular
+        # v0.16.0+ M6.3:RAG slots(anti_pattern + few_shot)
+        # anti_pattern 該只取 phase_b 的(避免 Phase A/C anti-pattern 噪音)
+        rag_kwargs = self._retrieve_rag_slots(
+            "phase_b_preprocess",
+            extra_filters={"applies_to_phase": "phase_b"},
+        )
         return compose_phase_b_prompt_modular(
             intent=intent,
             cols_info=cols_info,
             domain_knowledge=self.domain_knowledge,
             dashboard_block=dashboard_block,
+            rag_anti_pattern=rag_kwargs.get("rag_anti_pattern", ""),
+            rag_few_shot=rag_kwargs.get("rag_few_shot", ""),
         )
 
     def _inline_phase_b_preprocess_prompt(self, cols_info: str, dashboard_block: str) -> str:
@@ -2649,6 +2727,7 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         v0.5.0+:依 query 偵測 chart intent → 只注入相關 chart-specific block,
         prompt size 從 ~24K 降到 6-9K per call。
         """
+        self._last_query = query   # v0.16.0+ M6.3:給 _retrieve_rag_slots 用
         cols_info = (
             f"`Q` 實際欄位 (THE ONLY SOURCE OF TRUTH): {q_columns}\n"
             "⚠️ 上面這份 q_columns 是 Phase B 實際產出的欄位。\n"
@@ -2688,10 +2767,21 @@ Q = agg   # ⚠️ 絕對不能忘的終態指派
         prompt size 的好處,production migration 留 v0.5.1。
         """
         from embedded_prompts import compose_phase_c_prompt_modular
+        # v0.16.0+ M6.3:RAG slots(chart_recipe + anti_pattern)
+        # chart_recipe 由 intent filter,anti_pattern 由 applies_to_phase filter
+        rag_kwargs = self._retrieve_rag_slots(
+            "phase_c_chart",
+            extra_filters={
+                "intent": intent,
+                "applies_to_phase": "phase_c",
+            },
+        )
         return compose_phase_c_prompt_modular(
             intent=intent,
             cols_info=cols_info,
             echarts_few_shot=self.echarts_few_shot,
+            rag_chart_recipe=rag_kwargs.get("rag_chart_recipe", ""),
+            rag_anti_pattern=rag_kwargs.get("rag_anti_pattern", ""),
         )
 
     def _inline_phase_c_echarts_prompt(self, cols_info: str) -> str:
@@ -3604,6 +3694,7 @@ app 端會把這個 dict 直接餵給 `st_echarts(option, height="520px")` 渲�
     # --------------------------------------------------------
     def generate_insight(self, query, plan_text="", q_preview_md: str = ""):
         """根據處理後的 Q 表 (markdown 預覽) 產出商業洞察文字。"""
+        self._last_query = query
         system_prompt = self._render_phase_d_insight_prompt()
         user_msg = (
             f"使用者問題:{query}\n\n"
@@ -3630,10 +3721,12 @@ app 端會把這個 dict 直接餵給 `st_echarts(option, height="520px")` 渲�
         """產生 Phase D insight system prompt(repo → inline fallback)。"""
         if self.prompt_repo is not None:
             try:
+                rag_kwargs = self._retrieve_rag_slots("phase_d_insight")
                 return self.prompt_repo.render(
                     "phase_d_insight",
                     domain=self.domain,
                     domain_knowledge=self.domain_knowledge,
+                    **rag_kwargs,
                 )
             except Exception as e:
                 import logging

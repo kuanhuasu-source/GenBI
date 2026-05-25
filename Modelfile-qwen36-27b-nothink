@@ -1,0 +1,80 @@
+# ============================================================
+# Modelfile-qwen36-27b-nothink
+# ============================================================
+# 目的:用 Qwen 3.6 27B Instruct 跑 GenBI 5-phase workflow,並**強制關閉
+# thinking** — 透過 TEMPLATE override 在每次 user message 結尾自動接
+# `/no_think` directive(Qwen3 chat template 認此 token 會跳過 <think>...</think>
+# 生成,真正省 token + latency)。
+#
+# 對應 .env:
+#   HRDA_MODEL_NAME=qwen36-27b-nothink-8k
+#   HRDA_MODEL_PROFILE=default      # 走 code-tuned non-thinking sampling
+#   HRDA_MODEL_TIMEOUT_S=240
+#
+# Build:
+#   ollama create qwen36-27b-nothink-8k -f Modelfile-qwen36-27b-nothink
+#
+# 凍結驗證:GenBI code 0 改。所有控制透過 Modelfile + .env。
+
+# ────────────────────────────────────────
+# 1. Base model
+# ────────────────────────────────────────
+# 本機 ollama list 確認的 tag(qwen3.6:27b-instruct 不存在於 library,
+# 用 default `qwen3.6:27b` — Ollama 對此名通常綁 Instruct 變體)
+FROM qwen3.6:27b
+
+# ────────────────────────────────────────
+# 2. Sampling — 預設 0,真正控制在 GenBI 的 MODEL_PROFILES.default
+# ────────────────────────────────────────
+# Modelfile PARAMETER 是「caller 沒指定時的 default」。GenBI 每個 phase 都
+# 顯式指定 temperature,所以這裡的值幾乎不會被用到 — 設 0 是「最安全的
+# fallback」(對齊 code-gen 期望)。
+PARAMETER temperature 0.0
+PARAMETER top_p 0.95
+PARAMETER top_k 20
+PARAMETER repeat_penalty 1.05
+
+# Qwen3 標準 stop tokens
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# ────────────────────────────────────────
+# 3. Context length
+# ────────────────────────────────────────
+# GenBI Phase C 含完整 intent block 可達 12K token,8K 會截斷;設 12288 安全。
+# 若 VRAM 緊,可降回 8192(常見 Phase A/B/D 在 8K 內)。
+PARAMETER num_ctx 12288
+
+# ────────────────────────────────────────
+# 4. TEMPLATE override(關鍵)
+# ────────────────────────────────────────
+# Qwen3 chat template 的 thinking 觸發機制:
+#   - default:assistant turn 內含 <think>...</think> 推理段 + 最終回答
+#   - 當 user 最近一則 message 結尾含 `/no_think` token → 跳過 <think> 段,
+#     直接生成回答(省 thinking tokens 與 latency)
+#
+# Ollama 預設 template 不會自動加 `/no_think`,所以我們 override TEMPLATE,
+# 在每次 user role 的 .Content 結尾自動接上。System / assistant 不動。
+#
+# 變數說明(Ollama Go template):
+#   .System    系統 prompt(GenBI Phase 0/A/B/C/D 各有自己的)
+#   .Messages  完整對話歷史(GenBI 通常單 user + 單 system,但 follow-up 會多輪)
+#   .Role      'system' | 'user' | 'assistant'
+#   .Content   該 message 內容
+TEMPLATE """{{- if .System -}}
+<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end -}}
+{{- range .Messages -}}
+<|im_start|>{{ .Role }}
+{{ .Content }}{{ if eq .Role "user" }} /no_think{{ end }}<|im_end|>
+{{ end -}}
+<|im_start|>assistant
+"""
+
+# ────────────────────────────────────────
+# 5. (Optional)若你想 system prompt 也帶 GenBI 識別
+# ────────────────────────────────────────
+# 不設 SYSTEM 因為 GenBI 每個 phase 都會傳自己的 system prompt(generate_plan /
+# generate_pipeline 等)。Modelfile SYSTEM 是「caller 沒提供時的 fallback」,
+# 對 GenBI 永遠用不到。

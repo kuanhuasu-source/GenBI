@@ -984,15 +984,225 @@ streamlit run app.py
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 pytest tests/ -v
-# 預期:325 passed in ~5s
+# 預期(v0.16):470 passed in ~6s
 ```
 
 ```
 tests/
 ├── golden_data/           # 7 個 CSV(spec §16.3)
-├── unit/                  # 13 個 module × ~25 tests/module
+├── unit/                  # 13 個 module × ~25 tests/module + v0.16 RAG 6 個新 file
 ├── integration/           # 12 條 end-to-end + setup_confirmed_dataset fixture
 └── acceptance/            # 14 條 spec §16.4/16.5 acceptance criteria
+```
+
+---
+
+## 23. v0.16 · RAG Dynamic Prompt(第三條 architecture pillar)
+
+v0.16 引入 retrieval-augmented prompt 機制,**完全 byte-equal 既有 schema-driven**
+(凍結條款 + 雙 env flag gating)。設計目標:對長 prompt 進行語意動態剪裁,
+降 token + 提升 pass rate,長期向 self-learning loop 接軌。
+
+對應 spec:`GENBI_RAG_PROMPT_DESIGN.md`(1277 行,24 sections)+ `GENBI_RAG_SPRINT_PLAN.md`。
+產出 result:`SPRINT3_RESULT.md`(三個 sprint 的決策軌跡)+ `SPRINT2_RUN_GUIDE.md`(Mac/air-gap 操作)。
+
+### 23.1 三個 Sprint 軌跡(production-validated)
+
+| Sprint | Milestones | 結果 | 狀態 |
+|---|---|---|---|
+| **1** | M6.1 + M6.2 | RAG 基建 + Phase 0/A/D wire | ✅ byte-equal v0.15(RAG-off path) |
+| **2** | M6.4 | tflex 第一批 indices + A/B framework | ✅ **+11.5pp pass-rate**(22→25/26),-10% cost/success |
+| **3** | M6.3 | Phase B/C wire + 3 new indices | ⚠️ 基建 shipped,但 -2 cases vs Sprint 2 → 預設 disabled |
+
+**Production config:**
+
+```bash
+GENBI_RAG_ENABLED=true       # Phase 0/A/D RAG → +11.5pp(champion)
+GENBI_RAG_PHASE_BC=false     # Phase B/C RAG → opt-in only(已知 -2pp regression)
+GENBI_EMBEDDING_MODEL=...    # 指向本地 model 目錄(air-gap)
+HF_HUB_OFFLINE=1             # air-gap 環境必設
+```
+
+### 23.2 5 個 specialized vector index(spec §6 + §8)
+
+每 index 跑自己的 embedding namespace,filter / top-k / max-chars 獨立設計:
+
+| Index | Source | tflex 實際 docs | filter key | max_chars |
+|---|---|---:|---|---:|
+| `schema_index` | `domain_metadata.collections.fields` + `upload_metadata_versions` | ~25(14 tflex + 11 upload) | `domain` | 1200 |
+| `kpi_index` | `domain_metadata.kpi_definitions` + uploads | ~17(11 tflex + 6 upload) | `domain` | 600 |
+| `few_shot_index` | `test_runs.case_results` where `status="pass"` | ~22(dedup by query) | `domain` | 1500 |
+| `anti_pattern_index` | `anti_pattern_seed.ANTI_PATTERNS`(hand-curated) + `learning_instincts`(若有) | 17 seeds | `applies_to_phase` | 800 |
+| `chart_recipe_index` | `domain_metadata.charting_guidance.{recommended_charts,chart_rules}` | ~10 | `intent` | 2000 |
+
+Backend abstraction:`VectorIndexBackend` ABC,3 impl(`InMemoryBackend` 給 test,
+`ChromaBackend` 給 production embedded mode,`QdrantBackend` 留 Phase 3 scale)。
+
+### 23.3 Per-phase retrieval policy(spec §9.2)
+
+| Phase | Slots(orchestrator 自動抽哪些 index) |
+|---|---|
+| `phase_0_plan` | schema, kpi, few_shot |
+| `phase_a_pipeline` | schema, anti_pattern, few_shot |
+| `phase_b_preprocess` | anti_pattern, few_shot ※ Phase B/C gated |
+| `phase_c_chart` | chart_recipe, anti_pattern ※ Phase B/C gated |
+| `phase_d_insight` | kpi |
+
+### 23.4 新模組清單(v0.16+)
+
+```
+embedding_pipeline.py           # sentence-transformers wrapper + fake DI
+rag_index_repository.py         # VectorIndexBackend ABC + 3 backend impl
+rag_index_versions_repository.py # champion / challenger / promotion log
+retrieval_orchestrator.py       # per-phase policy + slot truncation
+anti_pattern_seed.py            # 17 hand-curated rules from validators
+
+scripts/
+├── build_rag_indices.py        # CLI 一次建 5 個 index(--full-rebuild)
+├── inspect_rag_retrieval.py    # diagnose retrieval quality(無 LLM)
+├── diff_test_runs.py           # 兩 run 對比(per-case + token diff)
+└── verify_embedding_model.py   # 離線 model 驗證(SPRINT2_RUN_GUIDE.md §7)
+
+tests/unit/(v0.16 新增 6 個 file,~120 tests)
+├── test_embedding_pipeline.py        # 21 tests
+├── test_rag_index_repository.py      # 28 tests
+├── test_retrieval_orchestrator.py    # 36 tests(含 anti_pattern phase filter)
+├── test_rag_prompt_wire.py           # 25 tests(Phase 0/A/D freeze-clause)
+├── test_rag_phase_bc_wire.py         # 21 tests(Phase B/C wire + gating)
+├── test_anti_pattern_seed.py         # 16 tests
+├── test_few_shot_index.py            # 12 tests
+└── test_chart_recipe_index.py        # 12 tests
+```
+
+### 23.5 既有模組的整合點(v0.16 surgical edits)
+
+```python
+# config.py — 2 個新 env flag
+RAG_ENABLED            # GENBI_RAG_ENABLED       default false(Sprint 1/2)
+RAG_PHASE_BC_ENABLED   # GENBI_RAG_PHASE_BC      default false(Sprint 3 gate)
+
+# prompt_repository.py — render() 自動補空 default
+_RAG_SLOT_DEFAULTS = {"rag_schema":"", "rag_kpi":"", ...}
+# 既有 caller 不傳 rag_* 仍 work,template 加 {%- if rag_X %} 在空字串下不發任何字元
+
+# embedded_prompts.py — 4 個 template 加 {%- if rag_X %}...{%- endif %} guard
+_PHASE_0_PLAN_TEMPLATE       # +schema, +kpi, +few_shot(Sprint 2)
+_PHASE_A_PIPELINE_TEMPLATE   # +schema, +anti_pattern, +few_shot(Sprint 2)
+_PHASE_D_INSIGHT_TEMPLATE    # +kpi(Sprint 2)
+_PHASE_B_HEADER_TEMPLATE_V6  # +anti_pattern, +few_shot(Sprint 3, gated)
+_PHASE_C_HEADER_TEMPLATE     # +chart_recipe, +anti_pattern(Sprint 3, gated)
+# 對應 composer signature 加 rag_* kwargs(default "" → byte-equal v0.15)
+
+# llm_service.py — 4 個變更
+LLMService.__init__         # +retrieval_orchestrator + rag_enabled + (auto-read) rag_phase_bc_enabled
+_retrieve_rag_slots(phase, extra_filters=None)  # 中央 RAG 入口,Phase B/C 自動 gate
+generate_{plan,pipeline,preprocess_code,echarts_option,insight}  # 統一 self._last_query=query 捕捉
+_render_phase_{0,a,b,c,d}_*_prompt  # 統一呼叫 _retrieve_rag_slots(extra_filters={"applies_to_phase":...})
+
+# test_runner.py — 2 個 CLI flag
+--rag-on                    # 啟動 RetrievalOrchestrator + 傳給 LLMService
+--rag-persist-dir DIR       # Chroma 索引目錄(default ./rag_indices)
+# test_runs collection 多 2 個 field:rag_enabled / rag_persist_dir
+```
+
+### 23.6 byte-equal 凍結條款驗證(spec §10.2)
+
+**核心保證:RAG-off 路徑與 v0.15 行為 byte-equal。**
+
+驗證方式(4 個專屬 test):
+- `test_no_jinja_artifacts_in_rag_off_output`:rendered output 無 `{%` / `{{` / `endif` 殘留
+- `test_phase_X_separator_byte_precise`:DK 與下個靜態 section 之間 separator 必為 `"\n\n"`
+- `test_explicit_empty_string_same_as_omitted`:`rag_*=""` vs 不傳 該完全等價
+- `test_dk_immediately_followed_by_static_section`:`(RAG)` substring 不出現於 DK→next section 之間
+
+Jinja2 whitespace control(`{%- if %}` / `{%- endif %}`):當 slot 為空,整個 if-block
+collapse 成 zero bytes。即使加入 RAG 機制,既有 caller(不傳 rag_*)的 rendered prompt
+仍與 v0.15 完全一致 — production 漸進 rollout 的安全網。
+
+### 23.7 Sprint 2 champion 的設計決策
+
+**為什麼 +11.5pp 提升:**
+- `schema_index` 提供 query 相關欄位描述 → Phase 0 plan 更準
+- `kpi_index` 提供相關 KPI 公式 → Phase 0/D 算對指標
+- `few_shot_index` 提供 exact-query 過往成功 pipeline → Phase 0/A 範本化
+- 平均每 case **新增 ~80 tokens**(僅在 active phase),pass-rate **+13.6%** → unit economics -10%
+
+**Production 該調的參數:**
+- `min_score`:default 0.20(Sprint 2 調定)。小 index 上 cosine 上限 ~0.4,
+   threshold 不能太嚴。新 domain 入第一次 build → 跑 inspector PART 3 sweep。
+- `max_chars` per slot:default 跟 spec §9.5 一致。緊張 token budget 時優先削
+   chart_recipe(2000)+ few_shot(1500),保留 schema(1200)。
+- `top_k`:schema 5 / kpi 3 / few_shot 3 / anti_pattern 3 / chart_recipe 3。
+   Phase 3 加 cross-encoder re-rank 後可降 top_k。
+
+### 23.8 Sprint 3 deferred issues(re-enable Phase B/C 前的 checklist)
+
+per `SPRINT3_RESULT.md`:
+
+1. **few_shot_index 從 RAG-ON era runs curate** — 目前 seed 自混合 era 的 test_runs,
+   RAG-OFF era 的 pipeline 可能 mismatch 當前 prompt regime → 改用 self-learning loop 自動 curate
+2. **chart_recipe_index 補 pie / heatmap / scatter recipe** — tflex 目前只有 bar/stacked,
+   非 bar 類 query 取不到 recipe(這也是 production-safe,fallback to phase C 內建 block)
+3. **anti_pattern 跟 static prompt 去重** — Phase B/C prompt 已內含 validator rules,
+   RAG 注入同樣內容稀釋注意力。具體做法:`anti_pattern_seed.ANTI_PATTERNS[i].id`
+   若在 static prompt text 中已被引用 → 跳過 RAG 注入
+
+### 23.9 操作命令參考(Mac / production)
+
+```bash
+# 第一次 setup(model 已 cache 過則跳過 sentence-transformers download)
+pip install sentence-transformers chromadb
+
+# Build 全部 5 個 index(讀 domain_metadata + test_runs + embedded fallback)
+python scripts/build_rag_indices.py --full-rebuild --domain tflex
+
+# 驗證 retrieval 沒 silent / 沒 noise
+python scripts/inspect_rag_retrieval.py
+python scripts/inspect_rag_retrieval.py --query "<specific query>" --skip-sweep
+
+# A/B 跑 test_runner
+python test_runner.py --domain tflex                  # baseline(RAG off)
+python test_runner.py --domain tflex --rag-on        # challenger(Sprint 2 config)
+# 開 Phase B/C(實驗):GENBI_RAG_PHASE_BC=true python test_runner.py --domain tflex --rag-on
+
+# 對比兩 run
+python scripts/diff_test_runs.py \
+    --a-id <baseline_oid> --a-label "OFF" \
+    --b-id <challenger_oid> --b-label "ON"
+```
+
+### 23.10 air-gap 部署 quick reference
+
+完整流程見 `SPRINT2_RUN_GUIDE.md §7`。要點:
+
+```
+1. 有網路機:huggingface-cli download sentence-transformers/all-MiniLM-L6-v2
+2. 整個 ./all-MiniLM-L6-v2 dir rsync 到部署機 → /opt/genbi/models/all-MiniLM-L6-v2
+3. 部署機 .env 加:
+   GENBI_EMBEDDING_MODEL=/opt/genbi/models/all-MiniLM-L6-v2
+   HF_HUB_OFFLINE=1
+   TRANSFORMERS_OFFLINE=1
+4. 驗證:python scripts/verify_embedding_model.py
+5. 部署機只能用 wheel install:見 §7.6
+```
+
+### 23.11 兩個 env flag 的決策矩陣
+
+| `GENBI_RAG_ENABLED` | `GENBI_RAG_PHASE_BC` | 行為 |
+|---|---|---|
+| false | * | byte-equal v0.15(完全停用 RAG;漸進 rollout 起點) |
+| true | false | **production default** — Phase 0/A/D RAG,+11.5pp 提升 |
+| true | true | Sprint 3 實驗模式 — Phase B/C 也注入 RAG(已知 -2pp regression) |
+
+### 23.12 一句話「v0.16 RAG 怎麼跑」
+
+```
+build_rag_indices.py 把 5 個 vector index 從 domain_metadata + test_runs +
+seed 文件 embed 進 Chroma。test_runner.py --rag-on 啟動時,LLMService 透過
+RetrievalOrchestrator 在 Phase 0/A/D 進 LLM call 前,把 user query embed
+→ 跑 cosine similarity → 抽 top-K relevant doc → 注入 prompt 對應 slot。
+Phase B/C 同套機制但 default off(Sprint 3 結論);所有 RAG 路徑都受
+GENBI_RAG_ENABLED env 控制,off 時整套 collapse → v0.15 byte-equal。
 ```
 
 ---

@@ -215,6 +215,26 @@ PROMPT_REPO_ENABLED: bool = os.getenv("GENBI_PROMPT_REPO", "false").lower() in (
 # Cache TTL — repo 讀取後在記憶體保留多久,避免每次 LLM call 都打 DB
 PROMPT_CACHE_TTL_S: int = int(os.getenv("GENBI_PROMPT_CACHE_TTL_S", "60"))
 
+# ── v0.16.0+ RAG dynamic prompt(M6.2 Sprint 1)──
+# False = RAG 機制不啟動,prompt 全走 v0.15 static 內容(byte-equal 保證)
+# True = RetrievalOrchestrator 注入 rag_<slot> kwargs 進 prompt template
+RAG_ENABLED: bool = os.getenv("GENBI_RAG_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# ── v0.16.0+ Phase B/C RAG 分開 gate(M6.3 Sprint 3 結論)──
+# Sprint 2 已驗證 Phase 0/A/D RAG 給出 +11.5pp 提升(25/26 vs 22/26 baseline)。
+# Sprint 3 加 Phase B/C RAG 反而 -2 cases(23/26),原因:
+#   1. few_shot_index 從 RAG-OFF runs 抽,語意 mismatch 可能誤導 LLM
+#   2. Phase B/C 已被 modular intent block + validator 強約束,RAG 注入稀釋注意力
+#   3. anti_pattern 為 Phase B/C 多半 irrelevant(static rules 已涵蓋)
+# 折衷:基礎建設保留(builders + indices + Phase B/C Jinja guards),但預設關閉。
+# 未來開啟條件:
+#   - few_shot_index 改從 RAG-ON 成功 runs curate
+#   - chart_recipe_index 補 pie/heatmap recipes
+#   - 加入 self-learning loop(learning_instincts 流入 anti_pattern)
+RAG_PHASE_BC_ENABLED: bool = os.getenv(
+    "GENBI_RAG_PHASE_BC", "false",
+).lower() in ("true", "1", "yes")
+
 # 4 個 repository 用的 collection 名(可由 env 覆寫,例如多環境共用同 DB 時加前綴)
 PROMPT_COLLECTION: str = os.getenv("GENBI_PROMPT_COLLECTION", "prompt_templates")
 METADATA_COLLECTION: str = os.getenv("GENBI_METADATA_COLLECTION", "domain_metadata")

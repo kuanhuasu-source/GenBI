@@ -210,6 +210,16 @@ class PromptRepository:
     # ------------------------------------------------------------
     # Render(讀 + Jinja2 變數替換)
     # ------------------------------------------------------------
+    # v0.16.0+:RAG slot 名,render() 自動補空字串 default
+    # 確保既有 caller(不傳 rag_*)在 template 加 {%- if rag_X %} 後仍 byte-equal
+    _RAG_SLOT_DEFAULTS = {
+        "rag_schema": "",
+        "rag_kpi": "",
+        "rag_few_shot": "",
+        "rag_anti_pattern": "",
+        "rag_chart_recipe": "",
+    }
+
     def render(self, prompt_key: str, domain: str = "*", **variables: Any) -> str:
         """
         讀 template + Jinja2 render。
@@ -218,6 +228,9 @@ class PromptRepository:
             prompt_key: 6 個固定 key 之一。
             domain: tflex / ecommerce / healthcare / "*"。
             **variables: 模板中 `{{varname}}` 對應的值。
+                v0.16.0+:若未提供 `rag_<slot>` keys,自動補空字串。
+                Template 的 `{%- if rag_X %}...{%- endif %}` 在空字串下不發任何字元
+                → RAG-off 時 prompt byte-equal v0.15 行為。
 
         Returns:
             填入變數後的 prompt 字串。
@@ -228,13 +241,15 @@ class PromptRepository:
                 "Cannot render template: jinja2 not installed. "
                 "Run `pip install jinja2`."
             )
+        # v0.16.0+:auto-inject RAG slot defaults(caller 提供者優先)
+        merged = {**self._RAG_SLOT_DEFAULTS, **variables}
         try:
             template: Template = self._jinja_env.from_string(template_str)
-            return template.render(**variables)
+            return template.render(**merged)
         except Exception as e:
             logger.error(
                 f"Jinja2 render failed for {prompt_key}/{domain}: {e}. "
-                f"Variables provided: {list(variables.keys())}"
+                f"Variables provided: {list(merged.keys())}"
             )
             raise
 

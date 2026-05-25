@@ -5,6 +5,153 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.16.0] · 2026-05-25 — RAG Dynamic Prompt(全套 4 sprints,Sprint 2 champion ship 上線)
+
+**Minor · 第三條 architecture pillar 落地。**
+
+引入 retrieval-augmented prompt 機制,**完全 byte-equal 既有 schema-driven**
+(凍結條款 + 雙 env flag gating)。Sprint 2 champion 上線提供 +11.5pp pass-rate
+提升(22→25/26),−10% cost/success。對應 spec `GENBI_RAG_PROMPT_DESIGN.md`(1277 行)
++ 4 個 sprint plan(8 週)。
+
+**測試:476 passed in ~7s**(v0.15 是 325 個,+151 個新測試)。
+
+### ✨ 4 個 sprint 的軌跡
+
+| Sprint | Milestone | 結果 |
+|---|---|---|
+| 1 | M6.1 + M6.2:RAG 基建 + Phase 0/A/D wire | ✅ byte-equal v0.15(RAG-off path) |
+| 2 | M6.4:tflex 第一批 indices + A/B framework | ✅ **+11.5pp 提升**(champion 上線) |
+| 3 | M6.3:Phase B/C wire + 3 new indices | ⚠️ 基建 shipped,但 −2 cases vs Sprint 2 → 預設 disabled(env flag opt-in) |
+| 4 | M6.5 + M6.6:self-learning RAG + air-gap hardening | ✅ 解決 Sprint 3 #1 deferred + production-ready |
+
+### 📦 新模組(v0.16+)
+
+```
+embedding_pipeline.py             # sentence-transformers wrapper + fake DI
+rag_index_repository.py           # VectorIndexBackend ABC + 3 backend impl
+rag_index_versions_repository.py  # champion / challenger / promotion log
+retrieval_orchestrator.py         # per-phase policy + slot truncation
+anti_pattern_seed.py              # 17 hand-curated rules from validators
+
+scripts/
+├── build_rag_indices.py          # 5 個 index 一鍵建(--full-rebuild)
+├── inspect_rag_retrieval.py      # diagnose retrieval 品質(無 LLM)
+├── diff_test_runs.py             # 兩 run per-case + token diff
+├── verify_embedding_model.py     # 離線 model 驗證
+├── build_wheel_cache.sh          # air-gap wheel 預下載
+└── backup_rag_indices.sh         # Chroma indices backup/restore
+```
+
+### 🔌 既有模組 surgical edits
+
+- **`config.py`** — 2 個新 env:`GENBI_RAG_ENABLED`(主)+ `GENBI_RAG_PHASE_BC`(Sprint 3 gate)
+- **`prompt_repository.py`** — `render()` 自動補空 `rag_*=""` defaults(既有 caller backward compat)
+- **`embedded_prompts.py`** — 5 個 template(Phase 0/A/B/C/D)加 `{%- if rag_X %}` Jinja2 guards(空 slot → byte-equal v0.15)
+- **`llm_service.py`** — `__init__` 接 `retrieval_orchestrator` / `rag_enabled` / `rag_phase_bc_enabled`;中央 `_retrieve_rag_slots(phase, extra_filters)` 入口
+- **`test_runner.py`** — `--rag-on` + `--rag-persist-dir` CLI;test_runs collection 加 `rag_enabled` field 供 A/B 標記
+- **`requirements.txt`** — `sentence-transformers>=2.5` + `chromadb>=0.4.22` + `huggingface_hub>=0.20`
+
+### 🎯 Sprint 2 champion 設計(production-shipped)
+
+5 個 specialized vector index(spec §6 + §8):
+
+| Index | tflex docs | filter | max_chars |
+|---|---:|---|---:|
+| schema_index | 25(14 tflex + 11 upload)| domain | 1200 |
+| kpi_index | 17(11 tflex + 6 upload)| domain | 600 |
+| few_shot_index | 22(dedup query, RAG-on era only after M6.5)| domain | 1500 |
+| anti_pattern_index | 17 seeds(+ learning_instincts active)| applies_to_phase | 800 |
+| chart_recipe_index | 10(tflex)| intent | 2000 |
+
+Per-phase retrieval policy(spec §9.2):
+
+- Phase 0(plan):schema + kpi + few_shot
+- Phase A(pipeline):schema + anti_pattern + few_shot
+- Phase B(preprocess):anti_pattern + few_shot ※ Sprint 3 gated
+- Phase C(chart):chart_recipe + anti_pattern ※ Sprint 3 gated
+- Phase D(insight):kpi
+
+`min_score=0.20` 在 5 個 slot 上 tune 過(Sprint 2 從 0.30 降下來,小 index
+cosine 自然偏低)。
+
+### 🛡️ 凍結條款 byte-equal 驗證(spec §10.2)
+
+4 個專屬 test 驗證:
+- `test_no_jinja_artifacts_in_rag_off_output`:rendered output 無 `{%` / `{{` 殘留
+- `test_phase_X_separator_byte_precise`:DK→next static section 之間必為 `"\n\n"`
+- `test_explicit_empty_string_same_as_omitted`:`rag_*=""` 與不傳完全等價
+- `test_dk_immediately_followed_by_static_section`:`(RAG)` substring 不出現
+
+Jinja2 whitespace control(`{%- if %}` / `{%- endif %}`):空 slot collapse 成
+zero bytes → 既有 caller 不傳 `rag_*` 的 rendered prompt 與 v0.15 完全一致。
+
+### 🔧 M6.5 self-learning RAG 整合(Sprint 4)
+
+- `build_anti_pattern_index`:從 `learning_instincts` `status='active'` 讀(對齊 GenBI 學習 pipeline 慣例,以前錯寫成 'verified');phase normalization(`a`/`phaseA`/`A` → `phase_a`)
+- `build_few_shot_index`:`rag_on_only=True` default — 只從 `test_runs.rag_enabled=True` 抽 few-shot(Sprint 3 #1 deferred ✅ 解決)
+- `--include-rag-off-runs` flag:bootstrap fallback,沒 RAG-on run 可用時用
+
+### 🚀 M6.6 Production deployment(Sprint 4)
+
+- `DEPLOYMENT.md`(9 sections)— venv / air-gap / docker 三種部署型態,systemd unit + timer 範本,embedding model 升級流程,rollback 流程,首次部署 checklist
+- `SPRINT2_RUN_GUIDE.md` §7 — air-gap 離線環境 embedding model 手動部署
+- `scripts/build_wheel_cache.sh` — internet 機抓所有 wheel,搬到部署機 `--no-index --find-links` 安裝
+- `scripts/backup_rag_indices.sh` — Chroma indices `backup` / `restore` / `list` 三個 mode
+
+### 📊 Sprint 2 A/B 實測數字(production-validated)
+
+| 指標 | RAG OFF | **RAG ON(champion)** | Δ |
+|---|---:|---:|---:|
+| Pass | 22/26(85%) | **25/26(96%)** | **+3(+11.5pp)** |
+| Wall clock | 1413.8s | 1482.4s | +5% |
+| Total tokens | 589,915 | 601,299 | +1.9% |
+| Cost / success(GPT-4o-mini 估)| $0.0050 | **$0.0045** | **−10%** |
+
+### ⚠️ Sprint 3 已知 deferred(re-enable Phase B/C 前的 checklist)
+
+per `SPRINT3_RESULT.md` + AI_CONTEXT.md §23.8:
+
+1. ✅ few_shot 從 RAG-ON era runs curate — Sprint 4 / M6.5 解決
+2. ⏳ chart_recipe_index 補 pie / heatmap / scatter recipe(metadata 工作)
+3. ⏳ anti_pattern 跟 static prompt 去重
+4. ⏳ A/B run 證明 ≥+1 case 提升 — 等 #2/#3 完成後再驗
+
+### 📚 文件產出
+
+- `GENBI_RAG_PROMPT_DESIGN.md`(1277 行 / 24 sections)— 設計規格
+- `GENBI_RAG_SPRINT_PLAN.md`(480 行)— 4 sprint × 8 週日程
+- `SPRINT2_RUN_GUIDE.md` — Mac/air-gap 操作完整流程
+- `SPRINT3_RESULT.md` — Sprint 3 deferred 決策軌跡
+- `DEPLOYMENT.md` — Production / air-gap deployment 手冊
+- `AI_CONTEXT.md` §23(210 行)— 整套 v0.16 RAG architecture reference
+
+### 🎯 Production config 上線設定
+
+```bash
+GENBI_RAG_ENABLED=true                   # Phase 0/A/D RAG(+11.5pp champion)
+GENBI_RAG_PHASE_BC=false                 # Phase B/C(Sprint 3 deferred,opt-in)
+GENBI_EMBEDDING_MODEL=/opt/genbi/models/all-MiniLM-L6-v2
+HF_HUB_OFFLINE=1                         # air-gap 必設
+TRANSFORMERS_OFFLINE=1
+```
+
+### 🧪 測試一覽(v0.16 新增 8 個 test file,+151 tests)
+
+```
+tests/unit/
+├── test_embedding_pipeline.py         # 21 tests
+├── test_rag_index_repository.py       # 28 tests
+├── test_retrieval_orchestrator.py     # 36 tests(含 anti_pattern phase filter)
+├── test_rag_prompt_wire.py            # 25 tests(Phase 0/A/D freeze-clause)
+├── test_rag_phase_bc_wire.py          # 21 tests(Phase B/C wire + gating)
+├── test_anti_pattern_seed.py          # 19 tests(含 M6.5 learning integration)
+├── test_few_shot_index.py             # 16 tests(含 M6.5 rag_on_only)
+└── test_chart_recipe_index.py         # 12 tests
+```
+
+---
+
 ## [0.11.2] · 2026-05-17 — `DEPLOY_A100_QWEN36_27B.md` production 部署指南
 
 **Patch · 文件版本。為「從本地 dev → A100 40GB production」的 deployment 寫完整 SOP。**

@@ -15,6 +15,8 @@
 - 🛡️ **三道結構性防禦**:`sanitize_pipeline` / `rescue_empty_echarts` / `ensure_default_styling` 攔住 LLM 常見出包
 - ⛔ **Schema-driven refusal**:LLM 從 metadata 推理該不該拒絕,不靠 hardcoded 關鍵詞
 - 📈 **Baseline + 跑分追蹤**:每次 test_runner 自動寫 `test_runs`,可 vs baseline 對比 pass rate / token
+- 📤 **Upload Workspace(v0.12+)**:BYOD 第二條路徑 — 上傳 CSV/Excel/Parquet → 自動 profile + 語意推理 → 對話分析,不必先建 schema
+- 🔍 **RAG Dynamic Prompt(v0.16+)**:5 個 specialized vector index 動態剪裁 prompt,Sprint 2 champion 上線 +11.5pp pass-rate,-10% cost/success;env flag 即可關回 v0.15 byte-equal
 
 ## 🏗️ 架構
 
@@ -22,17 +24,30 @@
 ┌───────────────────────────────────────────────────────────┐
 │ Layer 1: System Code (domain-agnostic)                     │
 │   - llm_service.py / app.py / repositories                 │
+│   - upload_*.py        (BYOD path, v0.12+)                  │
+│   - retrieval_orchestrator.py (RAG, v0.16+)                 │
 └───────────────────────┬───────────────────────────────────┘
-                        │ injects via Repository layer
+                        │ injects via Repository / Orchestrator
                         ▼
 ┌───────────────────────────────────────────────────────────┐
 │ Layer 2: MongoDB (live content, editable via admin UI)     │
-│   - prompt_templates   (5 phase prompts, Jinja2)            │
-│   - domain_metadata    (schema / KPI / 限制)                │
-│   - test_cases         (per-domain test definitions)        │
-│   - test_runs          (歷史 baseline + 跑分快照)            │
+│   - prompt_templates    (5 phase prompts, Jinja2)           │
+│   - domain_metadata     (schema / KPI / 限制)               │
+│   - upload_* (7 colls)  (datasets / profiles / metadata)    │
+│   - test_cases          (per-domain test definitions)       │
+│   - test_runs           (歷史 baseline + 跑分快照,含 rag_*) │
+│   - rag_index_versions  (champion / challenger 紀錄)        │
+│   - learning_* (3 colls)(self-learning observations…)       │
 └───────────────────────┬───────────────────────────────────┘
                         │ 60s cache + embedded fallback (緊急救援)
+                        ▼
+┌───────────────────────────────────────────────────────────┐
+│ Layer 2.5: RAG Vector Indices (Chroma embedded, v0.16+)    │
+│   - schema_index / kpi_index / few_shot_index               │
+│   - anti_pattern_index / chart_recipe_index                 │
+│   - sentence-transformers/all-MiniLM-L6-v2 (384-dim, CPU)   │
+└───────────────────────┬───────────────────────────────────┘
+                        │ slot injection per phase
                         ▼
 ┌───────────────────────────────────────────────────────────┐
 │ Layer 3: LLM (Qwen 3 Coder / vLLM / Ollama / OpenAI)        │
@@ -73,7 +88,12 @@ python migrations/003_seed_test_cases.py
 # 5. 啟用 repo 模式(.env 加一行 或 export)
 echo "GENBI_PROMPT_REPO=true" >> .env
 
-# 6. 啟動 Streamlit UI
+# 6. (v0.16.0+ optional) 啟用 RAG dynamic prompt(+11.5pp pass-rate)
+# 第一次跑會下載 sentence-transformers/all-MiniLM-L6-v2(~90MB)
+python scripts/build_rag_indices.py --full-rebuild --domain tflex
+echo "GENBI_RAG_ENABLED=true" >> .env
+
+# 7. 啟動 Streamlit UI
 streamlit run app.py
 ```
 
@@ -220,29 +240,37 @@ python admin/compare_baseline.py
 
 ## 📜 文件
 
-- `CHANGELOG.md` — SemVer 變更紀錄(v0.1.0 → v0.11.x)
-- `AI_CONTEXT.md` — LLM agent / 接手開發者用的單檔簡介(架構 + API + deployment)
+- `CHANGELOG.md` — SemVer 變更紀錄(v0.1.0 → **v0.16.0**)
+- `AI_CONTEXT.md` — LLM agent / 接手開發者用的單檔簡介(架構 + API + deployment;**§22 Upload Workspace + §23 RAG**)
 - `AI_CODE.md` — 完整源碼快照(用 `python make_ai_code.py` 重新產生)
 - `SELF_LEARNING_OPS.md` — **v0.11.0+ 維運手冊**(self-learning pipeline 操作 / 監控 / 故障排除)
+- `DEPLOYMENT.md` — **v0.16.0+ production / air-gap 部署手冊**(systemd / wheel cache / model upgrade / rollback)
+- `GENBI_RAG_PROMPT_DESIGN.md` — **v0.16.0 RAG 動態 prompt 規格**(24 sections,1277 行)
+- `GENBI_RAG_SPRINT_PLAN.md` — RAG 4 sprint 日程 + acceptance criteria
+- `SPRINT2_RUN_GUIDE.md` — Mac/air-gap 操作完整流程(含 embedding model 離線安裝)
+- `SPRINT3_RESULT.md` — Sprint 3 Phase B/C wire 決策軌跡 + deferred checklist
+- `GenBI_Upload_Workspace_System_Extension_Spec_v0.2.pdf` — Upload Workspace BYOD 系統規格(v0.12+)
 - `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` — Self-learning MVP 實作規格
 - `STACKED_BAR_TEST.md` — Stacked bar 8 個 STK case 測試規格
 - `TEST_PLAN.md` — 18 case 主測試計畫(v0.2.x 版本)
 - `TEST_UX_SCENARIOS.md` — 57 case UX 整合測試
 
-## 🆕 v0.4-v0.11 重要里程碑
+## 🆕 v0.4-v0.16 重要里程碑
 
 - **v0.4.0** PPTX export(matplotlib renderer / table fallback / Insight bullet)
 - **v0.5.0/6.0** Phase B/C prompt 拆 router + intent block(prompt size -40%)
 - **v0.7.0** `task_trace` module + admin UI 第 5 頁(每 query 完整 LLM call 紀錄)
-- **v0.8-v0.9** Self-learning MVP 7 個 module:bootstrap / failure_filter / observation_extractor / verifier(4-comp confidence) / instinct_consolidator(Jaccard cluster + contradiction) / resolution_detector / candidate_generator / regression_gate / dashboard_metrics + admin UI 第 6 頁 + nightly cron orchestrator
+- **v0.8-v0.9** Self-learning MVP 7 個 module:bootstrap / failure_filter / observation_extractor / verifier / instinct_consolidator(Jaccard cluster + contradiction)/ resolution_detector / candidate_generator / regression_gate / dashboard_metrics + admin UI 第 6 頁 + nightly cron orchestrator
 - **v0.10.0** Composite chart layout(sidebar 精簡/標準/複合)+ Q side panel
 - **v0.10.4-0.10.5** Phase B/C **semantic validator**(抓「exec OK 但內容錯」silent failure)
 - **v0.10.6** **Model profile system**(`default` vs `reasoning_distilled`,per-phase sampling + `<think>` strip)
-- **v0.10.7** `bench_model.py` benchmark tool + Modelfile-coder30b(8K ctx),確定主力模型 **qwen3-coder:30b**(對照 80B-A3B / 35B-A3B 都明顯較慢)
-- **v0.11.0** test_runner.py 接 TaskTrace,baseline run 也餵料給 self-learning loop
-- **v0.11.0.1** 修 task_trace datetime 序列化 bug(自 v0.7.0 起的隱形問題,failure_filter 終於能 match)
+- **v0.10.7** `bench_model.py` benchmark tool,確定主力模型 **qwen3-coder:30b**
+- **v0.11.0** test_runner 接 TaskTrace,baseline run 也餵料給 self-learning loop
+- **v0.12-v0.13** **Upload Workspace MVP**(BYOD 路徑):MetadataProvider 抽象 / file parser / semantic profiler(12 roles)/ Phase A pandas + safe_exec sandbox / PII detector / Phase A validator(5 checks)/ Saved Charts + Saved Metrics(寫回 kpi_definitions)
+- **v0.14-v0.15** Upload Workspace Phase 2:Excel multi-sheet / parquet direct upload / profile versioning / relationship profiler / upload → domain export / DuckDB SQL engine / Analysis Template cross-dataset apply
+- **v0.16.0** 🔍 **RAG Dynamic Prompt**(4 sprints,Sprint 2 champion):5 specialized vector index / per-phase retrieval policy / `{%- if rag_X %}` Jinja guards / sentence-transformers + Chroma 本地 embedding / air-gap deployment hardening / 476 tests(+151)
 
-**v0.10.7 baseline**: 24/26 (92%) pass · 1346s wall clock · 134 LLM call
+**v0.16.0 baseline**(Sprint 2 RAG-on champion): **25/26 (96%) pass** · 1482s wall · 140 LLM call · cost $0.0045/success(-10% vs v0.15.0 baseline 22/26)
 
 ## 📝 License
 

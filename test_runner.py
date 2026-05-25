@@ -1393,6 +1393,18 @@ def main() -> int:
         action="store_true",
         help="跑完自動標為 baseline(等同 --no-save-run 的反面)",
     )
+    # v0.16.0+ M6.4 Sprint 2:RAG A/B 旗標
+    parser.add_argument(
+        "--rag-on",
+        action="store_true",
+        help="啟動 RAG dynamic prompt(Phase 0/A/D 走 retrieval orchestrator)。"
+             "需要先跑過 scripts/build_rag_indices.py 才有 index 可讀。",
+    )
+    parser.add_argument(
+        "--rag-persist-dir",
+        default="./rag_indices",
+        help="RAG Chroma persist directory(預設 ./rag_indices)",
+    )
     args = parser.parse_args()
 
     banner(f" GenBI · Test Runner · domain={args.domain} ", "═")
@@ -1461,6 +1473,40 @@ def main() -> int:
         prompt_repo = None
         task_md = None
 
+    # v0.16.0+ M6.4:RAG orchestrator(off by default,--rag-on 啟用)
+    retrieval_orch = None
+    if args.rag_on:
+        try:
+            from embedding_pipeline import get_embedding_pipeline
+            from rag_index_repository import (
+                RAGIndexRepository, make_chroma_factory,
+            )
+            from retrieval_orchestrator import RetrievalOrchestrator
+            _persist_dir = args.rag_persist_dir
+            print(f"RAG       : ON · indices={_persist_dir}")
+            _ep = get_embedding_pipeline()
+            print(f"            embedder={_ep.model_name}(dim={_ep.dim})")
+            _rag_repo = RAGIndexRepository(
+                backend_factory=make_chroma_factory(_persist_dir),
+            )
+            retrieval_orch = RetrievalOrchestrator(
+                rag_repo=_rag_repo, embedding_pipeline=_ep,
+            )
+            # Fail-loud:若 schema_index 是空,警告 user(可能忘了 build)
+            try:
+                _cnt = _rag_repo.count("schema_index")
+                print(f"            schema_index doc count: {_cnt}")
+                if _cnt == 0:
+                    print("⚠️  schema_index empty — 跑 scripts/build_rag_indices.py 先 build")
+            except Exception as e:
+                print(f"⚠️  RAG count check failed: {e}")
+        except Exception as e:
+            print(f"❌ RAG init failed: {e}")
+            print("   Hint:確認 sentence-transformers + chromadb 已裝,且 ./rag_indices 存在。")
+            return 2
+    else:
+        print("RAG       : OFF(--rag-on 啟用)")
+
     llm = LLMService(
         api_url=OLLAMA_URL,
         api_key=OLLAMA_KEY,
@@ -1472,6 +1518,8 @@ def main() -> int:
         domain=args.domain,
         model_profile=LLM_MODEL_PROFILE,  # v0.10.6.1
         disable_thinking=config.LLM_DISABLE_THINKING,  # v0.13.3
+        retrieval_orchestrator=retrieval_orch,         # v0.16.0+ M6.4
+        rag_enabled=bool(args.rag_on),                 # v0.16.0+ M6.4
     )
 
     results = []
@@ -1653,6 +1701,9 @@ def main() -> int:
                     f"Auto-marked baseline at {_dt.datetime.now(_dt.timezone.utc).isoformat()}"
                     if args.baseline else ""
                 ),
+                # v0.16.0+ M6.4:RAG A/B run flag(讓兩次 run 的 summary 一眼可比)
+                "rag_enabled": bool(args.rag_on),
+                "rag_persist_dir": args.rag_persist_dir if args.rag_on else None,
             }, active_versions=active_versions or None)
             print(f"\n📦 test_runs 寫入 OK · _id={inserted_id}"
                   + (" · 已標 baseline" if args.baseline else ""))

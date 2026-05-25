@@ -36,3 +36,11 @@ openpyxl>=3.1.0
 
 # v0.15.0+ (M5.5): DuckDB Phase A engine(大檔 >100K row 走 SQL path)
 duckdb>=1.0.0
+
+# v0.16.0+ (Sprint 1-3): RAG dynamic prompt
+# sentence-transformers all-MiniLM-L6-v2 是預設 embedder(~90MB,CPU-only)
+sentence-transformers>=2.5.0
+# Chroma embedded mode(無 server,純 file-based vector store)
+chromadb>=0.4.22
+# 直接 import 用(用於 air-gap 模型下載 huggingface-cli)
+huggingface_hub>=0.20.0
