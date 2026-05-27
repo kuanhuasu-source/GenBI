@@ -5,6 +5,93 @@ All notable changes to GenBI will be documented in this file.
 
 ---
 
+## [0.17.0] · 2026-05-27 — UI Refactor:3-page split + Progressive phase render + st.navigation
+
+**Minor · 三個 UX 痛點一次解掉。**
+
+對應 spec `UI_REFACTOR_PLAN.md`(486 行,3 個 sprint A1 / A2 / B 全部落地)。
+凍結 `upload_analysis_service.handle_query` backward compat —
+既有 caller 不傳 `on_phase` kwarg → 行為 byte-equal v0.16。
+
+**測試:482 passed in ~7s**(v0.16 是 476,+6 個新測試:4 個 callback test + 2 個 page sanity)。
+
+### ✨ 3 個 Sprint
+
+| Sprint | Problem | Solution |
+|---|---|---|
+| A1 | Upload workspace 1608 行混在一頁,資料準備 vs 分析無法分離 | Split → `pages/07_data_workspace.py`(sections 1-9)+ `pages/08_data_analysis.py`(新檔,sections 10-12)+ `pages/09_saved_assets.py`(從 08 rename) |
+| A2 | 分析過程 30-60s 阻塞,使用者看不到進度 | `upload_analysis_service.handle_query(..., on_phase=callback)` · 5 個 phase 邊界 fire start/complete/error/skipped event,UI 漸進渲染 |
+| B  | Sidebar 9 page 平鋪,admin 與分析混雜 | `app.py` 從 1508 行縮到 83 行,用 `st.navigation()` 分 2 組:📊 分析工作區(expanded)+ ⚙️ 系統管理(collapsed);chat 內容拆到 `pages/main_chat.py` |
+
+### 📦 新檔(v0.17+)
+
+```
+pages/main_chat.py               # 從 app.py 拆出(~1510 行)·schema-driven 主對話
+pages/07_data_workspace.py       # 從原 07_upload_workspace.py sections 1-9 拆出
+pages/08_data_analysis.py        # 新檔 · Dataset picker + 漸進 phase 渲染 + Save Asset + Debug
+pages/09_saved_assets.py         # 從原 08_saved_assets.py rename
+tests/unit/test_upload_analysis_service.py  # 4 個 callback 行為 test
+```
+
+### 🔌 既有模組 surgical edits
+
+- **`app.py`** — 1508 → 83 行 · 純 `st.navigation()` registry · 唯一 `st.set_page_config()` 呼叫點
+- **`upload_analysis_service.py`** — `handle_query` 加 `on_phase: Optional[PhaseCallback] = None` kwarg · 5 phase boundaries 各加 callback fire · `_safe_emit_phase` helper(callback raise 不阻斷 pipeline)
+- **9 個 pages/** — `st.set_page_config(...)` 整段移除(`st.navigation` 規則:只能 main app 設一次)
+- **`requirements.txt`** — `streamlit>=1.30.0` → `>=1.36.0`(`st.navigation()` stable from 1.36)
+
+### 📋 Callback event taxonomy(progressive render API)
+
+| phase_id × event | payload |
+|---|---|
+| `phase_0_plan` / start | `{"query": str}` |
+| `phase_0_plan` / complete | `{"plan_text", "elapsed_s", "is_refusal"}` |
+| `phase_a_pipeline` / start | `{}` |
+| `phase_a_pipeline` / complete | `{"code", "raw_df_info", "elapsed_s"}` |
+| `phase_b_preprocess` / complete | `{"code", "Q_info", "Q_preview_md", "elapsed_s"}` |
+| `phase_c_chart` / complete | `{"code", "chart_option", "use_table_fallback", "elapsed_s"}` |
+| `phase_d_insight` / complete | `{"insight", "elapsed_s"}` |
+| `phase_d_insight` / skipped | `{"reason": str}`(`enable_insight=False`) |
+| any / error | `{"phase", "error", "traceback"}` |
+
+### 🔒 凍結驗證(byte-equal v0.16)
+
+- `on_phase=None`(既有 caller default)→ service 跑完 5 phase 邏輯與 v0.16 完全一致 — 新增 `_safe_emit_phase` 在 None 時直接 return
+- 既有 470+ unit tests 全綠(現 482 個)
+- 既有 integration tests `test_upload_pipeline.py` 全綠
+- Callback 若 raise(UI bug)→ log warning 但不阻斷 pipeline(test: `test_on_phase_callback_exception_does_not_break_pipeline`)
+
+### 🧭 新導航結構
+
+```
+📊 分析工作區(default expanded)
+├── 💬 Schema-driven 分析      → pages/main_chat.py(default page)
+├── 📊 Upload 分析             → pages/08_data_analysis.py
+├── 📤 資料準備                → pages/07_data_workspace.py
+└── ⭐ 已存圖表                → pages/09_saved_assets.py
+
+⚙️ 系統管理(Admin · default collapsed)
+├── 🗂️ Metadata 編輯          → pages/04_metadata.py
+├── 📝 Prompt 編輯             → pages/03_prompts.py
+├── 🧪 測試案例                → pages/01_test_cases.py
+├── 📊 測試紀錄                → pages/02_test_runs.py
+├── 🔍 Trace 追蹤              → pages/05_task_traces.py
+└── 🤖 自學審核                → pages/06_learning_review.py
+```
+
+### 🚨 Breaking change(僅影響開發者直接執行的命令)
+
+- `streamlit run app.py` 入口語意不變(仍是 main app),但 sidebar 結構改了:從「9 頁平鋪」變成「2 組分組」
+- 已不存在的舊路徑:`pages/07_upload_workspace.py`、`pages/08_saved_assets.py`(被 split / rename)
+- 若有 deploy script / Dockerfile 寫死 `streamlit run app.py` — 不需改
+- ⚠️ 需要 `pip install -U "streamlit>=1.36"` 才會有 `st.navigation()` API
+
+### 🚀 跨頁 state 新增
+
+- `st.session_state["analysis_dataset_id"]` — `pages/07` confirm metadata 後寫入,`pages/08` 進頁 default 選此 dataset。讓資料準備 → 分析的 mental flow 一次完成。
+
+---
+
 ## [0.16.0] · 2026-05-25 — RAG Dynamic Prompt(全套 4 sprints,Sprint 2 champion ship 上線)
 
 **Minor · 第三條 architecture pillar 落地。**

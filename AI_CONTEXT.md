@@ -868,7 +868,7 @@ Backfill script:`scripts/backfill_task_traces_datetime.py`(dry-run by default,`-
 | Phase A | `generate_pipeline` → MongoDB JSON pipeline | `generate_pandas_extraction` → Pandas filter,或 `duckdb_engine.execute_safe` → SQL |
 | Phase 0 plan prompt | `phase_0_plan`(描述 A 段為 MongoDB)| `phase_0_plan_upload`(描述 A 段為 Pandas filter)|
 | Sandbox | `sanitize_pipeline` strip 派生 operator | `safe_exec_pandas`(restricted builtins + timeout + row limit)+ `phase_a_validator`(static check) |
-| Chat orchestrator | `app.py` 主對話 | `pages/07_upload_workspace.py` Section 10 + `upload_analysis_service.py` |
+| Chat orchestrator | `pages/main_chat.py` 主對話(v0.17 從 app.py 拆出) | `pages/08_data_analysis.py` Section 10 + `upload_analysis_service.py`(v0.17 從原 07 拆出) |
 | 資產化 | (無) | Saved Chart / Saved Metric(寫回 kpi_definitions) / Analysis Template |
 | Test runner | `test_runner.py`(26 case baseline)| 路徑與 upload **零交集**,baseline 不受影響 |
 
@@ -915,10 +915,14 @@ upload_to_domain_exporter.py     — 把 confirmed upload metadata 寫成 schema
 duckdb_engine.py                 — DuckDB SQL engine(大檔 >100K row 走 SQL path) + safety
 template_compatibility.py        — Analysis Template 跨 dataset compatibility 評估
 
-pages/07_upload_workspace.py     — Streamlit UI(Section 1-12:Upload / Profile /
-                                    Field Review / Status Code / Grain / Confirm /
-                                    Chat / Save Asset / Debug Panel)
-pages/08_saved_assets.py         — Saved Chart / Metric / Template 瀏覽 + rerun / rename / 軟刪除
+pages/07_data_workspace.py       — v0.17 拆分後:Upload / Profile / Field Review /
+                                    Status Code / Grain / Confirm(原 07 sections 1-9)
+pages/08_data_analysis.py        — v0.17 新檔:Dataset picker + Chat + Save Asset +
+                                    Debug Panel(原 07 sections 10-12)+ 漸進 phase 渲染
+pages/09_saved_assets.py         — v0.17 從 08 rename:Saved Chart / Metric / Template
+                                    瀏覽 + rerun / rename / 軟刪除
+pages/main_chat.py               — v0.17 從 app.py 拆出:schema-driven 主對話
+                                    (app.py 變成 st.navigation registry)
 ```
 
 ### 22.4 7 個新 MongoDB collection

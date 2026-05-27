@@ -1,5 +1,6 @@
 # UI 前端框架
-streamlit>=1.30.0
+# v0.17 · 升到 1.36+:st.navigation() stable，啟用 sidebar 分組導航
+streamlit>=1.36.0
 
 # LLM API 溝通 (用來打 vLLM 的 OpenAI 相容 API)
 openai>=1.10.0

@@ -7,7 +7,7 @@ Upload Workspace 的對話分析 orchestrator — 對應 schema-driven `app.py` 
 # 5-phase pipeline(對應 app.py 行 755-1408)
 
 ```
-caller (pages/07_upload_workspace.py Section 10) 給 query
+caller (pages/08_data_analysis.py Section 10) 給 query
    │
    ▼
 [Pre-Phase 0]  classify_intent_for_query
@@ -50,9 +50,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pandas as pd
 import numpy as np
@@ -80,6 +81,33 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # Sandbox safety helper
 # ============================================================
+# v0.17.0 · Progressive phase callback
+# Event taxonomy (see UI_REFACTOR_PLAN Sprint A2):
+#   phase_id: 'phase_0_plan' | 'phase_a_pipeline' | 'phase_b_preprocess'
+#             | 'phase_c_chart' | 'phase_d_insight'
+#   event:    'start' | 'complete' | 'error' | 'skipped'
+PhaseCallback = Callable[[str, str, dict], None]
+
+
+def _safe_emit_phase(
+    on_phase: Optional[PhaseCallback],
+    phase_id: str,
+    event: str,
+    payload: dict,
+) -> None:
+    """Best-effort callback invocation。on_phase 為 None 時 no-op,
+    callback raise 時 log warning 但不阻斷 pipeline。
+    """
+    if on_phase is None:
+        return
+    try:
+        on_phase(phase_id, event, payload)
+    except Exception as e:
+        logger.warning(
+            f"on_phase callback failed for {phase_id}/{event}: {e}"
+        )
+
+
 def _build_phase_a_namespace(source_df: pd.DataFrame) -> dict:
     """為 Phase A exec 建構 restricted namespace。
 
@@ -147,6 +175,7 @@ class UploadAnalysisService:
         query: str,
         chart_engine: str = "ECharts",
         enable_insight: bool = True,
+        on_phase: Optional[PhaseCallback] = None,
     ) -> dict:
         """端對端跑 query — 寫進 session,寫 task_trace,回完整 result dict。
 
@@ -155,6 +184,13 @@ class UploadAnalysisService:
             query: 使用者輸入字串
             chart_engine: 'ECharts' or 'Plotly'
             enable_insight: True 才跑 Phase D
+            on_phase: v0.17 新增 · Optional progressive callback。
+                Signature: `(phase_id: str, event: str, payload: dict) -> None`
+                phase_id: 'phase_0_plan' | 'phase_a_pipeline' |
+                          'phase_b_preprocess' | 'phase_c_chart' | 'phase_d_insight'
+                event:    'start' | 'complete' | 'error' | 'skipped'
+                None(default)→ 不發 callback,行為 byte-equal v0.16。
+                Callback raise 不會阻斷 pipeline(會 log warning)。
 
         Returns:
             result dict:
@@ -214,6 +250,7 @@ class UploadAnalysisService:
                 enable_insight=enable_insight,
                 trace=trace,
                 session=session,
+                on_phase=on_phase,
             )
         finally:
             self.llm.trace = None  # 一定 detach
@@ -230,6 +267,7 @@ class UploadAnalysisService:
         enable_insight: bool,
         trace: TaskTrace,
         session: dict,
+        on_phase: Optional[PhaseCallback] = None,
     ) -> dict:
         last_analysis = session.get("last_analysis")
 
@@ -267,16 +305,28 @@ class UploadAnalysisService:
         # Phase 0: Plan
         # ────────────────────────────────────────
         plan_text = ""
+        _t0_phase0 = time.time()
+        _safe_emit_phase(on_phase, "phase_0_plan", "start", {"query": query})
         try:
             with trace.step("phase_0_plan", kind="llm_call"):
                 plan_res = self.llm.generate_plan(
                     query, followup_context=followup_context,
                 )
             if plan_res["status"] == "error":
+                _safe_emit_phase(
+                    on_phase, "phase_0_plan", "error",
+                    {"phase": "phase_0_plan", "error": plan_res["message"],
+                     "traceback": ""},
+                )
                 trace.finalize(status="failed", error=plan_res["message"])
                 return self._error_result(plan_res["message"], trace=trace)
             plan_text = plan_res["message"]
         except Exception as e:
+            _safe_emit_phase(
+                on_phase, "phase_0_plan", "error",
+                {"phase": "phase_0_plan", "error": str(e),
+                 "traceback": traceback.format_exc()},
+            )
             trace.finalize(status="failed", error=str(e))
             return self._error_result(f"Phase 0 失敗:{e}", trace=trace)
 
@@ -287,6 +337,15 @@ class UploadAnalysisService:
             or any(kw in plan_text[:400] for kw in (
                 "無法執行", "無法分析", "無法計算", "資料限制觸犯",
             ))
+        )
+        # v0.17:Phase 0 完成事件(含 is_refusal 旗標,讓 UI 決定是否往下顯示)
+        _safe_emit_phase(
+            on_phase, "phase_0_plan", "complete",
+            {
+                "plan_text": plan_text,
+                "elapsed_s": time.time() - _t0_phase0,
+                "is_refusal": is_refusal,
+            },
         )
         if is_refusal:
             clean_msg = plan_text.replace("[REFUSE]", "").strip()
@@ -308,6 +367,9 @@ class UploadAnalysisService:
         # ────────────────────────────────────────
         # Phase A: Pandas filter
         # ────────────────────────────────────────
+        _t0_phase_a = time.time()
+        _safe_emit_phase(on_phase, "phase_a_pipeline", "start", {})
+
         # 載入 source_df
         try:
             tables = self.repo.list_tables(dataset_id)
@@ -318,6 +380,11 @@ class UploadAnalysisService:
             source_df = file_parser.load_parquet(parquet_path)
             source_columns = list(source_df.columns)
         except Exception as e:
+            _safe_emit_phase(
+                on_phase, "phase_a_pipeline", "error",
+                {"phase": "phase_a_pipeline", "error": str(e),
+                 "traceback": traceback.format_exc()},
+            )
             trace.finalize(status="failed", error=str(e))
             return self._error_result(f"載入 parquet 失敗:{e}", trace=trace)
 
@@ -330,6 +397,11 @@ class UploadAnalysisService:
         # v0.14.2+: 檢查 source_df 沒爆 row/col limit(MVP 100K rows)
         ok, limit_err = check_dataframe_limits(source_df, max_rows=100_000)
         if not ok:
+            _safe_emit_phase(
+                on_phase, "phase_a_pipeline", "error",
+                {"phase": "phase_a_pipeline", "error": limit_err,
+                 "traceback": ""},
+            )
             trace.finalize(status="failed", error=limit_err)
             return self._error_result(limit_err, trace=trace)
 
@@ -388,6 +460,12 @@ class UploadAnalysisService:
             except Exception:
                 phase_a_err = traceback.format_exc()
                 if attempt >= 2:
+                    _safe_emit_phase(
+                        on_phase, "phase_a_pipeline", "error",
+                        {"phase": "phase_a_pipeline",
+                         "error": "Phase A 連續 3 次失敗",
+                         "traceback": phase_a_err},
+                    )
                     trace.finalize(status="failed", error=phase_a_err)
                     return self._error_result(
                         f"Phase A 連續 3 次失敗,最後錯誤:\n{phase_a_err[:300]}",
@@ -395,14 +473,35 @@ class UploadAnalysisService:
                     )
 
         if raw_df is None:
+            _safe_emit_phase(
+                on_phase, "phase_a_pipeline", "error",
+                {"phase": "phase_a_pipeline", "error": "raw_df 未取得",
+                 "traceback": ""},
+            )
             trace.finalize(status="failed", error="raw_df 未取得")
             return self._error_result("Phase A 完成但 raw_df 為空", trace=trace,
                                        phase_a_code=phase_a_code)
+
+        # v0.17:Phase A 完成事件
+        _safe_emit_phase(
+            on_phase, "phase_a_pipeline", "complete",
+            {
+                "code": phase_a_code,
+                "raw_df_info": {
+                    "n_rows": int(len(raw_df)),
+                    "columns": list(raw_df.columns),
+                },
+                "elapsed_s": time.time() - _t0_phase_a,
+            },
+        )
 
         # ────────────────────────────────────────
         # Phase B: Pandas processing(reuse 既有 generate_preprocess_code)
         # v0.14.2+: 走 safe_exec(同 Phase A)
         # ────────────────────────────────────────
+        _t0_phase_b = time.time()
+        _safe_emit_phase(on_phase, "phase_b_preprocess", "start", {})
+
         workflow_ns: dict = {"pd": pd, "np": np, "raw_df": raw_df}
         dashboard_mode = is_dashboard_query(query)
         try:
@@ -455,6 +554,12 @@ class UploadAnalysisService:
             except Exception:
                 phase_b_err = traceback.format_exc()
                 if attempt >= 2:
+                    _safe_emit_phase(
+                        on_phase, "phase_b_preprocess", "error",
+                        {"phase": "phase_b_preprocess",
+                         "error": "Phase B 連續 3 次失敗",
+                         "traceback": phase_b_err},
+                    )
                     trace.finalize(status="failed", error=phase_b_err)
                     return self._error_result(
                         f"Phase B 連續 3 次失敗:\n{phase_b_err[:300]}",
@@ -464,6 +569,11 @@ class UploadAnalysisService:
                     )
 
         if Q is None or (hasattr(Q, "empty") and Q.empty):
+            _safe_emit_phase(
+                on_phase, "phase_b_preprocess", "error",
+                {"phase": "phase_b_preprocess", "error": "Phase B Q 為空",
+                 "traceback": ""},
+            )
             trace.finalize(status="failed", error="Phase B Q 為空")
             return self._error_result(
                 "Phase B 完成但 Q 為空", trace=trace,
@@ -471,9 +581,30 @@ class UploadAnalysisService:
                 phase_b_code=phase_b_code,
             )
 
+        # v0.17:Phase B 完成事件
+        try:
+            _q_preview_md = Q.head(5).to_markdown(index=False)
+        except Exception:
+            _q_preview_md = Q.head(5).to_string(index=False)
+        _safe_emit_phase(
+            on_phase, "phase_b_preprocess", "complete",
+            {
+                "code": phase_b_code,
+                "Q_info": {
+                    "n_rows": int(len(Q)),
+                    "columns": list(Q.columns),
+                },
+                "Q_preview_md": _q_preview_md,
+                "elapsed_s": time.time() - _t0_phase_b,
+            },
+        )
+
         # ────────────────────────────────────────
         # Phase C: Visualization
         # ────────────────────────────────────────
+        _t0_phase_c = time.time()
+        _safe_emit_phase(on_phase, "phase_c_chart", "start", {})
+
         phase_c_code = None
         phase_c_err = None
         final_option: dict | None = None
@@ -538,11 +669,24 @@ class UploadAnalysisService:
                     final_option = {"_use_table": True, "_phase_c_fallback": True}
                     final_fig = None
 
+        # v0.17:Phase C 完成事件(含 fallback flag)
+        _safe_emit_phase(
+            on_phase, "phase_c_chart", "complete",
+            {
+                "code": phase_c_code,
+                "chart_option": final_option,
+                "use_table_fallback": use_table_fallback,
+                "elapsed_s": time.time() - _t0_phase_c,
+            },
+        )
+
         # ────────────────────────────────────────
         # Phase D: Insight(optional)
         # ────────────────────────────────────────
         insight_text = None
         if enable_insight:
+            _t0_phase_d = time.time()
+            _safe_emit_phase(on_phase, "phase_d_insight", "start", {})
             try:
                 q_preview_md = Q.head(30).to_markdown(index=False)
             except Exception:
@@ -554,8 +698,26 @@ class UploadAnalysisService:
                     )
                 if insight_res["status"] == "success":
                     insight_text = insight_res["message"]
+                _safe_emit_phase(
+                    on_phase, "phase_d_insight", "complete",
+                    {
+                        "insight": insight_text or "",
+                        "elapsed_s": time.time() - _t0_phase_d,
+                    },
+                )
             except Exception as e:
                 logger.warning(f"Phase D 失敗(不阻塞):{e}")
+                # Phase D 失敗不阻塞主流程,但要通知 UI
+                _safe_emit_phase(
+                    on_phase, "phase_d_insight", "error",
+                    {"phase": "phase_d_insight", "error": str(e),
+                     "traceback": traceback.format_exc()},
+                )
+        else:
+            _safe_emit_phase(
+                on_phase, "phase_d_insight", "skipped",
+                {"reason": "enable_insight=False"},
+            )
 
         # ────────────────────────────────────────
         # 寫 session.messages + last_analysis

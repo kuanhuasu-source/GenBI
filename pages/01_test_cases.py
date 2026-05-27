@@ -40,11 +40,7 @@ from test_case_repository import (
 # ============================================================
 # 頁面設定
 # ============================================================
-st.set_page_config(
-    page_title="GenBI · Test Cases",
-    page_icon="🧪",
-    layout="wide",
-)
+# v0.17:set_page_config 改在 app.py 統一設定(st.navigation 規則)
 st.markdown(
     "<h1 style='font-size:2.2rem;margin:0 0 .3rem 0'>🧪 Test Case Admin</h1>",
     unsafe_allow_html=True,

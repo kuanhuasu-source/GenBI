@@ -1,5 +1,5 @@
 """
-pages/08_saved_assets.py — v0.13.2+ (M3A)
+pages/09_saved_assets.py — v0.13.2+ (M3A) — renamed from 08 in v0.17 UI refactor
 
 Saved Assets Panel — 瀏覽 / 重執行 / 重命名 / 刪除 saved chart / metric / template。
 
@@ -44,11 +44,7 @@ from analysis_asset_service import AnalysisAssetService
 from metadata_correction_service import MetadataCorrectionService
 
 
-st.set_page_config(
-    page_title="GenBI · Saved Assets",
-    page_icon="💾",
-    layout="wide",
-)
+# v0.17:set_page_config 改在 app.py 統一設定(st.navigation 規則)
 st.markdown(
     "<h1 style='font-size:2.2rem;margin:0 0 .3rem 0'>💾 Saved Assets</h1>"
     "<p style='color:#8B6F4A;font-size:0.95rem;margin:0 0 1rem 0'>"
