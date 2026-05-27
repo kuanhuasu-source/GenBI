@@ -20,6 +20,11 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+# v0.16.1+ FIX:import config FIRST 觸發 .env 載入,讓 GENBI_EMBEDDING_BACKEND
+# 等環境變數被 get_embedding_pipeline() 看到。沒這個 inspector 會 silently
+# 走 local MiniLM 預設(雖然 .env 設了 http+bge-m3 也沒用)。
+import config  # noqa: F401  (side-effect:dotenv load)
+
 from embedding_pipeline import get_embedding_pipeline
 from rag_index_repository import (
     KNOWN_INDEX_NAMES,

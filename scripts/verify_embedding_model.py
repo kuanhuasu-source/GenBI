@@ -19,6 +19,10 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+# v0.16.1+ FIX:import config 觸發 .env 載入,確認 GENBI_EMBEDDING_BACKEND
+# 等 env 有進到 Python process(否則只看 OS-level env 會誤判)
+import config  # noqa: F401
+
 
 def main() -> int:
     print("=" * 60)

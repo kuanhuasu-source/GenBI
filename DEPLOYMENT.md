@@ -116,9 +116,26 @@ GENBI_PROMPT_REPO=true                # DB-driven prompt(已有 seed 跑過)
 # ─── v0.16 RAG ───
 GENBI_RAG_ENABLED=true                # Phase 0/A/D RAG(Sprint 2 champion)
 GENBI_RAG_PHASE_BC=false              # Phase B/C RAG(Sprint 3 deferred)
-GENBI_EMBEDDING_MODEL=/opt/genbi/models/all-MiniLM-L6-v2
-HF_HUB_OFFLINE=1                      # ★ air-gap 必設
-TRANSFORMERS_OFFLINE=1
+
+# ── Embedding backend ── 兩個選一:
+
+# Option A · 本地 sentence-transformers(v0.16.0 default)
+# GENBI_EMBEDDING_BACKEND=local
+# GENBI_EMBEDDING_MODEL=/opt/genbi/models/all-MiniLM-L6-v2
+# HF_HUB_OFFLINE=1                    # ★ air-gap 必設
+# TRANSFORMERS_OFFLINE=1
+
+# Option B · HTTP-served bge-m3(v0.16.1+,production 推薦)
+# 跟 LLM 走同一條服務:Ollama dev / vLLM prod 都吃 OpenAI-compatible /v1/embeddings
+GENBI_EMBEDDING_BACKEND=http
+GENBI_EMBEDDING_API_URL=http://localhost:11434/v1/embeddings   # Ollama default
+GENBI_EMBEDDING_MODEL=bge-m3
+GENBI_EMBEDDING_API_KEY=ollama        # Ollama 任意值;vLLM 看部署設定
+GENBI_EMBEDDING_BATCH_SIZE=64
+GENBI_EMBEDDING_TIMEOUT_S=30
+
+# production(vLLM):
+# GENBI_EMBEDDING_API_URL=http://vllm-embed-host:8000/v1/embeddings
 
 # ─── Thinking model ───
 LLM_DISABLE_THINKING=false            # qwen3-coder 不需要(預設 false)
@@ -227,6 +244,52 @@ MongoDB 也要 backup(本 doc 不展開,用 `mongodump` 走標準流程)。
 ---
 
 ## 6. Embedding model 升級流程
+
+### 6.1 切換 backend(local sentence-transformers → HTTP Ollama/vLLM)
+
+v0.16.1+ 推薦走 **HTTP backend** — 跟 LLM 共用同一條服務,deployment 一致。
+
+**Dev(Ollama):**
+```bash
+# 一次性 pull
+ollama pull bge-m3
+
+# Ollama 起來後 /v1/embeddings 自動可用(走 OpenAI-compat path)
+curl http://localhost:11434/v1/embeddings -d '{
+    "model": "bge-m3", "input": "hello"
+}' | head -c 200    # 確認 200 OK + embedding 數字
+
+# .env 切過去
+GENBI_EMBEDDING_BACKEND=http
+GENBI_EMBEDDING_API_URL=http://localhost:11434/v1/embeddings
+GENBI_EMBEDDING_MODEL=bge-m3
+
+# bge-m3 是 1024-dim,跟 all-MiniLM(384-dim)不相容 — 必須整套 rebuild
+rm -rf rag_indices
+python scripts/build_rag_indices.py --full-rebuild --domain tflex
+python scripts/inspect_rag_retrieval.py   # 確認 5 個 index 都重 build 上來
+```
+
+**Production(vLLM):**
+```bash
+# vLLM 啟動 embedder 模式
+vllm serve BAAI/bge-m3 \
+    --task embed \
+    --served-model-name bge-m3 \
+    --port 8000
+
+# .env
+GENBI_EMBEDDING_BACKEND=http
+GENBI_EMBEDDING_API_URL=http://<vllm-host>:8000/v1/embeddings
+GENBI_EMBEDDING_MODEL=bge-m3
+GENBI_EMBEDDING_API_KEY=<production-key-if-set>
+```
+
+vLLM 多卡跑 bge-m3:加 `--tensor-parallel-size 2`(看卡數)。bge-m3 模型大小
+~2.3GB,單張 A100 80GB 跑得很寬鬆;若跟 LLM 同卡,記得 `--gpu-memory-utilization 0.3`
+留空間給 LLM。
+
+### 6.2 切 embedding model(同 backend 內)
 
 當你決定從 `all-MiniLM-L6-v2`(384-dim)切到 e.g. `BAAI/bge-base-zh`(768-dim):
 

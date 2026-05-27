@@ -97,10 +97,16 @@ class SlotConfig:
 
 # ============================================================
 # Default slot configs(spec §9.5)
-# v0.16.0+ M6.4 tuning:min_score 0.30 → 0.20
-#   原因:tflex 小型 index(25 schema docs / 17 kpi docs)上 cosine 自然偏低,
-#         top match 落在 0.30-0.40 區間。0.30 threshold 只放 1-2 docs/slot,
-#         injection 太稀。0.20 讓 3-5 docs/slot 過,填滿 ~70% slot budget。
+# v0.16.0+ M6.4 tuning:min_score=0.20 對齊 all-MiniLM-L6-v2(Sprint 2 champion)
+#
+# ⚠️ Threshold 跟 embedding model 強耦合:
+#   - **all-MiniLM-L6-v2(384d,production champion)**:min_score=0.20。
+#     Top cosines 落在 0.35-0.50。0.20 留 2-3 docs/slot 通過(剛好填 prompt budget)。
+#   - **bge-m3(1024d,opt-in HTTP backend)**:建議 min_score=0.50。
+#     bge-m3 cosine 分布壓縮(off-domain 0.43 / on-domain 0.51-0.70),
+#     用 0.20 會 flood,用 0.50 又只達 RAG-neutral(0pp lift vs OFF baseline)。
+#     bge-m3 的「正解」是加 cross-encoder re-rank(spec §9.3 Phase 3),這版未做。
+# 換 embedder 時應同步調 min_score — 若有 per-backend config 需求未來再加。
 # ============================================================
 DEFAULT_SLOT_CONFIGS: dict[str, SlotConfig] = {
     SLOT_SCHEMA: SlotConfig(

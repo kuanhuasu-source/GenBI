@@ -155,3 +155,164 @@ class TestLazyImport:
         # 直到 .embed() 才會嘗試 _load_real_model
         assert ep._model is None
         assert ep._embed_func is None
+
+
+# ============================================================
+# v0.16.1+:dim auto-inference + HTTP backend
+# ============================================================
+class TestInferDim:
+    def test_minilm_default(self):
+        from embedding_pipeline import _infer_dim
+        assert _infer_dim("sentence-transformers/all-MiniLM-L6-v2") == 384
+        assert _infer_dim("all-MiniLM-L6-v2") == 384
+
+    def test_bge_m3_1024(self):
+        from embedding_pipeline import _infer_dim
+        assert _infer_dim("bge-m3") == 1024
+        assert _infer_dim("bge-m3:latest") == 1024          # Ollama tag
+        assert _infer_dim("BAAI/bge-m3") == 1024            # HF style
+
+    def test_bge_base_zh_768(self):
+        from embedding_pipeline import _infer_dim
+        assert _infer_dim("BAAI/bge-base-zh") == 768
+
+    def test_unknown_falls_back_to_default(self):
+        from embedding_pipeline import _infer_dim
+        assert _infer_dim("not-a-real-model") == DEFAULT_DIM
+
+
+class TestEmbeddingPipelineAutoDim:
+    def test_bge_m3_no_dim_kwarg(self):
+        """v0.16.1+:不傳 dim 時該從 model_name 自動推。"""
+        ep = EmbeddingPipeline(model_name="bge-m3")
+        assert ep.dim == 1024
+
+    def test_explicit_dim_overrides_inference(self):
+        ep = EmbeddingPipeline(model_name="bge-m3", dim=2048)
+        assert ep.dim == 2048
+
+
+class TestHTTPEmbedder:
+    """v0.16.1+:OpenAI-compatible HTTP embedder(Ollama / vLLM 通用)。
+
+    Mock OpenAI client,不真打 HTTP。
+    """
+    def test_returns_normalized_vectors(self):
+        from unittest.mock import MagicMock, patch
+        from embedding_pipeline import make_http_embedder
+
+        class FakeData:
+            def __init__(self, idx, emb):
+                self.index = idx
+                self.embedding = emb
+
+        mock_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.data = [
+            FakeData(0, [3.0, 4.0, 0.0, 0.0]),   # norm=5
+            FakeData(1, [0.0, 0.0, 1.0, 0.0]),   # already unit
+        ]
+        mock_client.embeddings.create.return_value = fake_resp
+
+        with patch("openai.OpenAI", return_value=mock_client):
+            embed_fn = make_http_embedder(
+                api_url="http://localhost:11434/v1/embeddings",
+                model="bge-m3",
+            )
+            vecs = embed_fn(["text1", "text2"])
+
+        assert vecs.shape == (2, 4)
+        # L2 normalize 過 → norm 該 ~1
+        assert abs(np.linalg.norm(vecs[0]) - 1.0) < 1e-5
+        assert abs(np.linalg.norm(vecs[1]) - 1.0) < 1e-5
+        np.testing.assert_allclose(vecs[0], [0.6, 0.8, 0.0, 0.0], atol=1e-5)
+
+    def test_empty_input(self):
+        from unittest.mock import patch, MagicMock
+        from embedding_pipeline import make_http_embedder
+        with patch("openai.OpenAI", return_value=MagicMock()):
+            embed_fn = make_http_embedder(
+                api_url="http://x/v1/embeddings", model="bge-m3",
+            )
+            vecs = embed_fn([])
+        assert vecs.shape == (0, 0)
+
+    def test_batching_respects_batch_size(self):
+        from unittest.mock import MagicMock, patch
+        from embedding_pipeline import make_http_embedder
+
+        class FakeData:
+            def __init__(self, idx, emb):
+                self.index = idx
+                self.embedding = emb
+
+        mock_client = MagicMock()
+        def _create(model, input):
+            fake = MagicMock()
+            fake.data = [FakeData(i, [1.0, 0.0, 0.0])
+                          for i in range(len(input))]
+            return fake
+        mock_client.embeddings.create.side_effect = _create
+
+        with patch("openai.OpenAI", return_value=mock_client):
+            embed_fn = make_http_embedder(
+                api_url="http://x/v1/embeddings", model="m", batch_size=2,
+            )
+            vecs = embed_fn(["a", "b", "c", "d", "e"])
+
+        assert vecs.shape == (5, 3)
+        # 5 input / batch=2 → 3 calls(2+2+1)
+        assert mock_client.embeddings.create.call_count == 3
+
+    def test_server_error_raises_with_context(self):
+        from unittest.mock import MagicMock, patch
+        from embedding_pipeline import make_http_embedder
+
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = ConnectionError("boom")
+        with patch("openai.OpenAI", return_value=mock_client):
+            embed_fn = make_http_embedder(
+                api_url="http://x/v1/embeddings", model="bge-m3",
+            )
+            with pytest.raises(RuntimeError, match="bge-m3"):
+                embed_fn(["hello"])
+
+
+class TestGetEmbeddingPipelineBackendRouting:
+    """v0.16.1+:GENBI_EMBEDDING_BACKEND env 路由。"""
+
+    def test_default_local_backend(self, monkeypatch):
+        monkeypatch.delenv("GENBI_EMBEDDING_BACKEND", raising=False)
+        monkeypatch.delenv("GENBI_EMBEDDING_MODEL", raising=False)
+        reset_embedding_pipeline()
+        ep = get_embedding_pipeline()
+        assert ep.model_name == DEFAULT_MODEL
+        # default → local sentence-transformers,_embed_func 該 None
+        assert ep._embed_func is None
+        reset_embedding_pipeline()
+
+    def test_http_backend_creates_http_embedder(self, monkeypatch):
+        from unittest.mock import patch, MagicMock
+        monkeypatch.setenv("GENBI_EMBEDDING_BACKEND", "http")
+        monkeypatch.setenv("GENBI_EMBEDDING_MODEL", "bge-m3")
+        monkeypatch.setenv(
+            "GENBI_EMBEDDING_API_URL",
+            "http://localhost:11434/v1/embeddings",
+        )
+        reset_embedding_pipeline()
+        with patch("openai.OpenAI", return_value=MagicMock()):
+            ep = get_embedding_pipeline()
+        assert ep.model_name == "bge-m3"
+        assert ep.dim == 1024     # bge-m3 該自動推
+        # _embed_func 該是 http embedder callable
+        assert ep._embed_func is not None
+        reset_embedding_pipeline()
+
+    def test_explicit_embed_func_overrides_env(self, monkeypatch):
+        # 即使 env 設 http,caller 傳 embed_func 該贏(test path)
+        monkeypatch.setenv("GENBI_EMBEDDING_BACKEND", "http")
+        reset_embedding_pipeline()
+        fake = make_deterministic_fake_embedder()
+        ep = get_embedding_pipeline(embed_func=fake)
+        assert ep._embed_func is fake
+        reset_embedding_pipeline()
