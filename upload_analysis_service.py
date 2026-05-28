@@ -108,18 +108,30 @@ def _safe_emit_phase(
         )
 
 
-def _build_phase_a_namespace(source_df: pd.DataFrame) -> dict:
+def _build_phase_a_namespace(
+    source_df: pd.DataFrame,
+    source_dfs: dict[str, pd.DataFrame] | None = None,
+) -> dict:
     """為 Phase A exec 建構 restricted namespace。
 
-    只暴露 `pd` / `np` / `source_df`。**故意省略** open/os/subprocess/__builtins__
-    等;LLM 真的寫 import xxx 也會在 phase_a_validator 被攔。
+    暴露 `pd` / `np` / `source_df`(legacy single-table) / `source_dfs`
+    (v0.18 M4 Tier B · multi-table dict 由 table_id 索引)。**故意省略**
+    open/os/subprocess/__builtins__ 等;LLM 真的寫 import xxx 也會在
+    phase_a_validator 被攔。
+
+    Args:
+        source_df: 首張 table 的 DataFrame(向下相容,單表場景仍可用)
+        source_dfs: optional {table_id: DataFrame} dict(多表場景)
     """
-    return {
+    ns = {
         "pd": pd,
         "np": np,
         "source_df": source_df,
         # __builtins__ 仍會被 Python 注入,但 validator 已擋 import / IO 關鍵字
     }
+    if source_dfs:
+        ns["source_dfs"] = source_dfs
+    return ns
 
 
 # ============================================================
@@ -370,15 +382,28 @@ class UploadAnalysisService:
         _t0_phase_a = time.time()
         _safe_emit_phase(on_phase, "phase_a_pipeline", "start", {})
 
-        # 載入 source_df
+        # 載入 source_df + source_dfs(v0.18 M4 Tier B · multi-table)
         try:
             tables = self.repo.list_tables(dataset_id)
             if not tables:
                 raise ValueError(f"Dataset `{dataset_id}` 沒 table")
-            table = tables[0]   # MVP single-table
-            parquet_path = table["storage"]["path"]
-            source_df = file_parser.load_parquet(parquet_path)
+            # Load every table into source_dfs dict (keyed by table_id)
+            source_dfs: dict[str, pd.DataFrame] = {}
+            for t in tables:
+                source_dfs[t["table_id"]] = file_parser.load_parquet(
+                    t["storage"]["path"]
+                )
+            # Single-table backward compat: source_df = first table.
+            # Existing Phase A code that writes `raw_df = source_df[...]`
+            # continues to work; new multi-table code uses source_dfs[id].
+            table = tables[0]
+            source_df = source_dfs[table["table_id"]]
             source_columns = list(source_df.columns)
+            # tables_info exposes per-table column lists to the Phase A
+            # prompt so the LLM knows which columns live on which table.
+            tables_info = {
+                tid: list(df.columns) for tid, df in source_dfs.items()
+            }
         except Exception as e:
             _safe_emit_phase(
                 on_phase, "phase_a_pipeline", "error",
@@ -420,14 +445,19 @@ class UploadAnalysisService:
                         source_df_sample=source_sample_md,
                         previous_code=phase_a_code if attempt > 0 else "",
                         previous_error=phase_a_err if attempt > 0 else "",
+                        tables_info=tables_info if len(tables_info) > 1 else None,
                     )
 
                 # v0.14.2+: 走 safe_exec sandbox(restricted builtins + timeout +
                 # output validation),取代裸 exec
+                # v0.18 M4 Tier B: 多表時 source_dfs 也注入 sandbox namespace
+                _exec_inputs = {"source_df": source_df}
+                if len(tables_info) > 1:
+                    _exec_inputs["source_dfs"] = source_dfs
                 with trace.step(f"phase_a_exec_attempt_{attempt + 1}"):
                     exec_result = safe_exec_pandas(
                         code=phase_a_code,
-                        inputs={"source_df": source_df},
+                        inputs=_exec_inputs,
                         expected_output_var="raw_df",
                         timeout_s=30.0,
                         max_rows=100_000,

@@ -397,6 +397,33 @@ def test_e2e_multisheet_metadata_has_one_collection_per_sheet(
     )
 
 
+def test_phase_a_namespace_exposes_source_dfs_for_multitable():
+    """v0.18 M4 Tier B · _build_phase_a_namespace passes through source_dfs
+    dict when there's more than one table. Verifies the Phase A exec
+    sandbox can reference any sheet by table_id.
+    """
+    import pandas as pd
+    from upload_analysis_service import _build_phase_a_namespace
+
+    df_a = pd.DataFrame({"x": [1, 2]})
+    df_b = pd.DataFrame({"y": [10, 20]})
+    df_c = pd.DataFrame({"z": [100, 200]})
+
+    # Single-table: source_dfs not in ns
+    ns_single = _build_phase_a_namespace(df_a)
+    assert "source_df" in ns_single
+    assert "source_dfs" not in ns_single
+    assert ns_single["source_df"] is df_a
+
+    # Multi-table: source_dfs in ns with all 3 entries
+    ns_multi = _build_phase_a_namespace(df_a, source_dfs={
+        "a": df_a, "b": df_b, "c": df_c,
+    })
+    assert "source_dfs" in ns_multi
+    assert set(ns_multi["source_dfs"].keys()) == {"a", "b", "c"}
+    assert ns_multi["source_df"] is df_a   # single-table backward compat
+
+
 @pytest.mark.integration
 @pytest.mark.requires_mongo
 def test_e2e_multisheet_detects_and_persists_relationships(

@@ -2105,21 +2105,41 @@ class LLMService:
         其他段落(Domain Knowledge / refuse 守則 / B/C 段)同 schema-driven 版本。
         """
         return f"""你是專業的 AI 商業智慧助理。請以上方 Domain Knowledge 為唯一依據規劃分析。
-此 dataset 是使用者上傳的檔案,**不在 MongoDB 中**,而是已以 Pandas DataFrame `source_df`
-形式載入。Phase A 不產生 MongoDB pipeline,而是產生 Pandas filter / selection code。
+此 dataset 是使用者上傳的檔案,**不在 MongoDB 中**:
+- 若 Domain Knowledge 的 `# Collections & 欄位定義` 區段**只有 1 張表**,
+  該表已載入為 Pandas DataFrame `source_df`。
+- 若**有多張表**(multi-sheet workbook,v0.18+),每張 sheet 已分別載入為
+  `source_dfs[<table_id>]` dict。`source_df` 仍可用,等於第一張 sheet
+  (向下相容)。table_id 列在 Collections 區段。
+Phase A 不產生 MongoDB pipeline,而是產生 Pandas filter / selection code。
 
 {self.domain_knowledge}
+
+### 🌟 META 結構性問題 — 直接從 Domain Knowledge 回答,不用走 Phase A/B/C
+若使用者問的是 dataset 的**結構** — 例:
+- 「列出有哪些 sheet / table」
+- 「每張表 row count 與可能主鍵」
+- 「欄位類型 / schema」
+- 「dataset 描述」
+
+→ Domain Knowledge 已有完整答案(`# Collections & 欄位定義` 區段列出
+所有 sheet + row 數 + primary_key + 欄位類型 + grain)。請**直接在 A 段
+text 中列出答案**(不需要寫 Pandas code,Phase A 可以是 `raw_df = source_df.copy()`
+作 placeholder)。Phase B/C 亦可標示「無需處理 — 此為結構性問題」。
 
 ### 任務說明
 請把使用者問題拆解成三個小段,**用 markdown 三層標題包**。
 
 **A. 資料獲取 (Phase A · Pandas filter):**
-從 `source_df` 取得分析所需的明細列。
+從 `source_df`(單表)或 `source_dfs['<table_id>']`(多表)取得分析所需的明細列。
 - 只能 `filter` / `selection`(`source_df[...]` / `.loc[...]` / `.query(...)`)
+- 多表跨 sheet:**只有 metadata.relationships 已 confirmed 的關聯**才可 merge
+  (`source_dfs['A'].merge(source_dfs['B'], on='<confirmed_key>')`);未 confirmed
+  的關聯 / 同名但不同語意的欄位不可 join
 - **嚴禁** `groupby` / `agg` / `apply` 派生欄 — 那是 Phase B 的工作
 - **嚴禁** 新增 raw 沒有的欄位(`source_df['new_col'] = ...` 是 Phase B)
 - **嚴禁** `import` / `open` / `read_csv` / `os` / `subprocess` / 任何外部 IO
-- 變數名鎖死:輸出必須 `raw_df = source_df[...]` 之類
+- 變數名鎖死:輸出必須 `raw_df = ...` 之類
 - 若使用者問題明確列出實體值(例「Apparel 類別」「2024 年」),A 段必須帶上對應 filter
 
 **B. 資料處理 (Phase B · Pandas):**
@@ -2153,6 +2173,7 @@ retry 機制接住,**Phase 0 不該預先拒絕**。
         source_df_sample: str = "",
         previous_code: str = "",
         previous_error: str = "",
+        tables_info: dict[str, list[str]] | None = None,
     ) -> str:
         """產 Pandas filter / selection code,從 `source_df` 取出 `raw_df`。
 
@@ -2162,11 +2183,33 @@ retry 機制接住,**Phase 0 不該預先拒絕**。
             source_columns: source_df 實際欄位 list(鎖死)
             source_df_sample: source_df 前幾列 markdown 樣本
             previous_code / previous_error: retry 時的回饋
+            tables_info: v0.18 M4 Tier B · 多表時的 {table_id: cols} dict;
+                None 時走單表 source_df 路徑(向下相容)
 
         Returns:
             Python code 字串(無 ``` 圍欄,直接 exec)。caller 應在 namespace 內
-            提供 `pd` / `np` / `source_df`,exec 後檢查 `raw_df` 存在。
+            提供 `pd` / `np` / `source_df`(+ `source_dfs` for multi-table),
+            exec 後檢查 `raw_df` 存在。
         """
+        # v0.18 M4 Tier B · multi-table info block(只在多表時加入)
+        multi_table_block = ""
+        if tables_info and len(tables_info) > 1:
+            tables_md = "\n".join(
+                f"  - `source_dfs['{tid}']` · {len(cols)} 欄: {cols}"
+                for tid, cols in tables_info.items()
+            )
+            multi_table_block = (
+                f"\n\n### ⭐ 多表 workbook(v0.18 M4 Tier B)\n"
+                f"本資料集為多 sheet workbook,所有 sheet 都已載入為 "
+                f"`source_dfs` dict(以 table_id 索引):\n{tables_md}\n\n"
+                f"- 單表分析 → `raw_df = source_dfs['<table_id>'][filter]`\n"
+                f"- 跨表 join → `raw_df = source_dfs['A'].merge(source_dfs['B'], "
+                f"on='<key>')`(只有 metadata.relationships 已 confirmed 的 "
+                f"關聯才允許 merge)\n"
+                f"- 單表 backward-compat:`source_df` 仍等於第一個 sheet,既有 "
+                f"`raw_df = source_df[...]` 寫法仍可用"
+            )
+
         cols_info = (
             f"`source_df` 已載入。實際欄位(鎖死,不可亂改名): {source_columns}"
             if source_columns else "`source_df` 已載入,欄位未知。"
@@ -2177,6 +2220,7 @@ retry 機制接住,**Phase 0 不該預先拒絕**。
                 f"{source_df_sample}\n\n"
                 "⚠️ 上面沒列出的欄位,絕對禁止引用。"
             )
+        cols_info += multi_table_block
 
         system_prompt = f"""你是資料篩選工程師,負責 Upload Workspace 的【A. 資料獲取】。
 {cols_info}
