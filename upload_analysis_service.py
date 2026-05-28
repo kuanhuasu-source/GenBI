@@ -391,12 +391,23 @@ class UploadAnalysisService:
                 meta_structural=True,
                 plan_text=plan_text,
             )
+            # v0.17 progressive render UI uses status_box to clear the
+            # spinner — must explicitly signal completion for Phase A/B/C/D
+            # which we're about to skip. Otherwise status_box stays in
+            # "running" state and the chat shows a perpetual spinner.
+            for skipped_phase in ("phase_a_pipeline", "phase_b_preprocess",
+                                  "phase_c_chart", "phase_d_insight"):
+                _safe_emit_phase(
+                    on_phase, skipped_phase, "skipped",
+                    {"reason": "meta_structural · plan_text 已含答案"},
+                )
             trace.finalize(status="completed")
             return {
                 "status": "meta_structural",
                 "intent": intent,
                 "trace_id": trace.trace_id,
                 "plan_text": plan_text,
+                "meta_response": clean_plan,  # for UI rendering
                 "messages_appended": 2,
             }
 

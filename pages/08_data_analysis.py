@@ -524,6 +524,20 @@ if query:
                 st.markdown(result.get("meta_response", ""))
                 st.rerun()
 
+            elif result["status"] == "meta_structural":
+                # v0.18 [META] short-circuit — Phase 0 plan_text already
+                # contains the structural answer; Phase A/B/C/D skipped.
+                status_box.update(
+                    label="ℹ️ 結構性問題 — Phase A/B/C/D 略過",
+                    state="complete", expanded=False,
+                )
+                st.info(
+                    "ℹ️ 偵測為結構性問題(列表 / 主鍵 / schema 之類),"
+                    "直接從 metadata 回答,略過 Phase A/B/C/D。"
+                )
+                st.markdown(result.get("meta_response", ""))
+                st.rerun()
+
             elif result["status"] == "refused":
                 status_box.update(
                     label="🛑 資料不足", state="error", expanded=False,
