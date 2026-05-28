@@ -397,6 +397,59 @@ def test_e2e_multisheet_metadata_has_one_collection_per_sheet(
     )
 
 
+class TestNormalizeCodePunctuation:
+    """v0.18 fix · LLM 偶爾 emit 全形 CJK 標點導致 Python SyntaxError。
+    sanitizer 必須把 9 個常見 full-width chars 翻譯成 ASCII。"""
+
+    def test_full_width_comma(self):
+        from upload_analysis_service import normalize_code_punctuation
+        # The exact case from HR_MT_01 scenario 3 screenshot
+        bad = "df.merge(other，on='id')"
+        assert normalize_code_punctuation(bad) == "df.merge(other,on='id')"
+
+    def test_full_width_parens(self):
+        from upload_analysis_service import normalize_code_punctuation
+        bad = "df.filter(col='x')"  # ascii (
+        assert normalize_code_punctuation(bad) == "df.filter(col='x')"
+        bad = "df.filter(col='x')"  # full-width  (
+        assert normalize_code_punctuation(
+            "df.filter（col='x'）"
+        ) == "df.filter(col='x')"
+
+    def test_full_width_colon_semicolon(self):
+        from upload_analysis_service import normalize_code_punctuation
+        bad = "for x in y： print(x)； done = True"
+        # full-width : and ;
+        assert normalize_code_punctuation(bad) == \
+            "for x in y: print(x); done = True"
+
+    def test_idempotent(self):
+        from upload_analysis_service import normalize_code_punctuation
+        ascii_code = "df['col'].sum()"
+        assert normalize_code_punctuation(ascii_code) == ascii_code
+        # Applying twice is the same as once
+        once = normalize_code_punctuation("df['col']，sum()")
+        assert normalize_code_punctuation(once) == once
+
+    def test_empty_string(self):
+        from upload_analysis_service import normalize_code_punctuation
+        assert normalize_code_punctuation("") == ""
+
+    def test_ascii_passthrough_untouched(self):
+        from upload_analysis_service import normalize_code_punctuation
+        code = "raw_df = source_dfs['a'].merge(source_dfs['b'], on='id')"
+        # No full-width chars → output identical
+        assert normalize_code_punctuation(code) == code
+
+    def test_result_parses_as_python(self):
+        from upload_analysis_service import normalize_code_punctuation
+        import ast
+        bad = "x = df['col']，sum()  # would syntax-error"
+        fixed = normalize_code_punctuation(bad)
+        # Should now parse cleanly
+        ast.parse(fixed)
+
+
 def test_phase_a_namespace_exposes_source_dfs_for_multitable():
     """v0.18 M4 Tier B · _build_phase_a_namespace passes through source_dfs
     dict when there's more than one table. Verifies the Phase A exec
