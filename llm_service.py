@@ -2207,7 +2207,11 @@ retry 機制接住,**Phase 0 不該預先拒絕**。
                 f"on='<key>')`(只有 metadata.relationships 已 confirmed 的 "
                 f"關聯才允許 merge)\n"
                 f"- 單表 backward-compat:`source_df` 仍等於第一個 sheet,既有 "
-                f"`raw_df = source_df[...]` 寫法仍可用"
+                f"`raw_df = source_df[...]` 寫法仍可用\n"
+                f"- 另有 `tables_meta` dict:"
+                f"`tables_meta['<table_id>']` → {{primary_key, grain, "
+                f"description, table_role}}。需要 META 資訊(PK / grain)時"
+                f"直接從此 dict 取,不要自己猜或填 None"
             )
 
         cols_info = (
@@ -2464,10 +2468,19 @@ raw_df = source_df.copy()
                 "\n\n### ⭐ 多表 workbook(v0.18 M4 Tier B · Phase B 也可用)\n"
                 f"除了 `raw_df`(來自 Phase A),你也可存取原始 sheets:\n{tables_md}\n\n"
                 "- `source_df` = 第一張 sheet(向下相容)\n"
-                "- META 問題(列出 sheet / row count / schema)→ 用 `source_dfs` "
-                "建一個 summary Q dict:\n"
-                "  `Q = pd.DataFrame([{'table': k, 'rows': len(v)} "
-                "for k, v in source_dfs.items()])`\n"
+                "- 另有 `tables_meta` dict:`tables_meta['<table_id>']` → "
+                "{primary_key, grain, description, table_role}。**META 問題"
+                "(列出 sheet / PK / grain)必須從 `tables_meta` 取值,不可填 None**\n"
+                "- META 問題標準寫法:\n"
+                "  ```python\n"
+                "  Q = pd.DataFrame([\n"
+                "      {'table': k,\n"
+                "       'rows': len(v),\n"
+                "       'primary_key': tables_meta[k]['primary_key'],\n"
+                "       'grain': tables_meta[k]['grain']}\n"
+                "      for k, v in source_dfs.items()\n"
+                "  ])\n"
+                "  ```\n"
                 "- 跨表 join 應在 Phase A 完成,Phase B 收 raw_df 即可\n"
             )
         if raw_df_sample:

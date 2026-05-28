@@ -404,6 +404,23 @@ class UploadAnalysisService:
             tables_info = {
                 tid: list(df.columns) for tid, df in source_dfs.items()
             }
+            # v0.18 M4 Tier B follow-up · tables_meta carries the
+            # metadata-level facts (primary_key / grain / description) that
+            # aren't visible from a raw DataFrame at runtime. Lets the LLM
+            # populate "primary_key" column for META questions instead of
+            # defaulting to None.
+            _md_collections = (self.llm.task_metadata or {}).get(
+                "collections"
+            ) or {}
+            tables_meta = {
+                tid: {
+                    "primary_key": coll.get("primary_key"),
+                    "grain": coll.get("grain"),
+                    "description": coll.get("description"),
+                    "table_role": coll.get("table_role"),
+                }
+                for tid, coll in _md_collections.items()
+            }
         except Exception as e:
             _safe_emit_phase(
                 on_phase, "phase_a_pipeline", "error",
@@ -450,10 +467,11 @@ class UploadAnalysisService:
 
                 # v0.14.2+: 走 safe_exec sandbox(restricted builtins + timeout +
                 # output validation),取代裸 exec
-                # v0.18 M4 Tier B: 多表時 source_dfs 也注入 sandbox namespace
+                # v0.18 M4 Tier B: 多表時 source_dfs + tables_meta 也注入 sandbox
                 _exec_inputs = {"source_df": source_df}
                 if len(tables_info) > 1:
                     _exec_inputs["source_dfs"] = source_dfs
+                    _exec_inputs["tables_meta"] = tables_meta
                 with trace.step(f"phase_a_exec_attempt_{attempt + 1}"):
                     exec_result = safe_exec_pandas(
                         code=phase_a_code,
@@ -541,6 +559,7 @@ class UploadAnalysisService:
         }
         if len(tables_info) > 1:
             workflow_ns["source_dfs"] = source_dfs
+            workflow_ns["tables_meta"] = tables_meta
         dashboard_mode = is_dashboard_query(query)
         try:
             raw_sample_md = raw_df.head(3).to_markdown(index=False)
@@ -575,6 +594,7 @@ class UploadAnalysisService:
                 _b_inputs = {"raw_df": raw_df, "source_df": source_df}
                 if len(tables_info) > 1:
                     _b_inputs["source_dfs"] = source_dfs
+                    _b_inputs["tables_meta"] = tables_meta
                 with trace.step(f"phase_b_exec_attempt_{attempt + 1}"):
                     exec_result = safe_exec_pandas(
                         code=phase_b_code,
