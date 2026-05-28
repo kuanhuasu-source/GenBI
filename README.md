@@ -17,6 +17,7 @@
 - 📈 **Baseline + 跑分追蹤**:每次 test_runner 自動寫 `test_runs`,可 vs baseline 對比 pass rate / token
 - 📤 **Upload Workspace(v0.12+)**:BYOD 第二條路徑 — 上傳 CSV/Excel/Parquet → 自動 profile + 語意推理 → 對話分析,不必先建 schema
 - 🔍 **RAG Dynamic Prompt(v0.16+)**:5 個 specialized vector index 動態剪裁 prompt,Sprint 2 champion 上線 +11.5pp pass-rate,-10% cost/success;env flag 即可關回 v0.15 byte-equal
+- 🔗 **Multi-table Upload(v0.18+)**:multi-sheet Excel 自動每張 sheet profile + cross-sheet relationship inference(spec §8.1 weighted score)+ HITL review UI + confirmed-relationship-only DuckDB join + 互動式 analysis steps(extract → add_column → aggregate → create_table → visualize)+ saved-derived-table / analysis-template assets · 12/12 spec §14.5 acceptance test 全綠 · 0 regression on v0.17 baseline
 
 ## 🏗️ 架構
 
@@ -33,7 +34,8 @@
 │ Layer 2: MongoDB (live content, editable via admin UI)     │
 │   - prompt_templates    (5 phase prompts, Jinja2)           │
 │   - domain_metadata     (schema / KPI / 限制)               │
-│   - upload_* (7 colls)  (datasets / profiles / metadata)    │
+│   - upload_* (9 colls)  (datasets / profiles / metadata /   │
+│                          relationship_candidates / steps)   │
 │   - test_cases          (per-domain test definitions)       │
 │   - test_runs           (歷史 baseline + 跑分快照,含 rag_*) │
 │   - rag_index_versions  (champion / challenger 紀錄)        │
@@ -136,9 +138,13 @@ GenBI/
 ├── app.py                         # v0.17+ · st.navigation registry(83 行,2 個 sidebar 分組)
 ├── llm_service.py                 # LLM service + 5 phase prompts(走 repo,inline fallback)
 ├── upload_analysis_service.py     # Upload Workspace 5-phase orchestrator + on_phase callback(v0.17)
-├── upload_repository.py           # 7 個 upload collection CRUD
-├── upload_service.py              # upload → parse → parquet → profile → metadata v1 端到端
-├── analysis_asset_service.py      # Save Chart / Metric / Template 服務
+├── upload_repository.py           # 9 個 upload collection CRUD(v0.18:+ relationship_candidates / analysis_steps)
+├── upload_service.py              # upload → parse → parquet → profile → metadata v1 端到端(v0.18:multi-sheet default ON)
+├── multi_table_profiler.py        # v0.18 M1 · 每張 sheet 加 table_role / grain / PK / warnings
+├── relationship_profiler.py       # v0.18 M2 · spec §8.1 weighted score + §8.2 type inference + m2m guardrail
+├── duckdb_engine.py               # v0.18 M4 · SQL execution + confirmed-relationship JOIN gate
+├── analysis_step_service.py       # v0.18 M5 · 5 action handlers(extract/add_column/aggregate/create/visualize)+ lineage
+├── analysis_asset_service.py      # Save Chart / Metric / Template + v0.18 M6 · Save Derived Table / Template-from-steps
 ├── prompt_repository.py           # Prompt + Metadata MongoDB repo (60s cache + embedded fallback)
 ├── test_case_repository.py        # Test case CRUD repo
 ├── test_run_repository.py         # Test run save + baseline + compare
@@ -166,6 +172,9 @@ GenBI/
 │   ├── list_test_runs.py
 │   ├── mark_baseline.py
 │   └── compare_baseline.py
+├── scripts/
+│   ├── build_rag_indices.py       # v0.16 · 5 vector index 建構
+│   └── run_regression_gate.py     # v0.18 M7 · 統一 gate(py_compile + unit + acceptance + multi_table)
 ├── assets/genbi_logo.svg          # 廚師 logo
 ├── test_runner.py                 # 26 case headless 回歸 + 寫 test_runs
 ├── test_generality.py             # 多 domain 通用性測試
@@ -210,6 +219,10 @@ python admin/list_test_runs.py
 
 # 比較最新 vs baseline
 python admin/compare_baseline.py
+
+# v0.18 M7 · 統一 regression gate(py_compile + unit + acceptance + multi-table)
+python scripts/run_regression_gate.py --mode fast    # ~10s,不需 Ollama/Mongo
+python scripts/run_regression_gate.py --mode full    # 加 schema-driven tflex baseline
 ```
 
 每次測試會自動:
@@ -260,9 +273,11 @@ python admin/compare_baseline.py
 
 ## 📜 文件
 
-- `CHANGELOG.md` — SemVer 變更紀錄(v0.1.0 → **v0.17.0**)
+- `CHANGELOG.md` — SemVer 變更紀錄(v0.1.0 → **v0.18.0**)
 - `UI_REFACTOR_PLAN.md` — **v0.17.0 UI refactor 三 sprint 規格**(page split + progressive render + sidebar nav)
-- `AI_CONTEXT.md` — LLM agent / 接手開發者用的單檔簡介(架構 + API + deployment;**§22 Upload Workspace + §23 RAG**)
+- `V0_18_MULTITABLE_AUDIT.md` — **v0.18 multi-table 升級 gap audit + sprint 排序**(M1-M7 work breakdown)
+- `HR_MT_SMOKE_TEST_REPORT.md` — **v0.18 真實 HR multi-table xlsx 煙霧測試報告**(3 fixture + per-file findings + 已知 limitation 工作 around)
+- `AI_CONTEXT.md` — LLM agent / 接手開發者用的單檔簡介(架構 + API + deployment;**§22 Upload Workspace + §23 RAG + §24 v0.18 multi-table**)
 - `AI_CODE.md` — 完整源碼快照(用 `python make_ai_code.py` 重新產生)
 - `SELF_LEARNING_OPS.md` — **v0.11.0+ 維運手冊**(self-learning pipeline 操作 / 監控 / 故障排除)
 - `DEPLOYMENT.md` — **v0.16.0+ production / air-gap 部署手冊**(systemd / wheel cache / model upgrade / rollback)
@@ -271,12 +286,13 @@ python admin/compare_baseline.py
 - `SPRINT2_RUN_GUIDE.md` — Mac/air-gap 操作完整流程(含 embedding model 離線安裝)
 - `SPRINT3_RESULT.md` — Sprint 3 Phase B/C wire 決策軌跡 + deferred checklist
 - `GenBI_Upload_Workspace_System_Extension_Spec_v0.2.pdf` — Upload Workspace BYOD 系統規格(v0.12+)
+- `GenBI_Upload_Workspace_MultiTable_Upgrade_Spec.pdf` — **v0.18 multi-table 升級規格**(13 頁 / 7 milestone)
 - `GenBI_v1.3_Self_Learning_MVP_Implementation_Spec.md` — Self-learning MVP 實作規格
 - `STACKED_BAR_TEST.md` — Stacked bar 8 個 STK case 測試規格
 - `TEST_PLAN.md` — 18 case 主測試計畫(v0.2.x 版本)
 - `TEST_UX_SCENARIOS.md` — 57 case UX 整合測試
 
-## 🆕 v0.4-v0.17 重要里程碑
+## 🆕 v0.4-v0.18 重要里程碑
 
 - **v0.4.0** PPTX export(matplotlib renderer / table fallback / Insight bullet)
 - **v0.5.0/6.0** Phase B/C prompt 拆 router + intent block(prompt size -40%)
@@ -295,8 +311,19 @@ python admin/compare_baseline.py
   - **A2 · Progressive phase render**:`handle_query(on_phase=callback)` 5 個 phase 邊界 fire start/complete/error/skipped event,UI 漸進顯示(~3s 看到 Phase 0,而非 30-60s 阻塞 wait)
   - **B · st.navigation**:app.py 從 1508 → 83 行,sidebar 分 2 組(分析工作區 + Admin);chat 拆到 `pages/main_chat.py`;`streamlit>=1.36`
   - 482 tests(+6 callback 行為 test) · `on_phase=None` 凍結 byte-equal v0.16
+- **v0.18.0** 🔗 **Multi-table Upload Workspace**(6 milestones · M1+M2+M4+M5+M6+M7 一個 session 內全落地):
+  - **M1** Multi-sheet parser + profile:`multi_table_profiler.py` 每張 sheet 加 `table_role / grain / primary_key / table_warnings`,Section 3 顯示 enrichment badges
+  - **M2** Relationship profiler 重寫 + Review UI:spec §8.1 加權公式(`0.25·name + 0.20·type + 0.30·overlap + 0.20·uniqueness − penalties`)+ §8.2 type inference(1:1 / m2o / 1:m / m2m_candidate)+ deterministic `relationship_id` + `upload_relationship_candidates` collection + `pages/07` Section 3b Confirm/Reject/Edit UI
+  - **M4** DuckDB JOIN gate(Tier A):pre-execution `validate_joins_against_confirmed(sql, rels)` 拒絕未 confirm / m2m_candidate / unknown rel · `error_type='JoinNotConfirmed'`
+  - **M5** Interactive analysis steps:`analysis_step_service.py` 5 個 pure handler(extract / add_column / aggregate / create_table / visualize)+ `analysis_steps` collection · derived parquet 寫 `uploads_root/<dataset_id>/derived/<step_id>.parquet` · `resolve_table` 走 derived→source 雙路
+  - **M6** Assets 2.0:`save_derived_table` / `save_template_from_steps` · spec rule 27 三件式 binding(`dataset_id` + `metadata_version` + `source_step_ids`)
+  - **M7** Regression gate:`scripts/run_regression_gate.py`(Appendix B JSON output,5 category)+ 12 acceptance test(spec §14.5 全綠)+ `confirm_metadata` 自動 merge confirmed rels 進 `metadata.relationships`
+  - **642 unit tests + 12 multi-table acceptance** · 0 regression on v0.17 baseline · spec §14.1 frozen baseline rule 強制驗證(acceptance #12)
+  - **7/10 spec §14.6 anti-pattern 覆蓋**(unconfirmed join / m2m auto-join / derived-table lineage loss / saved-chart drift / DuckDB write op / test_runner behavior change / schema-driven path uses upload provider)
 
 **v0.16.0 baseline**(Sprint 2 RAG-on champion): **25/26 (96%) pass** · 1482s wall · 140 LLM call · cost $0.0045/success(-10% vs v0.15.0 baseline 22/26)
+
+**v0.18.0 test footprint**(spec §14.5 acceptance,multi-table): **12/12 pass** · `pytest tests/acceptance/test_multitable_acceptance.py` · `python scripts/run_regression_gate.py --mode fast` 同時包 642 unit + 29 upload acceptance + 12 multi-table acceptance · 0 regression
 
 ## 📝 License
 

@@ -338,6 +338,67 @@ def test_e2e_multisheet_excel_creates_three_tables(
 
 @pytest.mark.integration
 @pytest.mark.requires_mongo
+def test_e2e_multisheet_metadata_has_one_collection_per_sheet(
+    mongo_db, tmp_path,
+):
+    """v0.18 M3 fix · spec §5.2/§17 M3 — regenerate_metadata must produce
+    one entry per sheet in metadata.collections (not just tables[0]).
+
+    Regression catch for the bug that surfaced during HR_MT_01 testing:
+    a 4-sheet workbook only had `Employees` in metadata.collections,
+    causing the LLM to think the dataset was single-table.
+    """
+    from upload_repository import UploadRepository
+    from upload_service import UploadService
+
+    xlsx_path = tmp_path / "wb.xlsx"
+    _build_multi_sheet_xlsx(xlsx_path)   # 3-sheet helper from M1 test
+
+    repo = UploadRepository(mongo_db)
+    repo.ensure_indexes()
+    service = UploadService(upload_repo=repo, uploads_root=tmp_path / "uploads")
+    dataset_id = service.handle_upload(
+        file_obj=xlsx_path.read_bytes(),
+        filename="wb.xlsx", owner="alice",
+    )
+
+    # Upload pipeline auto-runs regenerate_metadata at the end.
+    active = repo.get_active_metadata(dataset_id)
+    assert active is not None
+    md = active["metadata"]
+
+    # One collection per uploaded sheet.
+    tables = repo.list_tables(dataset_id)
+    table_ids = {t["table_id"] for t in tables}
+    coll_ids = set(md["collections"].keys())
+    assert coll_ids == table_ids, (
+        f"metadata.collections must have one entry per sheet — "
+        f"expected {table_ids}, got {coll_ids}"
+    )
+    assert len(coll_ids) == 3, (
+        f"3-sheet xlsx should produce 3 collections, got {len(coll_ids)}"
+    )
+
+    # Each collection has its own fields (not bleeding from another sheet).
+    emp_coll = md["collections"][next(
+        tid for tid in coll_ids if "employee" in tid.lower()
+        and "project" not in tid.lower()
+    )]
+    assert "employee_id" in emp_coll["fields"]
+    assert emp_coll["primary_key"] in ("employee_id", ["employee_id"], None) \
+        or "employee_id" in str(emp_coll.get("primary_key", ""))
+
+    # business_description should reflect multi-table.
+    biz = md.get("business_context", {})
+    desc = biz.get("business_description", "")
+    assert "3 tables" in desc or "multi-table" in desc, (
+        f"multi-sheet upload should produce multi-table business_description; "
+        f"got: {desc!r}"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.requires_mongo
 def test_e2e_multisheet_detects_and_persists_relationships(
     mongo_db, tmp_path,
 ):
