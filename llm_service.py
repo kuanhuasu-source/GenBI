@@ -2444,12 +2444,32 @@ raw_df = source_df.copy()
     def generate_preprocess_code(self, query, plan_text="", available_columns=None,
                                   raw_df_sample: str = "",
                                   dashboard_hint: bool = False,
-                                  previous_code: str = "", previous_error: str = ""):
+                                  previous_code: str = "", previous_error: str = "",
+                                  tables_info: dict[str, list[str]] | None = None):
         self._last_query = query   # v0.16.0+ M6.3:給 _retrieve_rag_slots 用
         cols_info = (
             f"目前 raw_df 的欄位 (鎖死,不可亂改名): {available_columns}"
             if available_columns else "欄位未知。"
         )
+        # v0.18 M4 Tier B · 多表 workbook 時 Phase B 也可存取其他 sheet
+        # (透過 source_dfs[<table_id>])。Phase A 焦點是 filter/select,
+        # Phase B 焦點是 preprocess / agg / derive,但 META 問題或補充查找
+        # 時 Phase B 可能需要從原始 sheets 撈資訊。
+        if tables_info and len(tables_info) > 1:
+            tables_md = "\n".join(
+                f"  - `source_dfs['{tid}']` · {len(cols)} 欄: {cols}"
+                for tid, cols in tables_info.items()
+            )
+            cols_info += (
+                "\n\n### ⭐ 多表 workbook(v0.18 M4 Tier B · Phase B 也可用)\n"
+                f"除了 `raw_df`(來自 Phase A),你也可存取原始 sheets:\n{tables_md}\n\n"
+                "- `source_df` = 第一張 sheet(向下相容)\n"
+                "- META 問題(列出 sheet / row count / schema)→ 用 `source_dfs` "
+                "建一個 summary Q dict:\n"
+                "  `Q = pd.DataFrame([{'table': k, 'rows': len(v)} "
+                "for k, v in source_dfs.items()])`\n"
+                "- 跨表 join 應在 Phase A 完成,Phase B 收 raw_df 即可\n"
+            )
         if raw_df_sample:
             cols_info += (
                 "\n\n### raw_df 實際前 3 列樣本 (你必須以此為準,不要憑訓練資料猜測欄位):\n"

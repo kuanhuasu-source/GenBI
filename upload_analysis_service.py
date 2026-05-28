@@ -555,12 +555,22 @@ class UploadAnalysisService:
                         dashboard_hint=dashboard_mode,
                         previous_code=phase_b_code if attempt > 0 else "",
                         previous_error=phase_b_err if attempt > 0 else "",
+                        tables_info=tables_info if len(tables_info) > 1 else None,
                     )
 
+                # v0.18 M4 Tier B: expose source_df + source_dfs (multi-table)
+                # in Phase B namespace too. Phase A's contract is filter/select;
+                # Phase B's is preprocess (groupby/agg/derive). For multi-table
+                # META questions or supplementary lookups, Phase B may need to
+                # reference other sheets — without these in the sandbox the
+                # LLM hits NameError.
+                _b_inputs = {"raw_df": raw_df, "source_df": source_df}
+                if len(tables_info) > 1:
+                    _b_inputs["source_dfs"] = source_dfs
                 with trace.step(f"phase_b_exec_attempt_{attempt + 1}"):
                     exec_result = safe_exec_pandas(
                         code=phase_b_code,
-                        inputs={"raw_df": raw_df},
+                        inputs=_b_inputs,
                         expected_output_var="Q",
                         timeout_s=60.0,    # Phase B 比 A 重(groupby/agg)
                         max_rows=100_000,
