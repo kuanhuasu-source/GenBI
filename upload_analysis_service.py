@@ -532,7 +532,15 @@ class UploadAnalysisService:
         _t0_phase_b = time.time()
         _safe_emit_phase(on_phase, "phase_b_preprocess", "start", {})
 
-        workflow_ns: dict = {"pd": pd, "np": np, "raw_df": raw_df}
+        # v0.18 M4 Tier B · Phase C 也暴露 source_df + source_dfs(多表時),
+        # 與 Phase A/B 一致避免 NameError。雖然 Phase C prompt 應只用 Q,
+        # 但 LLM 若意外引用 source data 會被這層 catch 住。
+        workflow_ns: dict = {
+            "pd": pd, "np": np, "raw_df": raw_df,
+            "source_df": source_df,
+        }
+        if len(tables_info) > 1:
+            workflow_ns["source_dfs"] = source_dfs
         dashboard_mode = is_dashboard_query(query)
         try:
             raw_sample_md = raw_df.head(3).to_markdown(index=False)
