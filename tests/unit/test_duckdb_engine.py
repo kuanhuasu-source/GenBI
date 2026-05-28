@@ -247,3 +247,235 @@ class TestBuildEngineForDataset:
         )
         engine.close()
         assert result.success
+
+
+# ============================================================
+# v0.18 M4: JOIN extraction + confirmed-relationship gate
+# ============================================================
+from duckdb_engine import (
+    extract_joins_from_sql,
+    validate_joins_against_confirmed,
+)
+
+
+class TestExtractJoinsFromSql:
+    def test_simple_inner_join(self):
+        sql = "SELECT * FROM a JOIN b ON a.x = b.y"
+        joins = extract_joins_from_sql(sql)
+        assert len(joins) == 1
+        j = joins[0]
+        assert j["joined_table"] == "b"
+        assert j["from_table"] == "a"
+        assert j["from_field"] == "x"
+        assert j["to_table"] == "b"
+        assert j["to_field"] == "y"
+
+    def test_left_join(self):
+        sql = "SELECT * FROM orders LEFT JOIN customers ON orders.cid = customers.cid"
+        assert len(extract_joins_from_sql(sql)) == 1
+
+    def test_right_outer_join(self):
+        sql = "SELECT * FROM a RIGHT OUTER JOIN b ON a.x = b.x"
+        assert len(extract_joins_from_sql(sql)) == 1
+
+    def test_full_outer_join(self):
+        sql = "SELECT * FROM a FULL OUTER JOIN b ON a.k = b.k"
+        assert len(extract_joins_from_sql(sql)) == 1
+
+    def test_multiple_joins(self):
+        sql = (
+            "SELECT * FROM orders "
+            "JOIN customers ON orders.cid = customers.cid "
+            "JOIN products ON orders.pid = products.pid"
+        )
+        joins = extract_joins_from_sql(sql)
+        assert len(joins) == 2
+
+    def test_no_join(self):
+        assert extract_joins_from_sql("SELECT * FROM t") == []
+
+    def test_empty_sql(self):
+        assert extract_joins_from_sql("") == []
+
+    def test_cross_join_not_matched(self):
+        # CROSS JOIN has no ON clause → MVP limitation, not matched.
+        sql = "SELECT * FROM a CROSS JOIN b"
+        assert extract_joins_from_sql(sql) == []
+
+
+# Fixtures for relationship dicts in JOIN validator tests.
+def _confirmed_rel(
+    from_table="orders", from_field="customer_id",
+    to_table="customers", to_field="customer_id",
+    status="confirmed",
+    relationship_type="many_to_one",
+    rid=None,
+):
+    return {
+        "relationship_id": rid or f"rel_{from_table}_{to_table}_{from_field}",
+        "from_table": from_table,
+        "from_field": from_field,
+        "to_table": to_table,
+        "to_field": to_field,
+        "relationship_type": relationship_type,
+        "status": status,
+    }
+
+
+class TestValidateJoinsAgainstConfirmed:
+    def test_confirmed_match_returns_no_errors(self):
+        sql = "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.customer_id"
+        errors = validate_joins_against_confirmed(sql, [_confirmed_rel()])
+        assert errors == []
+
+    def test_edited_also_counts_as_confirmed(self):
+        # Per spec §5.3, "edited" means user fixed + accepted → same trust.
+        sql = "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.customer_id"
+        errors = validate_joins_against_confirmed(
+            sql, [_confirmed_rel(status="edited")],
+        )
+        assert errors == []
+
+    def test_candidate_status_blocks(self):
+        sql = "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.customer_id"
+        errors = validate_joins_against_confirmed(
+            sql, [_confirmed_rel(status="candidate")],
+        )
+        assert len(errors) == 1
+        assert "candidate" in errors[0]
+
+    def test_rejected_status_blocks(self):
+        sql = "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.customer_id"
+        errors = validate_joins_against_confirmed(
+            sql, [_confirmed_rel(status="rejected")],
+        )
+        assert len(errors) == 1
+        assert "rejected" in errors[0]
+
+    def test_unknown_relationship_blocks(self):
+        # JOIN refers to tables/columns that have no relationship at all.
+        sql = "SELECT * FROM a JOIN b ON a.x = b.y"
+        errors = validate_joins_against_confirmed(sql, [])
+        assert len(errors) == 1
+        assert "no matching relationship" in errors[0]
+
+    def test_m2m_candidate_blocks_even_when_confirmed(self):
+        # Spec §8.2 guardrail: m2m_candidate cannot auto-join even if
+        # user confirmed. They must first re-classify to one_to_*.
+        sql = "SELECT * FROM tag JOIN post ON tag.post_id = post.id"
+        rels = [_confirmed_rel(
+            from_table="tag", from_field="post_id",
+            to_table="post", to_field="id",
+            status="confirmed",
+            relationship_type="many_to_many_candidate",
+        )]
+        errors = validate_joins_against_confirmed(sql, rels)
+        assert len(errors) == 1
+        assert "many_to_many_candidate" in errors[0]
+
+    def test_reverse_direction_also_matches(self):
+        # Relationship stored as orders→customers; SQL writes it the
+        # other way (customers JOIN orders ON customers.x = orders.x).
+        # Both directions reference the same FK link.
+        sql = "SELECT * FROM customers JOIN orders ON customers.customer_id = orders.customer_id"
+        errors = validate_joins_against_confirmed(sql, [_confirmed_rel()])
+        assert errors == []
+
+    def test_case_insensitive_match(self):
+        # Relationships stored with original sheet case "Customers"
+        # but SQL uses lowercase (DuckDB normalizes identifiers).
+        sql = "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.customer_id"
+        rels = [_confirmed_rel(to_table="Customers")]
+        errors = validate_joins_against_confirmed(sql, rels)
+        assert errors == []
+
+    def test_multi_join_one_unconfirmed_blocks_only_that_one(self):
+        sql = (
+            "SELECT * FROM orders "
+            "JOIN customers ON orders.customer_id = customers.customer_id "
+            "JOIN products ON orders.product_id = products.product_id"
+        )
+        rels = [
+            _confirmed_rel(),  # orders→customers OK
+            # products NOT in confirmed list
+        ]
+        errors = validate_joins_against_confirmed(sql, rels)
+        assert len(errors) == 1
+        assert "orders.product_id" in errors[0]
+
+    def test_no_joins_no_errors(self):
+        # Single-table SELECT — nothing to validate.
+        assert validate_joins_against_confirmed("SELECT * FROM t", []) == []
+
+
+class TestExecuteSafeWithJoinValidation:
+    def test_confirmed_join_executes(self, tmp_path):
+        # End-to-end: register two parquets, confirm a join, run it.
+        df_o = pd.DataFrame({
+            "order_id": [1, 2, 3],
+            "customer_id": ["C1", "C2", "C1"],
+        })
+        df_c = pd.DataFrame({
+            "customer_id": ["C1", "C2"],
+            "name": ["Alice", "Bob"],
+        })
+        po = tmp_path / "orders.parquet"
+        pc = tmp_path / "customers.parquet"
+        df_o.to_parquet(po, index=False)
+        df_c.to_parquet(pc, index=False)
+
+        engine = DuckDBEngine()
+        engine.register_dataset_tables({
+            "orders": str(po),
+            "customers": str(pc),
+        })
+        rels = [_confirmed_rel()]
+        result = engine.execute_safe_with_join_validation(
+            "SELECT orders.order_id, customers.name "
+            "FROM orders JOIN customers "
+            "ON orders.customer_id = customers.customer_id",
+            confirmed_relationships=rels,
+        )
+        engine.close()
+        assert result.success, f"unexpected fail: {result.error}"
+        assert len(result.df) == 3
+
+    def test_unconfirmed_join_blocked_before_execution(self, tmp_path):
+        # No confirmed relationships → JOIN rejected pre-execution
+        # → error_type set + no DataFrame returned.
+        df = pd.DataFrame({"x": [1, 2]})
+        p1 = tmp_path / "a.parquet"
+        p2 = tmp_path / "b.parquet"
+        df.to_parquet(p1, index=False)
+        df.to_parquet(p2, index=False)
+
+        engine = DuckDBEngine()
+        engine.register_dataset_tables({"a": str(p1), "b": str(p2)})
+        result = engine.execute_safe_with_join_validation(
+            "SELECT * FROM a JOIN b ON a.x = b.x",
+            confirmed_relationships=[],
+        )
+        engine.close()
+        assert result.success is False
+        assert result.error_type == "JoinNotConfirmed"
+        assert result.df is None
+        assert "no matching relationship" in result.error.lower()
+
+    def test_register_dataset_tables_returns_mapping(self, tmp_path):
+        df = pd.DataFrame({"x": [1]})
+        p = tmp_path / "t.parquet"
+        df.to_parquet(p, index=False)
+
+        engine = DuckDBEngine()
+        result = engine.register_dataset_tables({"my_table": str(p)})
+        engine.close()
+        assert result == {"my_table": "my_table"}
+
+    def test_register_dataset_tables_rejects_bad_name(self, tmp_path):
+        df = pd.DataFrame({"x": [1]})
+        p = tmp_path / "t.parquet"
+        df.to_parquet(p, index=False)
+        engine = DuckDBEngine()
+        with pytest.raises(ValueError):
+            engine.register_dataset_tables({"1-bad-name": str(p)})
+        engine.close()

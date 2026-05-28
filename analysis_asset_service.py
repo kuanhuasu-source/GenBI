@@ -320,6 +320,205 @@ class AnalysisAssetService:
             return None
         return asset.get("source_query")
 
+    # ============================================================
+    # v0.18 M6 (Assets 2.0): Save Derived Table / Save Analysis Template
+    # ============================================================
+    def save_derived_table(
+        self,
+        session_id: str,
+        step_id: str,
+        name: str,
+        description: str = "",
+        user: str = "anonymous",
+    ) -> str:
+        """Persist a completed M5 step's output as a reusable derived table.
+
+        Per spec §17 M6 + rule 27, the asset doc binds:
+          - dataset_id          (lineage to source upload)
+          - metadata_version    (snapshot — drift check uses this)
+          - source_step_ids     ([step_id] — provenance to M5 chain)
+          - storage path        (referenced from the step, not copied —
+                                 the step parquet is the source of truth;
+                                 if the dataset is deleted both go)
+
+        Args:
+            session_id: M5 analysis session the step belongs to.
+            step_id: A completed analysis_step (action_type ∈
+                {extract_data, add_column, aggregate, create_table}).
+                `visualize` steps don't materialize data and are rejected.
+
+        Returns:
+            asset_id.
+
+        Raises:
+            ValueError on missing session / step, failed step, visualize
+            step (no data), or dataset missing active metadata.
+        """
+        session = self.repo.get_session(session_id)
+        if not session:
+            raise ValueError(f"session `{session_id}` not found")
+        step = self.repo.get_analysis_step(step_id)
+        if not step:
+            raise ValueError(f"step `{step_id}` not found")
+        if step.get("session_id") != session_id:
+            raise ValueError(
+                f"step `{step_id}` does not belong to session `{session_id}`"
+            )
+        if step.get("status") != "completed":
+            raise ValueError(
+                f"step `{step_id}` has status `{step.get('status')}` — "
+                f"can only save completed steps"
+            )
+        if step.get("action_type") == "visualize":
+            raise ValueError(
+                "save_derived_table: visualize steps don't produce data; "
+                "use save_chart() for chart assets instead"
+            )
+        storage = step.get("storage")
+        if not storage or not storage.get("path"):
+            raise ValueError(
+                f"step `{step_id}` has no materialized storage — "
+                f"cannot be saved as derived table"
+            )
+
+        dataset_id = session["dataset_id"]
+        active_meta = self.repo.get_active_metadata(dataset_id)
+        if not active_meta:
+            raise ValueError(
+                f"Dataset `{dataset_id}` has no active metadata"
+            )
+
+        asset_id = generate_asset_id("saved_derived_table")
+        doc = {
+            "_id": asset_id,
+            "asset_type": "saved_derived_table",
+            "dataset_id": dataset_id,
+            "metadata_version": active_meta["version"],
+            "name": name,
+            "description": description,
+            # source_query is required by create_asset; for step-based
+            # assets the originating user_query is the closest analog.
+            "source_query": step.get("user_query", "") or f"step:{step_id}",
+            "source_step_ids": [step_id],   # spec rule 27
+            "asset_payload": {
+                "output_table": step.get("output_table"),
+                "output_schema": step.get("output_schema") or [],
+                "row_count": step.get("row_count", 0),
+                "action_type": step.get("action_type"),
+                "params": step.get("params") or {},
+            },
+            "storage": storage,             # reference, not copy
+            "lineage": {
+                "session_id": session_id,
+                "step_no": step.get("step_no"),
+                "user_query": step.get("user_query", ""),
+                "input_tables": step.get("input_tables") or [],
+            },
+            "created_by": user,
+        }
+        self.repo.create_asset(doc)
+        return asset_id
+
+    def save_template_from_steps(
+        self,
+        session_id: str,
+        step_ids: list[str],
+        name: str,
+        description: str = "",
+        user: str = "anonymous",
+    ) -> str:
+        """Persist a chain of M5 steps as a replayable analysis template.
+
+        Unlike save_template (which preserves a single 5-phase
+        `analysis_result`), this captures a multi-step M5 sequence so
+        the user can replay extract→add→aggregate→visualize on a
+        different dataset with the same shape.
+
+        Per spec §17 M6 + spec §14.5 #11 (test acceptance):
+          - source_step_ids preserves the full chain
+          - template_payload serializes each step's action + params
+
+        Args:
+            session_id: must exist.
+            step_ids: ordered list of step_ids to include in the
+                template (typically all completed steps in the session,
+                but caller can subset).
+
+        Raises:
+            ValueError on missing session / unknown step / failed step
+            in the list / empty step_ids.
+        """
+        if not step_ids:
+            raise ValueError("save_template_from_steps: step_ids empty")
+        session = self.repo.get_session(session_id)
+        if not session:
+            raise ValueError(f"session `{session_id}` not found")
+        dataset_id = session["dataset_id"]
+        active_meta = self.repo.get_active_metadata(dataset_id)
+        if not active_meta:
+            raise ValueError(
+                f"Dataset `{dataset_id}` has no active metadata"
+            )
+
+        # Fetch + validate all referenced steps
+        step_specs: list[dict] = []
+        for sid in step_ids:
+            step = self.repo.get_analysis_step(sid)
+            if not step:
+                raise ValueError(f"step `{sid}` not found")
+            if step.get("session_id") != session_id:
+                raise ValueError(
+                    f"step `{sid}` does not belong to session `{session_id}`"
+                )
+            if step.get("status") != "completed":
+                raise ValueError(
+                    f"step `{sid}` has status `{step.get('status')}` — "
+                    f"template requires all steps to be completed"
+                )
+            step_specs.append({
+                "step_no": step.get("step_no"),
+                "action_type": step.get("action_type"),
+                "params": step.get("params") or {},
+                "user_query": step.get("user_query", ""),
+                "input_tables": step.get("input_tables") or [],
+                "output_table": step.get("output_table"),
+            })
+
+        # Sort by step_no so replay order matches original execution
+        step_specs.sort(key=lambda s: s.get("step_no", 0))
+
+        asset_id = generate_asset_id("analysis_template")
+        # Compose a representative source_query — caller-friendly preview
+        # of what this template replays. Prefer the first non-empty
+        # user_query; else fall back to the template name.
+        rep_query = next(
+            (s.get("user_query") for s in step_specs
+             if s.get("user_query")),
+            None,
+        ) or f"template:{name}"
+
+        doc = {
+            "_id": asset_id,
+            "asset_type": "analysis_template",
+            "dataset_id": dataset_id,
+            "metadata_version": active_meta["version"],
+            "name": name,
+            "description": description,
+            "source_query": rep_query,
+            "source_step_ids": list(step_ids),   # spec rule 27
+            "asset_payload": {
+                "n_steps": len(step_specs),
+                "steps": step_specs,
+            },
+            "lineage": {
+                "session_id": session_id,
+                "step_count": len(step_specs),
+            },
+            "created_by": user,
+        }
+        self.repo.create_asset(doc)
+        return asset_id
+
     def metadata_drift_check(self, asset_id: str) -> dict:
         """檢查 asset 的 metadata_version 跟當前 active 是否一致(spec §12A.7 #9)。
 

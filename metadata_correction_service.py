@@ -237,27 +237,74 @@ class MetadataCorrectionService:
         user: str,
         notes: str = "",
     ) -> dict:
-        """純 confirm — 不改任何欄位,只把當前 active 標 confirmed。
+        """Confirm the currently-active draft metadata.
 
-        若當前 active 已是 confirmed,raise(避免重複)。
-        若還沒有任何 metadata version,raise。
+        Behavior:
+          - Writes a new metadata_version with status='confirmed'.
+          - v0.18 M7: also merges confirmed/edited rows from
+            upload_relationship_candidates into metadata['relationships']
+            on the new version (spec §14.5 #5). When no confirmed rels
+            exist the field stays absent — backward compat preserved.
+
+        If the active version is already confirmed, no new version is
+        written and `already_confirmed=True` is returned.
 
         Returns:
-            {"version": int}
+            {"version": int, "already_confirmed": bool,
+             "n_relationships_merged": int}
         """
         active = self.repo.get_active_metadata(dataset_id)
         if not active:
             raise ValueError(f"No active metadata for `{dataset_id}`")
         if active["confirmation_status"] == "confirmed":
-            return {"version": active["version"], "already_confirmed": True}
+            return {
+                "version": active["version"],
+                "already_confirmed": True,
+                "n_relationships_merged": 0,
+            }
 
-        # 寫新版(內容同,但 status='confirmed')
+        # M7: project confirmed/edited relationships into metadata.relationships.
+        # The repository defaults to the latest metadata_version's rows,
+        # which is what we want (most recent profile).
+        # Only the executable fields go into metadata — evidence/audit
+        # stays in the dedicated collection.
+        merged_relationships: list[dict] = []
+        try:
+            cands = self.repo.list_relationship_candidates(dataset_id)
+            for c in cands:
+                if c.get("status") not in ("confirmed", "edited"):
+                    continue
+                merged_relationships.append({
+                    "relationship_id": c.get("relationship_id"),
+                    "from_table": c.get("from_table"),
+                    "from_field": c.get("from_field"),
+                    "to_table": c.get("to_table"),
+                    "to_field": c.get("to_field"),
+                    "relationship_type": c.get("relationship_type"),
+                    "default_join_type": c.get("default_join_type", "left"),
+                    "status": c.get("status"),
+                })
+        except Exception as e:
+            # Don't let a missing/empty rel collection block confirm.
+            logger.warning(
+                f"confirm_metadata: relationship merge skipped "
+                f"({type(e).__name__}: {e})"
+            )
+
+        new_metadata = dict(active["metadata"])
+        if merged_relationships:
+            new_metadata["relationships"] = merged_relationships
+
         new_version = self.repo.save_metadata_version(
             dataset_id=dataset_id,
-            metadata=active["metadata"],
+            metadata=new_metadata,
             confirmation_status="confirmed",
             confirmed_by=user,
             notes=notes or "User confirmed without further edits",
             activate=True,
         )
-        return {"version": new_version, "already_confirmed": False}
+        return {
+            "version": new_version,
+            "already_confirmed": False,
+            "n_relationships_merged": len(merged_relationships),
+        }

@@ -257,3 +257,137 @@ class TestCorrectionServiceWithMongo:
         # 再 confirm:應該 short-circuit 不出新版
         result = service.confirm_metadata(dataset_id="upload_test_001", user="alice")
         assert result.get("already_confirmed") is True
+
+
+@pytest.mark.requires_mongo
+class TestConfirmMetadataMergesRelationships:
+    """v0.18 M7: confirmed/edited relationships project into the new
+    metadata version's `relationships` field. Spec §14.5 #5."""
+
+    def _setup(self, mongo_db, sample_metadata):
+        from upload_repository import UploadRepository
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.create_dataset({
+            "_id": "ds-m7", "dataset_name": "test", "owner": "alice",
+            "source_type": "file_upload", "file": {},
+            "status": "profiled",
+        })
+        repo.save_metadata_version(
+            dataset_id="ds-m7", metadata=sample_metadata,
+            confirmation_status="draft", activate=True,
+        )
+        return repo
+
+    def _sample_rel(self, rid, status="confirmed"):
+        return {
+            "relationship_id": rid,
+            "from_table": "orders", "from_field": "customer_id",
+            "to_table": "customers", "to_field": "customer_id",
+            "relationship_type": "many_to_one",
+            "default_join_type": "left",
+            "confidence": 0.95,
+            "status": status,
+        }
+
+    def test_no_rels_field_absent(self, mongo_db, sample_metadata):
+        # When there are zero confirmed rels, metadata.relationships
+        # must not appear on the new version (backward compat).
+        repo = self._setup(mongo_db, sample_metadata)
+        svc = MetadataCorrectionService(repo)
+        result = svc.confirm_metadata("ds-m7", user="alice")
+        assert result["n_relationships_merged"] == 0
+        new_active = repo.get_active_metadata("ds-m7")
+        assert "relationships" not in new_active["metadata"]
+
+    def test_confirmed_rel_merged(self, mongo_db, sample_metadata):
+        repo = self._setup(mongo_db, sample_metadata)
+        repo.save_relationship_candidates(
+            "ds-m7", [self._sample_rel("rel_a")], metadata_version=1,
+        )
+        svc = MetadataCorrectionService(repo)
+        result = svc.confirm_metadata("ds-m7", user="alice")
+        assert result["n_relationships_merged"] == 1
+        new_active = repo.get_active_metadata("ds-m7")
+        assert "relationships" in new_active["metadata"]
+        rels = new_active["metadata"]["relationships"]
+        assert len(rels) == 1
+        assert rels[0]["relationship_id"] == "rel_a"
+        assert rels[0]["from_table"] == "orders"
+        assert rels[0]["status"] == "confirmed"
+
+    def test_edited_status_also_merged(self, mongo_db, sample_metadata):
+        # `edited` rels count as user-approved (same trust level as
+        # confirmed) — must also flow into the new version.
+        repo = self._setup(mongo_db, sample_metadata)
+        repo.save_relationship_candidates(
+            "ds-m7",
+            [self._sample_rel("rel_edited", status="edited")],
+            metadata_version=1,
+        )
+        svc = MetadataCorrectionService(repo)
+        result = svc.confirm_metadata("ds-m7", user="alice")
+        assert result["n_relationships_merged"] == 1
+        rels = repo.get_active_metadata("ds-m7")["metadata"]["relationships"]
+        assert rels[0]["status"] == "edited"
+
+    def test_candidate_status_not_merged(self, mongo_db, sample_metadata):
+        # Unreviewed candidates do NOT flow in — that would defeat
+        # the HITL gate.
+        repo = self._setup(mongo_db, sample_metadata)
+        repo.save_relationship_candidates(
+            "ds-m7",
+            [self._sample_rel("rel_pending", status="candidate")],
+            metadata_version=1,
+        )
+        svc = MetadataCorrectionService(repo)
+        result = svc.confirm_metadata("ds-m7", user="alice")
+        assert result["n_relationships_merged"] == 0
+
+    def test_rejected_status_not_merged(self, mongo_db, sample_metadata):
+        repo = self._setup(mongo_db, sample_metadata)
+        repo.save_relationship_candidates(
+            "ds-m7",
+            [self._sample_rel("rel_rejected", status="rejected")],
+            metadata_version=1,
+        )
+        svc = MetadataCorrectionService(repo)
+        result = svc.confirm_metadata("ds-m7", user="alice")
+        assert result["n_relationships_merged"] == 0
+
+    def test_mixed_only_approved_merged(self, mongo_db, sample_metadata):
+        # 1 confirmed + 1 candidate + 1 rejected + 1 edited = 2 merged
+        repo = self._setup(mongo_db, sample_metadata)
+        repo.save_relationship_candidates(
+            "ds-m7",
+            [
+                self._sample_rel("rel_c", status="confirmed"),
+                self._sample_rel("rel_p", status="candidate"),
+                self._sample_rel("rel_r", status="rejected"),
+                self._sample_rel("rel_e", status="edited"),
+            ],
+            metadata_version=1,
+        )
+        svc = MetadataCorrectionService(repo)
+        result = svc.confirm_metadata("ds-m7", user="alice")
+        assert result["n_relationships_merged"] == 2
+        merged_ids = {
+            r["relationship_id"]
+            for r in repo.get_active_metadata("ds-m7")["metadata"]["relationships"]
+        }
+        assert merged_ids == {"rel_c", "rel_e"}
+
+    def test_only_executable_fields_projected(self, mongo_db, sample_metadata):
+        # Evidence + confidence should NOT leak into metadata —
+        # those live in the dedicated upload_relationship_candidates
+        # collection. metadata only carries what's needed at query time.
+        repo = self._setup(mongo_db, sample_metadata)
+        rel = self._sample_rel("rel_c")
+        rel["evidence"] = {"name_similarity": 1.0}
+        rel["confidence"] = 0.99
+        repo.save_relationship_candidates("ds-m7", [rel], metadata_version=1)
+        svc = MetadataCorrectionService(repo)
+        svc.confirm_metadata("ds-m7", user="alice")
+        merged = repo.get_active_metadata("ds-m7")["metadata"]["relationships"][0]
+        assert "evidence" not in merged
+        assert "confidence" not in merged

@@ -161,6 +161,457 @@ class TestTableCRUD:
         tables = repo.list_tables("ds-1")
         assert [t["table_id"] for t in tables] == ["sheet1", "sheet2", "sheet3"]
 
+    def test_extra_fields_persist_through_create(self, mongo_db):
+        # Spec §5.2 — upload_tables doc includes sheet_name / table_role /
+        # grain / primary_key. create_table inserts the dict as-is, so extra
+        # fields must round-trip. Regression guard: a future "strict schema"
+        # change shouldn't silently drop these.
+        repo = UploadRepository(mongo_db)
+        repo.create_table({
+            "dataset_id": "ds-1", "table_id": "tbl_employee",
+            "table_name": "employee", "sheet_name": "Employee",
+            "row_count": 10, "column_count": 3,
+            "storage": {"format": "parquet", "path": "p"},
+            "table_role": "dimension", "grain": "one row per employee",
+            "primary_key": ["employee_id"],
+        })
+        t = repo.get_table("ds-1", "tbl_employee")
+        assert t["sheet_name"] == "Employee"
+        assert t["table_role"] == "dimension"
+        assert t["grain"] == "one row per employee"
+        assert t["primary_key"] == ["employee_id"]
+
+
+@pytest.mark.requires_mongo
+class TestUpdateTableProfileFields:
+    """Spec §5.2 fields set after profiling (profile_multi_table → repo)."""
+
+    def _seed_table(self, repo, dataset_id="ds-1", table_id="tbl_employee"):
+        repo.create_table({
+            "dataset_id": dataset_id, "table_id": table_id,
+            "table_name": "employee",
+            "row_count": 10, "column_count": 3,
+            "storage": {"format": "parquet", "path": "p"},
+        })
+
+    def test_sets_all_fields(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        self._seed_table(repo)
+        ok = repo.update_table_profile_fields(
+            "ds-1", "tbl_employee",
+            sheet_name="Employee",
+            table_role="dimension",
+            grain="one row per employee",
+            primary_key=["employee_id"],
+            profile_version=1,
+        )
+        assert ok is True
+        t = repo.get_table("ds-1", "tbl_employee")
+        assert t["sheet_name"] == "Employee"
+        assert t["table_role"] == "dimension"
+        assert t["grain"] == "one row per employee"
+        assert t["primary_key"] == ["employee_id"]
+        assert t["profile_version"] == 1
+        assert "updated_at" in t   # timestamp written
+
+    def test_partial_update_preserves_other_fields(self, mongo_db):
+        # If caller only updates table_role, the existing grain/PK must stay.
+        repo = UploadRepository(mongo_db)
+        self._seed_table(repo)
+        repo.update_table_profile_fields(
+            "ds-1", "tbl_employee",
+            table_role="dimension",
+            grain="one row per employee",
+            primary_key=["employee_id"],
+        )
+        # Second call: only flip table_role to "fact" — other fields stay.
+        ok = repo.update_table_profile_fields(
+            "ds-1", "tbl_employee", table_role="fact",
+        )
+        assert ok is True
+        t = repo.get_table("ds-1", "tbl_employee")
+        assert t["table_role"] == "fact"
+        assert t["grain"] == "one row per employee"   # untouched
+        assert t["primary_key"] == ["employee_id"]    # untouched
+
+    def test_unrelated_fields_untouched(self, mongo_db):
+        # row_count / column_count / storage / table_name (set at create_table
+        # time) must survive a profile-fields update.
+        repo = UploadRepository(mongo_db)
+        self._seed_table(repo)
+        repo.update_table_profile_fields(
+            "ds-1", "tbl_employee", table_role="dimension",
+        )
+        t = repo.get_table("ds-1", "tbl_employee")
+        assert t["row_count"] == 10
+        assert t["column_count"] == 3
+        assert t["table_name"] == "employee"
+        assert t["storage"]["path"] == "p"
+
+    def test_missing_table_returns_false(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        ok = repo.update_table_profile_fields(
+            "ds-nonexistent", "tbl_nothing", table_role="fact",
+        )
+        assert ok is False
+
+    def test_no_fields_returns_false(self, mongo_db):
+        # Empty update — short-circuit, don't even hit Mongo.
+        repo = UploadRepository(mongo_db)
+        self._seed_table(repo)
+        ok = repo.update_table_profile_fields("ds-1", "tbl_employee")
+        assert ok is False
+
+    def test_can_clear_with_empty_list(self, mongo_db):
+        # Per docstring: pass [] to explicitly clear a primary_key.
+        # None is "leave alone", [] is "no PK now".
+        repo = UploadRepository(mongo_db)
+        self._seed_table(repo)
+        repo.update_table_profile_fields(
+            "ds-1", "tbl_employee", primary_key=["employee_id"],
+        )
+        repo.update_table_profile_fields(
+            "ds-1", "tbl_employee", primary_key=[],
+        )
+        t = repo.get_table("ds-1", "tbl_employee")
+        assert t["primary_key"] == []
+
+    def test_composite_primary_key_persists(self, mongo_db):
+        # Bridge tables have composite PKs — verify multi-element list
+        # round-trips correctly.
+        repo = UploadRepository(mongo_db)
+        self._seed_table(repo, table_id="tbl_emp_proj")
+        repo.update_table_profile_fields(
+            "ds-1", "tbl_emp_proj",
+            table_role="bridge",
+            primary_key=["employee_id", "project_id"],
+        )
+        t = repo.get_table("ds-1", "tbl_emp_proj")
+        assert t["primary_key"] == ["employee_id", "project_id"]
+        assert t["table_role"] == "bridge"
+
+
+@pytest.mark.requires_mongo
+class TestRelationshipCandidatesCRUD:
+    """v0.18 M2 · spec §5.3 upload_relationship_candidates"""
+
+    def _sample(self, rid="rel_orders_customers_customer_id"):
+        return {
+            "relationship_id": rid,
+            "from_table": "orders", "from_field": "customer_id",
+            "to_table": "customers", "to_field": "customer_id",
+            "relationship_type": "many_to_one",
+            "default_join_type": "left",
+            "confidence": 0.91,
+            "confidence_tier": "high",
+            "evidence": {
+                "name_similarity": 1.0, "type_compatible": True,
+                "from_to_overlap_ratio": 0.98, "to_unique_ratio": 0.997,
+                "sample_match_count": 50,
+            },
+            "status": "candidate",
+        }
+
+    def test_save_bulk_writes_n(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        n = repo.save_relationship_candidates(
+            "ds-1",
+            [self._sample(), self._sample("rel_a_b_x"), self._sample("rel_c_d_y")],
+            metadata_version=1,
+        )
+        assert n == 3
+        rows = repo.list_relationship_candidates("ds-1")
+        assert len(rows) == 3
+
+    def test_save_empty_returns_zero(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        assert repo.save_relationship_candidates("ds-1", [], 1) == 0
+
+    def test_save_idempotent_via_relationship_id(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample()], metadata_version=1,
+        )
+        # Re-running with same args must not produce duplicates — only update.
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample()], metadata_version=1,
+        )
+        rows = repo.list_relationship_candidates("ds-1")
+        assert len(rows) == 1
+
+    def test_save_different_metadata_version_creates_new_row(self, mongo_db):
+        # When metadata is re-profiled (new version), candidates are NOT
+        # overwritten on the old version — both rows coexist for history.
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample()], metadata_version=1,
+        )
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample()], metadata_version=2,
+        )
+        all_rows = list(
+            mongo_db["upload_relationship_candidates"]
+            .find({"dataset_id": "ds-1"})
+        )
+        assert len(all_rows) == 2
+        versions = {r["metadata_version"] for r in all_rows}
+        assert versions == {1, 2}
+
+    def test_save_requires_relationship_id(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        bad = self._sample()
+        del bad["relationship_id"]
+        with pytest.raises(ValueError, match="relationship_id"):
+            repo.save_relationship_candidates(
+                "ds-1", [bad], metadata_version=1,
+            )
+
+    def test_list_defaults_to_latest_version(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        # v1 has 2 rels; v2 has 1 (smaller set after user editing)
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample("rel_a"), self._sample("rel_b")],
+            metadata_version=1,
+        )
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample("rel_a")], metadata_version=2,
+        )
+        # Default call returns v2 (latest) only.
+        rows = repo.list_relationship_candidates("ds-1")
+        assert len(rows) == 1
+        assert all(r["metadata_version"] == 2 for r in rows)
+
+    def test_list_filter_by_status(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        r1 = self._sample("rel_a")
+        r2 = {**self._sample("rel_b"), "status": "confirmed"}
+        r3 = {**self._sample("rel_c"), "status": "rejected"}
+        repo.save_relationship_candidates(
+            "ds-1", [r1, r2, r3], metadata_version=1,
+        )
+        candidate_rows = repo.list_relationship_candidates(
+            "ds-1", status="candidate",
+        )
+        assert len(candidate_rows) == 1
+        confirmed_rows = repo.list_relationship_candidates(
+            "ds-1", status="confirmed",
+        )
+        assert len(confirmed_rows) == 1
+        assert confirmed_rows[0]["relationship_id"] == "rel_b"
+
+    def test_list_sorted_by_confidence_desc(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        rels = [
+            {**self._sample("rel_low"), "confidence": 0.55},
+            {**self._sample("rel_high"), "confidence": 0.95},
+            {**self._sample("rel_mid"), "confidence": 0.75},
+        ]
+        repo.save_relationship_candidates("ds-1", rels, metadata_version=1)
+        rows = repo.list_relationship_candidates("ds-1")
+        confidences = [r["confidence"] for r in rows]
+        assert confidences == sorted(confidences, reverse=True)
+
+    def test_update_status_confirmed_writes_audit(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample("rel_x")], metadata_version=1,
+        )
+        ok = repo.update_relationship_status(
+            "ds-1", "rel_x", status="confirmed", user="alice",
+        )
+        assert ok is True
+        row = repo.list_relationship_candidates("ds-1")[0]
+        assert row["status"] == "confirmed"
+        assert row["confirmed_by"] == "alice"
+        assert "confirmed_at" in row
+
+    def test_update_status_rejected_writes_audit(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample("rel_x")], metadata_version=1,
+        )
+        repo.update_relationship_status(
+            "ds-1", "rel_x", status="rejected", user="bob",
+        )
+        row = repo.list_relationship_candidates("ds-1")[0]
+        assert row["status"] == "rejected"
+        assert row["rejected_by"] == "bob"
+
+    def test_update_join_key_and_type(self, mongo_db):
+        # User edited a candidate: changed from_field + relationship_type.
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample("rel_x")], metadata_version=1,
+        )
+        ok = repo.update_relationship_status(
+            "ds-1", "rel_x",
+            status="edited",
+            from_field="customer_uid",
+            relationship_type="one_to_many",
+            default_join_type="inner",
+            user="carol",
+        )
+        assert ok is True
+        row = repo.list_relationship_candidates("ds-1")[0]
+        assert row["from_field"] == "customer_uid"
+        assert row["relationship_type"] == "one_to_many"
+        assert row["default_join_type"] == "inner"
+        assert row["status"] == "edited"
+
+    def test_update_missing_relationship_returns_false(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        assert repo.update_relationship_status(
+            "ds-1", "rel_nonexistent", status="confirmed",
+        ) is False
+
+    def test_update_no_fields_returns_false(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.save_relationship_candidates(
+            "ds-1", [self._sample("rel_x")], metadata_version=1,
+        )
+        assert repo.update_relationship_status(
+            "ds-1", "rel_x",
+        ) is False
+
+    def test_cascade_delete_with_dataset(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.create_dataset({
+            "_id": "ds-cascade", "dataset_name": "x",
+            "owner": "alice", "source_type": "file_upload",
+            "file": {}, "status": "uploaded",
+        })
+        repo.save_relationship_candidates(
+            "ds-cascade", [self._sample("rel_x")], metadata_version=1,
+        )
+        repo.delete_dataset("ds-cascade")
+        assert repo.list_relationship_candidates("ds-cascade") == []
+
+
+@pytest.mark.requires_mongo
+class TestAnalysisStepsCRUD:
+    """v0.18 M5 · spec §5.4 analysis_steps collection"""
+
+    def _sample_step(self, step_id="step_001", step_no=1,
+                      session_id="sess_001", action="extract_data"):
+        return {
+            "step_id": step_id,
+            "session_id": session_id,
+            "dataset_id": "ds-1",
+            "metadata_version": 1,
+            "step_no": step_no,
+            "action_type": action,
+            "user_query": "test",
+            "input_tables": ["employee"],
+            "output_table": "out_1",
+            "row_count": 10,
+        }
+
+    def test_save_and_get_step(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        sid = repo.save_analysis_step(self._sample_step())
+        assert sid == "step_001"
+        doc = repo.get_analysis_step("step_001")
+        assert doc["session_id"] == "sess_001"
+        assert doc["action_type"] == "extract_data"
+        assert "created_at" in doc
+
+    def test_save_requires_fields(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        bad = self._sample_step()
+        del bad["step_id"]
+        with pytest.raises(ValueError, match="step_id"):
+            repo.save_analysis_step(bad)
+
+    def test_list_steps_sorted_by_step_no(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        for n in [3, 1, 2]:
+            repo.save_analysis_step(self._sample_step(
+                step_id=f"step_{n}", step_no=n,
+            ))
+        steps = repo.list_analysis_steps("sess_001")
+        assert [s["step_no"] for s in steps] == [1, 2, 3]
+
+    def test_duplicate_step_no_in_session_rejected(self, mongo_db):
+        # Unique index on (session_id, step_no) — duplicate step_no
+        # within the same session must fail.
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_analysis_step(self._sample_step(
+            step_id="step_a", step_no=1,
+        ))
+        with pytest.raises(Exception) as excinfo:
+            repo.save_analysis_step(self._sample_step(
+                step_id="step_b", step_no=1,
+            ))
+        msg = str(excinfo.value).lower()
+        assert ("duplicate" in msg or "duplicatekey" in msg
+                or "e11000" in msg)
+
+    def test_list_filter_by_status(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_analysis_step(self._sample_step(
+            step_id="step_ok", step_no=1,
+        ))
+        bad = self._sample_step(step_id="step_bad", step_no=2)
+        bad["status"] = "failed"
+        repo.save_analysis_step(bad)
+        completed = repo.list_analysis_steps(
+            "sess_001", status="completed",
+        )
+        assert len(completed) == 1
+        assert completed[0]["step_id"] == "step_ok"
+
+    def test_next_step_no(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        # Empty session → 1
+        assert repo.next_step_no("sess_001") == 1
+        repo.save_analysis_step(self._sample_step(step_no=1))
+        assert repo.next_step_no("sess_001") == 2
+        repo.save_analysis_step(self._sample_step(
+            step_id="step_2", step_no=2,
+        ))
+        assert repo.next_step_no("sess_001") == 3
+
+    def test_step_isolated_by_session(self, mongo_db):
+        # step_no=1 in session A and step_no=1 in session B must coexist.
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.save_analysis_step(self._sample_step(
+            step_id="a1", session_id="sess_A", step_no=1,
+        ))
+        repo.save_analysis_step(self._sample_step(
+            step_id="b1", session_id="sess_B", step_no=1,
+        ))
+        assert len(repo.list_analysis_steps("sess_A")) == 1
+        assert len(repo.list_analysis_steps("sess_B")) == 1
+
+    def test_cascade_delete_with_dataset(self, mongo_db):
+        repo = UploadRepository(mongo_db)
+        repo.ensure_indexes()
+        repo.create_dataset({
+            "_id": "ds-cascade", "dataset_name": "x", "owner": "a",
+            "source_type": "file_upload", "file": {}, "status": "uploaded",
+        })
+        repo.save_analysis_step({
+            **self._sample_step(), "dataset_id": "ds-cascade",
+        })
+        repo.delete_dataset("ds-cascade")
+        assert repo.list_analysis_steps("sess_001") == []
+
 
 @pytest.mark.requires_mongo
 class TestProfileVersioning:

@@ -1211,4 +1211,269 @@ GENBI_RAG_ENABLED env 控制,off 時整套 collapse → v0.15 byte-equal。
 
 ---
 
+## 24. v0.18 · Multi-table Upload Workspace(第四條 architecture pillar)
+
+對應 spec `GenBI_Upload_Workspace_MultiTable_Upgrade_Spec.pdf`(13 頁,7 milestone)
++ audit `V0_18_MULTITABLE_AUDIT.md`。一個 session 內 6 個 milestone 全落地
+(M1+M2+M4+M5+M6+M7),12/12 spec §14.5 acceptance test 全綠,zero regression
+on existing 482 v0.17 tests。
+
+### 24.1 為什麼需要
+
+v0.12-v0.15 的 Upload-driven path 是 **single-table only**:
+- `upload_service.handle_upload` 只讀 Excel 的第一個 sheet
+- `upload_analysis_service.py:378` 寫死 `tables[0]  # MVP single-table`
+- `pages/07_data_workspace.py:446` 寫死 `list(metadata["collections"].keys())[0]`
+- 多 sheet workbook 的 cross-table 分析完全做不到
+
+v0.18 把這層整個升級成 multi-table:每張 sheet 自動 parse + profile,
+relationships 自動偵測 + HITL review,confirmed relationship 才能 join,
+互動分析支援 add_column / aggregate / create_table / visualize 鏈式步驟,
+saved asset 都綁 source_step_ids lineage。
+
+### 24.2 6 個 milestone overview
+
+| M | Module(s) | Spec § |
+|---|---|---|
+| M1 Multi-sheet Parser + Profile | `multi_table_profiler.py`(新) + `file_parser.parse_excel_all_sheets`(v0.15 已有) | §6, §7 |
+| M2 Relationship Profiler + Review UI | `relationship_profiler.py`(重寫) + `pages/07` Section 3b | §8, §5.3, §9.1 |
+| M4 DuckDB Multi-table Analysis(Tier A)| `duckdb_engine.py`(extend) + JOIN validator | §11, §8.2 guardrail |
+| M5 Interactive Analysis Steps | `analysis_step_service.py`(新) | §10, §5.4 |
+| M6 Assets 2.0 | `analysis_asset_service.py`(extend) | rule 27 |
+| M7 Regression Gate(scaffold → complete)| `scripts/run_regression_gate.py`(新) + 12 acceptance test | §14 |
+
+### 24.3 4 個新 collection(spec §5)
+
+| Collection | M | 鍵 |
+|---|---|---|
+| `upload_relationship_candidates` | M2 | `(dataset_id, metadata_version, relationship_id)` unique |
+| `analysis_steps` | M5 | `(session_id, step_no)` unique |
+| `upload_tables` 加新欄位 | M1 | `sheet_name` / `table_role` / `grain` / `primary_key` |
+| `analysis_assets` 加新 type + 欄位 | M6 | `asset_type ∈ {saved_derived_table, analysis_template}` · `source_step_ids: list[str]` |
+
+### 24.4 兩條路徑(多表升級後的全景)
+
+```
+Schema-driven Path                    Upload-driven Path (v0.18 升級)
+────────────────────                   ─────────────────────────────
+app.py / main_chat.py                  upload_service.handle_upload
+  → 5-phase legacy chain                 → file_parser.parse_excel_all_sheets  ← v0.15
+                                         → data_profiler.profile_dataset
+                                         → multi_table_profiler.profile_multi_table  ← M1
+                                         → upload_repository.update_table_profile_fields
+                                         → relationship_profiler.detect_relationships  ← M2
+                                         → upload_repository.save_relationship_candidates
+                                         → upload_metadata_generator.regenerate_metadata
+                                         → metadata_correction_service.confirm_metadata  ← M7 加 rel merge
+                                         → analysis_step_service(M5):
+                                           add_step → handler → derived parquet → save step
+                                         → duckdb_engine(M4):
+                                           validate_joins_against_confirmed → execute_safe
+                                         → analysis_asset_service(M6):
+                                           save_derived_table / save_template_from_steps
+```
+
+Frozen baseline rule(spec §14.1):**Schema-driven path 在 v0.18 一行都沒動**。
+acceptance #12(`test_multisheet_12_schema_driven_baseline_unchanged`)用 py_compile +
+import smoke + grep 「from upload_」 in `llm_service.py` 三重檢驗。
+
+### 24.5 M1 · multi_table_profiler 設計
+
+```python
+profile_multi_table(workbook: dict[str, pd.DataFrame]) -> {
+    "tables": [
+        {
+            # from data_profiler.profile_table:
+            "table_id": "tbl_employee", "row_count": ..., "column_count": ...,
+            "columns": [{name, physical_type, null_pct, distinct_pct, ...}],
+            # M1 加值:
+            "sheet_name": "Employee",
+            "table_name": "employee",
+            "possible_primary_key": ["employee_id"],
+            "possible_total_row": False,
+            "duplicate_row_count": 0,
+            "table_warnings": ["no_clear_pk"],
+            "table_role": "dimension" | "fact" | "bridge" | "unknown",
+            "grain": "one row per employee",
+        },
+        ...
+    ],
+    "n_sheets": int, "total_rows": int,
+}
+```
+
+Deterministic、no LLM call、純 pandas + rule。bridge 偵測規則:**該 table 有 ≥2 個
+column 名字命中其他 table 的 PK candidate**。fact 規則:**有 PK 且 measure ratio ≥ 30%**。
+
+### 24.6 M2 · relationship_profiler 公式重寫
+
+從 v0.15 的 `0.85-base + boost/penalty` 換成 spec §8.1 weighted:
+
+```python
+score = (
+    0.25 * name_score        # 1.0 if normalized 名稱完全一樣
+  + 0.20 * type_score        # 1.0 if physical type family 相同
+  + 0.30 * overlap_score     # |from ∩ to| / |from|
+  + 0.20 * uniqueness_score  # to-side distinct/row ratio
+  - penalties                # null (>30%) + free_text (avg len>50) + low_cardinality (<5)
+)
+```
+
+Status tier(spec §8.1):≥0.90 high · 0.70-0.89 review · 0.50-0.69 weak · <0.50 ignore
+
+Type inference(spec §8.2):依 source / target uniqueness 兩兩比 0.95 切 high/low:
+1:1 / m2o / 1:m / **m2m_candidate**(guardrail tag)
+
+deterministic `relationship_id = "rel_{from_table}_{to_table}_{from_field}"`,
+讓 `upload_relationship_candidates` 的 unique index 可以 idempotent upsert。
+
+### 24.7 M4 · DuckDB JOIN gate
+
+加在 v0.15 的 `duckdb_engine` 上 — 不改既有 `execute_safe`、加 wrapper:
+
+```python
+def execute_safe_with_join_validation(sql, confirmed_relationships):
+    # 1. regex 解出所有 JOIN ... ON a.x = b.y
+    joins = extract_joins_from_sql(sql)
+    # 2. 對每個 join,三 way check:
+    for j in joins:
+        match = find_matching_relationship(j, confirmed_relationships)
+        if match is None: error("no matching relationship")
+        if match.status not in {"confirmed", "edited"}: error("not approved")
+        if match.relationship_type == "many_to_many_candidate":
+            error("m2m must be re-classified before join")
+    # 3. 全通過 → execute_safe(SQL)
+```
+
+**MVP 限制**(in-code documented):literal-table-name JOIN 為主,alias / 多欄
+join / quoted identifier 暫不支援。Case-insensitive matching(DuckDB identifier
+規則 + parser 產 lowercase 但 relationship 存原 sheet case)。
+
+### 24.8 M5 · analysis_step_service 設計(spec §5.4 + §10)
+
+5 個 pure action handler,每個都是 `_handle_*(df, params) -> df` 純函數:
+
+| action_type | params | 用 pandas API |
+|---|---|---|
+| `extract_data` | filters: list[{column, op, value}] | mask + df[mask] |
+| `add_column` | new_column, formula | **`df.eval(engine='python')`** |
+| `aggregate` | group_by, aggregations[{column, function, alias}] | groupby + 安全 list 內的 agg |
+| `create_table` | new_name | passthrough rename |
+| `visualize` | chart_type, x, y, ... | passthrough(只存 chart_spec)|
+
+side-effect 在 dispatcher `add_step()` 裡:寫 derived parquet 到
+`uploads_root/<dataset_id>/derived/<step_id>.parquet`,寫 step doc 到 Mongo。
+這個 pure/side-effect split 讓 future `rerun_step` 可以重跑 handler 不碰 DB。
+
+`resolve_table(session_id, name)` 走 derived(最新 step 優先)→ source upload_tables
+雙路 lookup,讓 step 2 可以引用 step 1 的 `output_table` 而不知道是 step 還是 source。
+
+### 24.9 M6 · Assets 2.0(spec rule 27)
+
+兩個新 method,都 binding 三件事:`dataset_id` / `metadata_version` / `source_step_ids`
+
+```python
+save_derived_table(session_id, step_id, name, ...) -> asset_id
+# 把 1 個完成的 step 存成可重用 asset
+# storage path 直接 reference 該 step 的 parquet(不 copy)
+
+save_template_from_steps(session_id, step_ids, name, ...) -> asset_id
+# 把多個 step 的 (action_type, params) chain 序列化成 replayable template
+# 內部 sort by step_no 確保 replay order
+```
+
+既有 `metadata_drift_check(asset_id)` **不用改**就對新 type 適用 — 只看
+`asset.metadata_version` vs `dataset.active_metadata_version`。
+
+### 24.10 M7 · `confirm_metadata` 自動 merge confirmed rels
+
+spec §14.5 #5 acceptance — 這是 M7 唯一一個需要既有 code 改動的 anti-pattern fix:
+
+```python
+# metadata_correction_service.confirm_metadata 新行為:
+cands = repo.list_relationship_candidates(dataset_id)
+merged = [
+    {
+        "relationship_id": c.relationship_id,
+        "from_table": ..., "to_table": ..., "relationship_type": ...,
+        "default_join_type": ..., "status": ...,  # 只 project 執行所需欄位
+    }
+    for c in cands
+    if c.status in ("confirmed", "edited")
+]
+if merged:
+    new_metadata["relationships"] = merged
+# 寫新 version,return {"version": ..., "n_relationships_merged": N}
+```
+
+backward-compat:0 個 confirmed rel → `relationships` field 整個不出現(既有 17 個
+test_metadata_correction_service test 全綠)。
+
+### 24.11 Pages 變動
+
+| Page | M1 | M2 |
+|---|---|---|
+| `pages/07_data_workspace.py` | Section 1 改 copy(移除 "single sheet")· Section 3 加 enrichment badges(role/grain/PK)· Section 5 多 table 加 selectbox | 新 Section 3b Relationship Review(per-row expander + Confirm/Reject/Edit type/Edit join) |
+| `pages/08_data_analysis.py` | 不需要 — 仍 single-table 分析 chat | 從 repo 讀 candidates 不再 re-detect · 新 evidence 欄位名 |
+
+### 24.12 Regression Gate(spec §14.4)
+
+```bash
+python scripts/run_regression_gate.py --mode fast      # ~10s · 不需 Ollama/Mongo
+python scripts/run_regression_gate.py --mode full      # 加 test_runner --domain tflex baseline
+```
+
+5 category(Appendix B JSON output):
+- py_compile(8 critical files)
+- unit_tests(642)
+- upload_acceptance(29)
+- multi_table_acceptance(12)
+- schema_baseline(full mode only)
+
+exit 0 / 1 視 `blocking_failures` 是否為空。
+
+### 24.13 Spec §14.6 anti-pattern coverage:7/10
+
+| Anti-pattern | 覆蓋於 |
+|---|---|
+| Unconfirmed relationship used in SQL join | M4 #6 |
+| Many-to-many auto-joins without review | M4 unit test + #6/#7 |
+| Derived table loses metadata_version lineage | M5 step doc + M6 asset doc |
+| Saved chart rerun ignores metadata drift | M6 `metadata_drift_check` |
+| DuckDB SQL contains write operation | pre-M2 既有(FORBIDDEN_SQL keywords) |
+| test_runner.py --domain tflex behavior changes | #12 + frozen baseline rule |
+| Schema-driven path uses upload metadata provider | #12 grep on `llm_service.py` |
+
+剩 3 個未覆蓋的 anti-pattern(audit + 程式碼 TODO 都有記錄):
+- Upload path calls schema-driven `generate_pipeline` — 需 M4 Tier B
+- Prompt includes full workbook metadata exceeding budget — 需 spec §13 RAG indices
+- Identifier field aggregated — 已有 M3 既有 validator
+
+### 24.14 v0.18 延期到 follow-up PR(audit + 程式碼 TODO 都有記錄)
+
+1. **M2 fuzzy name matching**(`cust_id` ↔ `customer_id` 語意相似)
+2. **M4 Tier B** — `llm_service.generate_duckdb_sql` + `UploadAnalysisService` Phase A routing
+3. **M5 Streamlit UI** — `pages/09_analysis_workspace.py`(service + repo 已完整,UI 是獨立 PR)
+4. **M5** `rerun_step` / **M6** `rerun_template` — asset 已存全部需要的 spec
+5. **M6** `save_join_view` — 需要 M4 Tier B 才有 SQL string 可存
+6. **M7** Appendix-A 6 個 golden xlsx fixture — spec 是「建議」非必須
+7. **spec §13 RAG indices** — `upload_table_profile_index` / `upload_relationship_index` / `upload_derived_asset_index`,目前 multi-table prompt 還沒大到需要
+
+### 24.15 一句話「v0.18 multi-table 怎麼跑」
+
+```
+Upload Excel → multi_table_profiler 給每張 sheet 加 role/grain/PK → relationship_profiler
+偵測 cross-sheet FK candidates 存進 upload_relationship_candidates(status='candidate')
+→ 使用者在 pages/07 Section 3b review + Confirm/Reject/Edit → confirm_metadata merge
+confirmed rels 進 metadata.relationships(新 version) → analysis_step_service 提供
+add_column/aggregate/create_table/visualize 鏈式步驟,每個 step 寫 derived parquet
++ 記 lineage → 跨表 join 要走 duckdb_engine.execute_safe_with_join_validation,
+unconfirmed/m2m_candidate join 在 pre-execution 就被拒 → 滿意的 step 可以
+analysis_asset_service.save_derived_table 存成可重用 asset,或
+save_template_from_steps 存整條 chain 變 replayable template,全部都綁
+dataset_id+metadata_version+source_step_ids。
+```
+
+---
+
 # (以下為文件結束)

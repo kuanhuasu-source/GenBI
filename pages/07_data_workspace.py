@@ -6,11 +6,11 @@ UI 重構於 v0.17:此頁專注「資料準備」流程 —
 分析功能拆到 pages/08_data_analysis.py。
 
 # 範圍(從原 07_upload_workspace.py sections 1-9 保留)
-- Section 1:檔案上傳(CSV / Excel single sheet)
+- Section 1:檔案上傳(CSV / Excel · multi-sheet 自動處理 — v0.18 M1)
 - Section 2:既有 dataset list / 切換 / 刪除
-- Section 3:Table list + sample data + column profile
-- Section 4-9:Metadata Review · Field editor / Grain / Status code /
-  Limitation / Apply / Confirm
+- Section 3:Table list + 多表 enrichment badges + sample data + column profile
+- Section 4-9:Metadata Review · 多表時用 table selector 切換 ·
+  Field editor / Grain / Status code / Limitation / Apply / Confirm
 
 # 跨頁 state(寫給 pages/08_data_analysis.py 讀)
 - `analysis_dataset_id` — 本頁 confirm 後,點「→ 開始分析」按鈕時寫入,
@@ -113,12 +113,13 @@ st.markdown("### 1️⃣ 上傳新檔案")
 col_up_l, col_up_r = st.columns([3, 2])
 with col_up_l:
     uploaded = st.file_uploader(
-        "選擇 CSV 或 Excel(single sheet)— 上限 100MB",
+        "選擇 CSV 或 Excel(支援 multi-sheet)— 上限 100MB",
         type=["csv", "xlsx", "xls"],
         accept_multiple_files=False,
         help=(
             "支援 `.csv` / `.xlsx` / `.xls`。"
-            "Excel multi-sheet 目前只讀第一個 sheet(Phase 2 才支援多 sheet)。"
+            "v0.18 起 Excel multi-sheet 自動處理:每個 visible sheet 各自解析、"
+            "profile、推 PK / table_role / grain。"
         ),
     )
 with col_up_r:
@@ -261,13 +262,40 @@ if not tables:
         st.info("此 dataset 尚無 table(可能還在解析中)。")
     st.stop()
 
-# MVP 通常只有 1 table,但設計上支援多 sheet(Phase 2)
-for table in tables:
+# v0.18 M1:Excel multi-sheet 每張 sheet 一筆 upload_tables doc;
+# CSV 仍然只有 1 個 entry。
+_ROLE_BADGE = {
+    "fact":      "📊 fact",
+    "dimension": "📋 dimension",
+    "bridge":    "🔗 bridge",
+    "unknown":   "❓ unknown",
+}
+
+for table_idx, table in enumerate(tables):
     table_id = table["table_id"]
+    if table_idx > 0:
+        st.markdown("---")
+    header_prefix = "### 3️⃣ Table" if table_idx == 0 else "### "
+    sheet_display = table.get("sheet_name") or table.get("table_name") or table_id
     st.markdown(
-        f"### 3️⃣ Table: `{table_id}` · "
+        f"{header_prefix}: `{table_id}` · 來源 sheet **{sheet_display}** · "
         f"**{table['row_count']:,}** 列 × **{table['column_count']}** 欄"
     )
+
+    # v0.18 M1:multi-table enrichment 行 — table_role / grain / primary_key
+    role = table.get("table_role") or "unknown"
+    grain = table.get("grain")
+    pk = table.get("primary_key")
+    badge_parts: list[str] = [_ROLE_BADGE.get(role, f"❓ {role}")]
+    if pk:
+        if isinstance(pk, list):
+            badge_parts.append(f"🔑 PK: `{', '.join(pk)}`")
+        else:
+            badge_parts.append(f"🔑 PK: `{pk}`")
+    if grain:
+        badge_parts.append(f"🎯 grain: {grain}")
+    st.caption(" · ".join(badge_parts))
+
     if table.get("warnings"):
         for w in table["warnings"]:
             st.warning(f"⚠️ {w}")
@@ -344,6 +372,137 @@ for table in tables:
                                  hide_index=True)
 
 st.divider()
+
+# ============================================================
+# 3️⃣b · Relationship Review(v0.18 M2 · spec §9.1)
+# ============================================================
+# Show candidates auto-detected at upload time; let user Confirm /
+# Reject / Edit join key / Edit relationship type / Edit default join type.
+# "Add relationship manually" is deferred to a follow-up PR.
+if len(tables) >= 2:
+    rel_candidates = repo.list_relationship_candidates(selected_id)
+    st.markdown("### 3️⃣b Relationship Review")
+    if not rel_candidates:
+        st.info(
+            "未偵測到 cross-table relationship — 可能是:(a) 各 sheet 沒有"
+            "共通欄名,或 (b) upload 偵測失敗。可重新上傳此 dataset。"
+        )
+    else:
+        _TIER_BADGE = {
+            "high":            "🟢 high",
+            "review_required": "🟡 review",
+            "weak":            "🟠 weak",
+            "ignore":          "⚪ ignore",
+        }
+        _STATUS_BADGE = {
+            "candidate": "⏳ candidate",
+            "confirmed": "✅ confirmed",
+            "rejected":  "❌ rejected",
+            "edited":    "✏️ edited",
+        }
+        n_high = sum(1 for r in rel_candidates
+                     if r.get("confidence_tier") == "high")
+        n_review = sum(1 for r in rel_candidates
+                       if r.get("confidence_tier") == "review_required")
+        n_confirmed = sum(1 for r in rel_candidates
+                          if r.get("status") == "confirmed")
+        st.caption(
+            f"📊 {len(rel_candidates)} candidates · "
+            f"🟢 {n_high} high · 🟡 {n_review} review · "
+            f"✅ {n_confirmed} confirmed"
+        )
+
+        # One expander per candidate with per-row Confirm / Reject / Edit.
+        for r in rel_candidates:
+            rid = r["relationship_id"]
+            status = r.get("status", "candidate")
+            tier = r.get("confidence_tier", "ignore")
+            conf = r.get("confidence", 0)
+            with st.expander(
+                f"{_TIER_BADGE.get(tier, '?')} · "
+                f"{_STATUS_BADGE.get(status, '?')} · "
+                f"`{r['from_table']}.{r['from_field']}` → "
+                f"`{r['to_table']}.{r['to_field']}` · "
+                f"conf={conf:.2f} · type={r['relationship_type']}",
+                expanded=(status == "candidate" and tier == "high"),
+            ):
+                ev = r.get("evidence", {})
+                st.caption(
+                    f"name_similarity={ev.get('name_similarity', 0):.2f} · "
+                    f"type_compatible={ev.get('type_compatible')} · "
+                    f"overlap={ev.get('from_to_overlap_ratio', 0):.2%} · "
+                    f"to_unique={ev.get('to_unique_ratio', 0):.2%} · "
+                    f"matches={ev.get('sample_match_count', 0)}"
+                )
+
+                # Edit row
+                col_t, col_j, col_a1, col_a2 = st.columns([1.5, 1, 1, 1])
+                with col_t:
+                    new_type = st.selectbox(
+                        "relationship_type",
+                        options=["many_to_one", "one_to_one", "one_to_many",
+                                 "many_to_many_candidate"],
+                        index=["many_to_one", "one_to_one", "one_to_many",
+                               "many_to_many_candidate"].index(
+                            r["relationship_type"]),
+                        key=f"_rel_type_{rid}",
+                    )
+                with col_j:
+                    new_join = st.selectbox(
+                        "join_type",
+                        options=["left", "inner", "right"],
+                        index=["left", "inner", "right"].index(
+                            r.get("default_join_type", "left")),
+                        key=f"_rel_join_{rid}",
+                    )
+                with col_a1:
+                    if st.button(
+                        "✅ Confirm",
+                        key=f"_rel_confirm_{rid}",
+                        disabled=(status == "confirmed"),
+                        use_container_width=True,
+                    ):
+                        user = st.session_state.get(
+                            "_upload_owner", "anonymous"
+                        )
+                        # Detect whether user edited type/join — if so use
+                        # 'edited' status; otherwise 'confirmed' as-is.
+                        type_changed = new_type != r["relationship_type"]
+                        join_changed = (
+                            new_join != r.get("default_join_type", "left")
+                        )
+                        s = "edited" if (type_changed or join_changed) \
+                            else "confirmed"
+                        repo.update_relationship_status(
+                            selected_id, rid,
+                            status=s,
+                            relationship_type=new_type,
+                            default_join_type=new_join,
+                            user=user,
+                        )
+                        st.toast(f"✅ {s}", icon="✅")
+                        st.rerun()
+                with col_a2:
+                    if st.button(
+                        "❌ Reject",
+                        key=f"_rel_reject_{rid}",
+                        disabled=(status == "rejected"),
+                        use_container_width=True,
+                    ):
+                        user = st.session_state.get(
+                            "_upload_owner", "anonymous"
+                        )
+                        repo.update_relationship_status(
+                            selected_id, rid,
+                            status="rejected", user=user,
+                        )
+                        st.toast("❌ rejected", icon="❌")
+                        st.rerun()
+        st.caption(
+            "💡 m2m_candidate 不會被自動 join — 必須先 Confirm + 設定 join_type 才能用於分析。"
+        )
+
+    st.divider()
 
 # ============================================================
 # 4️⃣ — 8️⃣ · Metadata Review(M2 新增)
@@ -441,9 +600,25 @@ with col_history:
 
 # ────────────────────────────────────────
 # Section 5 · Field Review Table(可編輯)
+# v0.18 M1:多 table 時用 selectbox 切換;Apply 每次寫一個 table 的 corrections。
+# 多表批次 Apply 是 M3(metadata versioning)範圍。
 # ────────────────────────────────────────
-# 取出 M3 之後實際會用的 single table
-md_table_id = list(metadata["collections"].keys())[0]
+_all_table_ids = list(metadata["collections"].keys())
+if not _all_table_ids:
+    st.error("⚠️ Metadata 中無 collections — 可能是 upload 失敗。")
+    st.stop()
+
+if len(_all_table_ids) > 1:
+    md_table_id = st.selectbox(
+        "選擇要 review 的 table",
+        options=_all_table_ids,
+        index=0,
+        key=f"_md_table_pick_{selected_id}_{md_version}",
+        help="多 sheet workbook 時切換;Apply 只寫當前選的 table 的 corrections。",
+    )
+else:
+    md_table_id = _all_table_ids[0]
+
 md_coll = metadata["collections"][md_table_id]
 md_fields = md_coll["fields"]
 

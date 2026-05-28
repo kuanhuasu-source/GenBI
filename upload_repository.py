@@ -91,6 +91,10 @@ DEFAULT_METADATA_VERSIONS_COLLECTION = "upload_metadata_versions"
 DEFAULT_USER_CORRECTIONS_COLLECTION = "upload_user_corrections"
 DEFAULT_ANALYSIS_SESSIONS_COLLECTION = "analysis_sessions"
 DEFAULT_ANALYSIS_ASSETS_COLLECTION = "analysis_assets"
+# v0.18 M2:relationship candidates per spec §5.3
+DEFAULT_RELATIONSHIP_CANDIDATES_COLLECTION = "upload_relationship_candidates"
+# v0.18 M5:interactive analysis steps per spec §5.4
+DEFAULT_ANALYSIS_STEPS_COLLECTION = "analysis_steps"
 
 
 class UploadRepository:
@@ -115,6 +119,8 @@ class UploadRepository:
         user_corrections_collection: str = DEFAULT_USER_CORRECTIONS_COLLECTION,
         analysis_sessions_collection: str = DEFAULT_ANALYSIS_SESSIONS_COLLECTION,
         analysis_assets_collection: str = DEFAULT_ANALYSIS_ASSETS_COLLECTION,
+        relationship_candidates_collection: str = DEFAULT_RELATIONSHIP_CANDIDATES_COLLECTION,
+        analysis_steps_collection: str = DEFAULT_ANALYSIS_STEPS_COLLECTION,
     ):
         """
         Args:
@@ -137,6 +143,10 @@ class UploadRepository:
         self._analysis_sessions = mongo_db[analysis_sessions_collection]
         # M3A+: analysis assets(Saved Chart / Saved Metric / Analysis Template)
         self._analysis_assets = mongo_db[analysis_assets_collection]
+        # v0.18 M2:upload_relationship_candidates per spec §5.3
+        self._relationship_candidates = mongo_db[relationship_candidates_collection]
+        # v0.18 M5:analysis_steps per spec §5.4
+        self._analysis_steps = mongo_db[analysis_steps_collection]
 
     # ============================================================
     # Index management
@@ -175,6 +185,27 @@ class UploadRepository:
         )
         self._analysis_assets.create_index(
             [("dataset_id", 1), ("is_active", 1)],
+        )
+        # v0.18 M2: upload_relationship_candidates
+        # Unique (dataset_id, metadata_version, relationship_id) so we can
+        # safely upsert when a profile re-runs.
+        self._relationship_candidates.create_index(
+            [("dataset_id", 1), ("metadata_version", 1),
+             ("relationship_id", 1)],
+            unique=True,
+        )
+        self._relationship_candidates.create_index(
+            [("dataset_id", 1), ("status", 1)],
+        )
+        # v0.18 M5: analysis_steps
+        # Unique (session_id, step_no) so steps within a session are ordered
+        # and a duplicate step_no on the same session is an error.
+        self._analysis_steps.create_index(
+            [("session_id", 1), ("step_no", 1)],
+            unique=True,
+        )
+        self._analysis_steps.create_index(
+            [("dataset_id", 1), ("created_at", -1)],
         )
 
     # ============================================================
@@ -241,9 +272,15 @@ class UploadRepository:
         return result.modified_count > 0
 
     def delete_dataset(self, dataset_id: str) -> bool:
-        """硬刪除 dataset 及相關 table / profile 記錄(filesystem 由 caller 清)。"""
+        """硬刪除 dataset 及相關 table / profile 記錄(filesystem 由 caller 清)。
+
+        v0.18 M2:cascade also clears upload_relationship_candidates rows.
+        v0.18 M5:cascade also clears analysis_steps rows.
+        """
         self._tables.delete_many({"dataset_id": dataset_id})
         self._profiles.delete_many({"dataset_id": dataset_id})
+        self._relationship_candidates.delete_many({"dataset_id": dataset_id})
+        self._analysis_steps.delete_many({"dataset_id": dataset_id})
         result = self._datasets.delete_one({"_id": dataset_id})
         return result.deleted_count > 0
 
@@ -279,6 +316,57 @@ class UploadRepository:
         return self._tables.find_one(
             {"dataset_id": dataset_id, "table_id": table_id},
         )
+
+    def update_table_profile_fields(
+        self,
+        dataset_id: str,
+        table_id: str,
+        *,
+        sheet_name: Optional[str] = None,
+        table_role: Optional[str] = None,
+        grain: Optional[str] = None,
+        primary_key: Optional[list[str]] = None,
+        profile_version: Optional[int] = None,
+    ) -> bool:
+        """Set profile-derived fields on an existing upload_tables doc.
+
+        These fields are not knowable at parse time — they come out of
+        `multi_table_profiler.profile_multi_table()` after the profile
+        step. Called by `upload_service` once profiling completes.
+
+        Spec §5.2 `upload_tables` schema:
+            sheet_name    — original Excel sheet name (informational)
+            table_role    — "fact" | "dimension" | "bridge" | "unknown"
+            grain         — human-readable, e.g. "one row per employee"
+            primary_key   — list[str] of column names forming the PK
+
+        Args:
+            dataset_id, table_id: lookup keys (unique together).
+            sheet_name / table_role / grain / primary_key / profile_version:
+                Only fields you pass non-None get written. Pass an empty
+                list / empty string to explicitly clear a value.
+
+        Returns:
+            True if a doc matched and any field changed; False otherwise.
+        """
+        set_doc: dict[str, Any] = {}
+        for k, v in [
+            ("sheet_name", sheet_name),
+            ("table_role", table_role),
+            ("grain", grain),
+            ("primary_key", primary_key),
+            ("profile_version", profile_version),
+        ]:
+            if v is not None:
+                set_doc[k] = v
+        if not set_doc:
+            return False
+        set_doc["updated_at"] = _dt.datetime.now(_dt.timezone.utc)
+        result = self._tables.update_one(
+            {"dataset_id": dataset_id, "table_id": table_id},
+            {"$set": set_doc},
+        )
+        return result.modified_count > 0
 
     # ============================================================
     # upload_profiles CRUD
@@ -656,6 +744,255 @@ class UploadRepository:
         """真刪 — 從 DB 移除(危險,僅 admin 用途)。"""
         return self._analysis_assets.delete_one(
             {"_id": asset_id}).deleted_count > 0
+
+    # ============================================================
+    # upload_relationship_candidates CRUD (v0.18 M2 · spec §5.3)
+    # ============================================================
+    def save_relationship_candidates(
+        self,
+        dataset_id: str,
+        candidates: list[dict],
+        metadata_version: int,
+    ) -> int:
+        """Bulk upsert relationship candidates per spec §5.3.
+
+        Idempotent via the unique (dataset_id, metadata_version,
+        relationship_id) index — calling this twice with the same args
+        replaces existing rows in place rather than creating duplicates.
+
+        Args:
+            dataset_id: dataset to attach candidates to.
+            candidates: list of relationship dicts (one per spec §5.3
+                schema, as produced by relationship_profiler.detect_relationships).
+                Each must have `relationship_id` (caller provides — the
+                profiler generates one deterministically).
+            metadata_version: pins these candidates to a profile snapshot
+                so re-profiling doesn't silently clobber confirmed status.
+
+        Returns:
+            Number of candidates written (insert or update).
+        """
+        if not candidates:
+            return 0
+        now = _dt.datetime.now(_dt.timezone.utc)
+        n_written = 0
+        for c in candidates:
+            if "relationship_id" not in c:
+                raise ValueError(
+                    "save_relationship_candidates: candidate missing "
+                    "`relationship_id`"
+                )
+            doc = {
+                **c,
+                "dataset_id": dataset_id,
+                "metadata_version": metadata_version,
+                "updated_at": now,
+            }
+            doc.setdefault("status", "candidate")
+            doc.setdefault("created_at", now)
+            self._relationship_candidates.update_one(
+                {
+                    "dataset_id": dataset_id,
+                    "metadata_version": metadata_version,
+                    "relationship_id": c["relationship_id"],
+                },
+                {"$set": doc},
+                upsert=True,
+            )
+            n_written += 1
+        return n_written
+
+    def list_relationship_candidates(
+        self,
+        dataset_id: str,
+        *,
+        metadata_version: Optional[int] = None,
+        status: Optional[str] = None,
+    ) -> list[dict]:
+        """List relationship candidates for a dataset.
+
+        Args:
+            dataset_id: required.
+            metadata_version: if given, filter to that profile version;
+                otherwise returns the latest metadata_version's rows.
+            status: optional filter — "candidate" / "confirmed" /
+                "rejected" / "edited".
+
+        Returns:
+            Sorted by confidence desc.
+        """
+        query: dict[str, Any] = {"dataset_id": dataset_id}
+        if metadata_version is None:
+            # Pick the max metadata_version present and filter to it.
+            latest = (
+                self._relationship_candidates.find({"dataset_id": dataset_id})
+                .sort("metadata_version", -1)
+                .limit(1)
+            )
+            latest_list = list(latest)
+            if not latest_list:
+                return []
+            query["metadata_version"] = latest_list[0]["metadata_version"]
+        else:
+            query["metadata_version"] = metadata_version
+        if status is not None:
+            query["status"] = status
+        return list(
+            self._relationship_candidates.find(query)
+            .sort("confidence", -1)
+        )
+
+    def update_relationship_status(
+        self,
+        dataset_id: str,
+        relationship_id: str,
+        *,
+        status: Optional[str] = None,
+        relationship_type: Optional[str] = None,
+        default_join_type: Optional[str] = None,
+        from_field: Optional[str] = None,
+        to_field: Optional[str] = None,
+        metadata_version: Optional[int] = None,
+        user: str = "system",
+    ) -> bool:
+        """Update a candidate's status / type / join settings (Review UI).
+
+        Spec §9.1 Relationship Review actions (Confirm / Reject / Edit
+        join key / Edit relationship type / Edit default join type) all
+        funnel through this method.
+
+        Args:
+            dataset_id, relationship_id: lookup keys.
+            status: candidate | confirmed | rejected | edited.
+            relationship_type: optional override (one_to_one / many_to_one /
+                one_to_many / many_to_many_candidate).
+            default_join_type: optional override (left / inner / right).
+            from_field / to_field: optional override (user picked a different
+                join column).
+            metadata_version: if given, restricts the update to that
+                version's row. Default updates the latest version's row.
+            user: who made the change (audit; written to `confirmed_by` if
+                status is `confirmed`, `rejected_by` if `rejected`, ...).
+
+        Returns:
+            True if a doc matched and was updated; False otherwise.
+        """
+        set_doc: dict[str, Any] = {}
+        if status is not None:
+            set_doc["status"] = status
+            now = _dt.datetime.now(_dt.timezone.utc)
+            if status == "confirmed":
+                set_doc["confirmed_by"] = user
+                set_doc["confirmed_at"] = now
+            elif status == "rejected":
+                set_doc["rejected_by"] = user
+                set_doc["rejected_at"] = now
+            elif status == "edited":
+                set_doc["edited_by"] = user
+                set_doc["edited_at"] = now
+        for k, v in [
+            ("relationship_type", relationship_type),
+            ("default_join_type", default_join_type),
+            ("from_field", from_field),
+            ("to_field", to_field),
+        ]:
+            if v is not None:
+                set_doc[k] = v
+        if not set_doc:
+            return False
+        set_doc["updated_at"] = _dt.datetime.now(_dt.timezone.utc)
+
+        query: dict[str, Any] = {
+            "dataset_id": dataset_id,
+            "relationship_id": relationship_id,
+        }
+        if metadata_version is not None:
+            query["metadata_version"] = metadata_version
+        else:
+            # Update the latest metadata_version's row only — avoids
+            # mass-updating historical snapshots.
+            latest = (
+                self._relationship_candidates.find(
+                    {"dataset_id": dataset_id,
+                     "relationship_id": relationship_id}
+                )
+                .sort("metadata_version", -1)
+                .limit(1)
+            )
+            latest_list = list(latest)
+            if not latest_list:
+                return False
+            query["metadata_version"] = latest_list[0]["metadata_version"]
+
+        result = self._relationship_candidates.update_one(
+            query, {"$set": set_doc},
+        )
+        return result.modified_count > 0
+
+    # ============================================================
+    # analysis_steps CRUD (v0.18 M5 · spec §5.4)
+    # ============================================================
+    def save_analysis_step(self, step_doc: dict) -> str:
+        """Insert a new analysis_step row.
+
+        Args:
+            step_doc: must include `step_id`, `session_id`, `dataset_id`,
+                `step_no`, `action_type`. Other fields per spec §5.4 are
+                optional (output_table, generated_code, generated_sql,
+                row_count, status, input_tables, output_schema).
+
+        Returns:
+            step_id (str).
+
+        Raises:
+            ValueError on missing required field.
+            pymongo DuplicateKeyError if (session_id, step_no) already exists.
+        """
+        required = {"step_id", "session_id", "dataset_id",
+                    "step_no", "action_type"}
+        missing = required - set(step_doc.keys())
+        if missing:
+            raise ValueError(
+                f"save_analysis_step: required keys missing: {missing}"
+            )
+        now = _dt.datetime.now(_dt.timezone.utc)
+        step_doc.setdefault("created_at", now)
+        step_doc["updated_at"] = now
+        step_doc.setdefault("status", "completed")
+        self._analysis_steps.insert_one(step_doc)
+        return step_doc["step_id"]
+
+    def get_analysis_step(self, step_id: str) -> Optional[dict]:
+        return self._analysis_steps.find_one({"step_id": step_id})
+
+    def list_analysis_steps(
+        self,
+        session_id: str,
+        *,
+        status: Optional[str] = None,
+    ) -> list[dict]:
+        """List steps in a session, ordered by step_no ascending."""
+        query: dict[str, Any] = {"session_id": session_id}
+        if status is not None:
+            query["status"] = status
+        return list(
+            self._analysis_steps.find(query).sort("step_no", 1)
+        )
+
+    def next_step_no(self, session_id: str) -> int:
+        """Return the step_no to use for the next step in this session.
+
+        Walks step_no asc and returns 1 + max(step_no), or 1 if none.
+        """
+        latest = (
+            self._analysis_steps.find({"session_id": session_id})
+            .sort("step_no", -1)
+            .limit(1)
+        )
+        latest_list = list(latest)
+        if not latest_list:
+            return 1
+        return int(latest_list[0]["step_no"]) + 1
 
 
 def generate_asset_id(asset_type: str = "asset") -> str:

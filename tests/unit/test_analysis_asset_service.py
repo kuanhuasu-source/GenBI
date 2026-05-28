@@ -242,6 +242,273 @@ class TestReplayAndDriftCheck:
         assert drift["warning"] is not None
 
 
+@pytest.fixture
+def setup_steps(setup_dataset, tmp_path):
+    """Build a 2-step M5 chain on top of setup_dataset.
+
+    Step 1: extract_data → step parquet on disk.
+    Step 2: aggregate    → step parquet on disk.
+
+    Returns (repo, dataset_id, session_id, step1_id, step2_id).
+    """
+    repo, did, sid = setup_dataset
+    df = pd.DataFrame({
+        "dept": ["Eng", "Sales", "Eng"],
+        "salary": [1000, 2000, 1500],
+    })
+    # Write the step parquets directly into the per-dataset derived dir.
+    derived_dir = tmp_path / did / "derived"
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    p1 = derived_dir / "step_001.parquet"
+    p2 = derived_dir / "step_002.parquet"
+    df.to_parquet(p1, index=False)
+    df.groupby("dept").sum().reset_index().to_parquet(p2, index=False)
+
+    repo.save_analysis_step({
+        "step_id": "step_001", "session_id": sid, "dataset_id": did,
+        "metadata_version": 1, "step_no": 1,
+        "action_type": "extract_data",
+        "user_query": "all rows",
+        "input_tables": ["employee"],
+        "output_table": "step_001",
+        "params": {"input_table": "employee"},
+        "output_schema": [
+            {"name": "dept", "dtype": "object"},
+            {"name": "salary", "dtype": "int64"},
+        ],
+        "row_count": 3,
+        "status": "completed",
+        "storage": {"format": "parquet", "path": str(p1)},
+    })
+    repo.save_analysis_step({
+        "step_id": "step_002", "session_id": sid, "dataset_id": did,
+        "metadata_version": 1, "step_no": 2,
+        "action_type": "aggregate",
+        "user_query": "total salary by dept",
+        "input_tables": ["step_001"],
+        "output_table": "step_002",
+        "params": {"input_table": "step_001", "group_by": ["dept"],
+                   "aggregations": [
+                       {"column": "salary", "function": "sum",
+                        "alias": "total"},
+                   ]},
+        "output_schema": [
+            {"name": "dept", "dtype": "object"},
+            {"name": "total", "dtype": "int64"},
+        ],
+        "row_count": 2,
+        "status": "completed",
+        "storage": {"format": "parquet", "path": str(p2)},
+    })
+    return repo, did, sid, "step_001", "step_002"
+
+
+@pytest.mark.requires_mongo
+class TestSaveDerivedTable:
+    """v0.18 M6 (Assets 2.0): save a completed M5 step as a reusable asset."""
+
+    def _svc(self, repo):
+        from metadata_correction_service import MetadataCorrectionService
+        return AnalysisAssetService(repo, MetadataCorrectionService(repo))
+
+    def test_basic_save(self, mongo_db, setup_steps):
+        repo, did, sid, s1, _s2 = setup_steps
+        svc = self._svc(repo)
+        aid = svc.save_derived_table(
+            session_id=sid, step_id=s1,
+            name="employees_extract", description="extracted rows",
+            user="alice",
+        )
+        assert aid.startswith("asset_") or aid.startswith("saved_") \
+               or "derived" in aid.lower() or aid.startswith("asset")
+        doc = repo.get_asset(aid)
+        assert doc is not None
+        assert doc["asset_type"] == "saved_derived_table"
+        assert doc["name"] == "employees_extract"
+        assert doc["dataset_id"] == did
+        assert doc["metadata_version"] == 1
+        # Spec rule 27: source_step_ids must bind to the originating step.
+        assert doc["source_step_ids"] == [s1]
+        # asset_payload echoes the step's schema + row count.
+        assert doc["asset_payload"]["row_count"] == 3
+        assert doc["asset_payload"]["action_type"] == "extract_data"
+        # storage references the step's parquet path (not copied).
+        assert doc["storage"]["format"] == "parquet"
+
+    def test_uses_step_storage_path_directly(self, mongo_db, setup_steps):
+        # The asset's storage path equals the step's storage path
+        # (no copy in MVP — documented design decision).
+        repo, did, sid, s1, _ = setup_steps
+        svc = self._svc(repo)
+        aid = svc.save_derived_table(
+            session_id=sid, step_id=s1, name="x", user="alice",
+        )
+        asset = repo.get_asset(aid)
+        step = repo.get_analysis_step(s1)
+        assert asset["storage"]["path"] == step["storage"]["path"]
+
+    def test_drift_check_works_on_new_asset(self, mongo_db, setup_steps):
+        # After saving, drift check returns is_stale=False (no new
+        # metadata version since save).
+        repo, did, sid, s1, _ = setup_steps
+        svc = self._svc(repo)
+        aid = svc.save_derived_table(
+            session_id=sid, step_id=s1, name="x", user="alice",
+        )
+        drift = svc.metadata_drift_check(aid)
+        assert drift["is_stale"] is False
+        assert drift["warning"] is None
+        assert drift["asset_version"] == drift["active_version"]
+
+    def test_drift_detected_after_metadata_bump(self, mongo_db, setup_steps):
+        repo, did, sid, s1, _ = setup_steps
+        svc = self._svc(repo)
+        aid = svc.save_derived_table(
+            session_id=sid, step_id=s1, name="x", user="alice",
+        )
+        # Simulate metadata change: write a new version + activate.
+        repo.save_metadata_version(
+            dataset_id=did,
+            metadata={"dataset_id": did, "source_type": "upload",
+                       "collections": {"sheet1": {"fields": {}}},
+                       "kpi_definitions": {}, "data_limitations": {}},
+            confirmation_status="confirmed", confirmed_by="bob",
+            activate=True,
+        )
+        drift = svc.metadata_drift_check(aid)
+        assert drift["is_stale"] is True
+        assert drift["warning"] is not None
+        assert drift["asset_version"] < drift["active_version"]
+
+    def test_save_missing_step_raises(self, mongo_db, setup_steps):
+        repo, did, sid, _, _ = setup_steps
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="step `nope` not found"):
+            svc.save_derived_table(
+                session_id=sid, step_id="nope", name="x",
+            )
+
+    def test_save_failed_step_rejected(self, mongo_db, setup_steps):
+        # Inject a failed step and try to save it.
+        repo, did, sid, _, _ = setup_steps
+        repo.save_analysis_step({
+            "step_id": "step_fail", "session_id": sid,
+            "dataset_id": did, "metadata_version": 1,
+            "step_no": 99, "action_type": "add_column",
+            "status": "failed",
+            "error_message": "bogus formula",
+        })
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="completed"):
+            svc.save_derived_table(
+                session_id=sid, step_id="step_fail", name="x",
+            )
+
+    def test_save_visualize_step_rejected(self, mongo_db, setup_steps):
+        # Visualize steps have no materialized data → can't be saved as
+        # derived table. (User should save_chart() for them.)
+        repo, did, sid, _, _ = setup_steps
+        repo.save_analysis_step({
+            "step_id": "step_viz", "session_id": sid,
+            "dataset_id": did, "metadata_version": 1,
+            "step_no": 100, "action_type": "visualize",
+            "status": "completed",
+            "chart_spec": {"chart_type": "bar"},
+        })
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="visualize"):
+            svc.save_derived_table(
+                session_id=sid, step_id="step_viz", name="x",
+            )
+
+    def test_save_cross_session_step_rejected(self, mongo_db, setup_steps):
+        # Step belongs to a different session — must refuse to prevent
+        # mis-linking lineage.
+        repo, did, sid, s1, _ = setup_steps
+        sid2 = repo.create_session(did, metadata_version=1, user="alice")
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="does not belong"):
+            svc.save_derived_table(
+                session_id=sid2, step_id=s1, name="x",
+            )
+
+
+@pytest.mark.requires_mongo
+class TestSaveTemplateFromSteps:
+    """v0.18 M6 (Assets 2.0): replayable multi-step analysis template."""
+
+    def _svc(self, repo):
+        from metadata_correction_service import MetadataCorrectionService
+        return AnalysisAssetService(repo, MetadataCorrectionService(repo))
+
+    def test_basic_save_2_step_chain(self, mongo_db, setup_steps):
+        repo, did, sid, s1, s2 = setup_steps
+        svc = self._svc(repo)
+        aid = svc.save_template_from_steps(
+            session_id=sid, step_ids=[s1, s2],
+            name="extract_then_agg",
+            description="employees → sum salary per dept",
+            user="alice",
+        )
+        doc = repo.get_asset(aid)
+        assert doc["asset_type"] == "analysis_template"
+        assert doc["dataset_id"] == did
+        assert doc["metadata_version"] == 1
+        assert doc["source_step_ids"] == [s1, s2]   # spec rule 27
+        payload = doc["asset_payload"]
+        assert payload["n_steps"] == 2
+        # Replay payload preserves enough to re-execute later.
+        assert payload["steps"][0]["action_type"] == "extract_data"
+        assert payload["steps"][1]["action_type"] == "aggregate"
+        # Aggregation params preserved (replay needs them).
+        agg_params = payload["steps"][1]["params"]
+        assert agg_params["group_by"] == ["dept"]
+        assert agg_params["aggregations"][0]["function"] == "sum"
+
+    def test_steps_sorted_by_step_no_in_payload(self, mongo_db, setup_steps):
+        # Caller passes step_ids in arbitrary order — replay must use
+        # original step_no order.
+        repo, did, sid, s1, s2 = setup_steps
+        svc = self._svc(repo)
+        aid = svc.save_template_from_steps(
+            session_id=sid, step_ids=[s2, s1],   # reversed!
+            name="x",
+        )
+        steps = repo.get_asset(aid)["asset_payload"]["steps"]
+        assert [s["step_no"] for s in steps] == [1, 2]
+
+    def test_empty_step_ids_rejected(self, mongo_db, setup_steps):
+        repo, _, sid, _, _ = setup_steps
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="step_ids empty"):
+            svc.save_template_from_steps(
+                session_id=sid, step_ids=[], name="x",
+            )
+
+    def test_failed_step_in_chain_rejected(self, mongo_db, setup_steps):
+        repo, did, sid, s1, _ = setup_steps
+        repo.save_analysis_step({
+            "step_id": "step_fail", "session_id": sid,
+            "dataset_id": did, "metadata_version": 1,
+            "step_no": 50, "action_type": "add_column",
+            "status": "failed",
+            "error_message": "bad formula",
+        })
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="status `failed`"):
+            svc.save_template_from_steps(
+                session_id=sid, step_ids=[s1, "step_fail"], name="x",
+            )
+
+    def test_unknown_step_id_rejected(self, mongo_db, setup_steps):
+        repo, _, sid, s1, _ = setup_steps
+        svc = self._svc(repo)
+        with pytest.raises(ValueError, match="not found"):
+            svc.save_template_from_steps(
+                session_id=sid, step_ids=[s1, "step_nope"], name="x",
+            )
+
+
 @pytest.mark.requires_mongo
 class TestRenameAndDelete:
     def test_rename(self, mongo_db, setup_dataset, fake_completed_result):

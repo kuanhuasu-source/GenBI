@@ -38,6 +38,8 @@ from typing import Any, BinaryIO
 from upload_repository import UploadRepository, generate_dataset_id
 import file_parser
 import data_profiler
+import multi_table_profiler
+import relationship_profiler
 import semantic_profiler
 import upload_metadata_generator
 
@@ -107,7 +109,7 @@ class UploadService:
         filename: str,
         owner: str,
         table_id: str = "sheet1",
-        excel_multi_sheet: bool = False,
+        excel_multi_sheet: bool = True,
     ) -> str:
         """端到端:接檔 → 解析 → 寫 parquet → profile → 寫 MongoDB。
 
@@ -241,12 +243,20 @@ class UploadService:
 
         # ── 7-9. Profile → save_profile → status='profiled' ──
         # v0.15.0+ M5.1:multi-sheet → profile 每張 table
+        # Note: keep data_profiler.profile_dataset() driving save_profile so
+        # the upload_profiles doc's table_id keys match the parser-generated
+        # ids in upload_tables (regenerate_metadata joins on this).
         try:
             tables = self.repo.list_tables(dataset_id)
             tables_for_profile = []
+            workbook_for_enrichment: dict[str, Any] = {}
             for t in tables:
                 df_t = file_parser.load_parquet(t["storage"]["path"])
                 tables_for_profile.append((t["table_id"], df_t))
+                # Multi-table enrichment is keyed on table_name (= original
+                # sheet name for Excel, filename for CSV). Matches upload_tables
+                # docs back to enrichment results below.
+                workbook_for_enrichment[t["table_name"]] = df_t
             profile = data_profiler.profile_dataset(tables=tables_for_profile)
             self.repo.save_profile(dataset_id, profile)
             self.repo.update_status(
@@ -259,6 +269,69 @@ class UploadService:
                 error_message=f"Profile 階段失敗: {type(e).__name__}: {e}",
             )
             raise
+
+        # ── 9b. v0.18 M1:Multi-table enrichment ──
+        # Push table_role / grain / primary_key / sheet_name onto each
+        # upload_tables doc per spec §5.2. Failure here is non-fatal —
+        # enrichment is additive; missing fields just mean the review UI
+        # shows "unknown" and the user fills them in.
+        try:
+            multi_profile = multi_table_profiler.profile_multi_table(
+                workbook_for_enrichment,
+            )
+            tname_to_tid = {t["table_name"]: t["table_id"] for t in tables}
+            for entry in multi_profile["tables"]:
+                sheet = entry["sheet_name"]
+                tid = tname_to_tid.get(sheet)
+                if not tid:
+                    logger.warning(
+                        f"multi-table enrichment: profile entry "
+                        f"sheet_name={sheet!r} has no matching upload_tables "
+                        f"row in dataset_id={dataset_id}"
+                    )
+                    continue
+                self.repo.update_table_profile_fields(
+                    dataset_id, tid,
+                    sheet_name=sheet,
+                    table_role=entry["table_role"],
+                    grain=entry["grain"],
+                    primary_key=entry["possible_primary_key"],
+                )
+        except Exception as e:
+            logger.warning(
+                f"multi-table enrichment failed dataset_id={dataset_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+
+        # ── 9c. v0.18 M2:Relationship detection ──
+        # For multi-table datasets, detect candidate FK/PK relationships per
+        # spec §8 and persist to upload_relationship_candidates. Pinned to
+        # the latest upload_profiles.profile_version so re-profile creates
+        # new rows rather than silently clobbering user-confirmed status.
+        try:
+            if len(workbook_for_enrichment) >= 2:
+                rel_result = relationship_profiler.detect_relationships(
+                    workbook_for_enrichment,
+                )
+                # Get the profile_version we just wrote so candidates pin to it
+                latest_profile = self.repo.get_latest_profile(dataset_id)
+                profile_version = (latest_profile["profile_version"]
+                                   if latest_profile else 1)
+                n = self.repo.save_relationship_candidates(
+                    dataset_id,
+                    rel_result["relationships"],
+                    metadata_version=profile_version,
+                )
+                logger.info(
+                    f"relationship detection: dataset_id={dataset_id} "
+                    f"scanned={rel_result['n_pairs_scanned']} pairs · "
+                    f"saved={n} candidates"
+                )
+        except Exception as e:
+            logger.warning(
+                f"relationship detection failed dataset_id={dataset_id}: "
+                f"{type(e).__name__}: {e}"
+            )
 
         # ── 10. (M2+) Semantic profile + metadata v1 draft ──
         # Rule-based only,LLM-assisted refine 留給使用者在 UI 觸發

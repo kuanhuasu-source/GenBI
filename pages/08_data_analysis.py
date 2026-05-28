@@ -947,57 +947,39 @@ with debug_tabs[4]:
             "上傳 Excel multi-sheet(M5.1)或多 CSV 才會出現 relationships。"
         )
     else:
-        from relationship_profiler import detect_relationships, apply_user_confirmation
-
-        # 預先 load 全部 table data
-        @st.cache_data(show_spinner=False)
-        def _detect_rels_cached(_ds_id: str, table_ids: tuple):
-            t_list = []
-            for tid in table_ids:
-                t = repo.get_table(_ds_id, tid)
-                if t:
-                    df_t = file_parser.load_parquet(t["storage"]["path"])
-                    t_list.append((tid, df_t))
-            return detect_relationships(t_list)
-
-        if st.button("🔍 偵測 relationships", use_container_width=False):
-            tids = tuple(t["table_id"] for t in tables)
-            result = _detect_rels_cached(selected_id, tids)
-            st.session_state[f"_rel_result_{selected_id}"] = result
-            st.rerun()
-
-        rel_result = st.session_state.get(f"_rel_result_{selected_id}")
-        if not rel_result:
-            st.caption(
-                "尚未偵測。按上方按鈕。偵測完每對 table 兩兩比對欄名 + 值域。"
+        # v0.18 M2:relationships are auto-detected during upload and
+        # persisted to upload_relationship_candidates. This panel reads
+        # the stored candidates rather than re-running detection on every
+        # page load. Confirm / Reject / Edit lives on pages/07.
+        candidates = repo.list_relationship_candidates(selected_id)
+        if not candidates:
+            st.info(
+                "沒偵測到 cross-table relationship,或 upload 過程偵測失敗。"
+                "可重新上傳此 dataset,或到 pages/07 手動 review。"
             )
         else:
             st.caption(
-                f"📊 偵測 {rel_result['n_pairs_scanned']} pairs · "
-                f"找到 {rel_result['n_relationships_found']} 條 relationship"
+                f"📊 共 {len(candidates)} 條 relationship candidates"
             )
-            if not rel_result["relationships"]:
-                st.info("沒偵測到 cross-table relationship(欄名沒共通 + 值域沒重疊)")
-            else:
-                rel_rows = []
-                for i, r in enumerate(rel_result["relationships"]):
-                    rel_rows.append({
-                        "#": i,
-                        "from": f"{r['from_table']}.{r['from_field']}",
-                        "to": f"{r['to_table']}.{r['to_field']}",
-                        "type": r["relationship_type"],
-                        "confidence": r["confidence"],
-                        "right_is_pk": r["evidence"].get("right_is_pk", False),
-                        "overlap_%": r["evidence"].get("value_overlap_pct", 0),
-                    })
-                st.dataframe(pd.DataFrame(rel_rows),
-                              use_container_width=True, hide_index=True)
-                st.caption(
-                    "🚧 User confirmation UI 簡化版:目前只顯示偵測結果,"
-                    "Confirm / Edit / Reject 等動作預留 M5.3+ phase 2。"
-                    "目前 relationship 不會自動寫進 metadata.relationships,"
-                    "需要 user 手動編輯 metadata Section 8(下個 milestone 接通)。"
-                )
+            rel_rows = []
+            for r in candidates:
+                ev = r.get("evidence", {})
+                rel_rows.append({
+                    "from": f"{r['from_table']}.{r['from_field']}",
+                    "to": f"{r['to_table']}.{r['to_field']}",
+                    "type": r["relationship_type"],
+                    "confidence": r["confidence"],
+                    "tier": r.get("confidence_tier", "—"),
+                    "status": r.get("status", "candidate"),
+                    "overlap": ev.get("from_to_overlap_ratio", 0),
+                    "to_unique": ev.get("to_unique_ratio", 0),
+                })
+            st.dataframe(pd.DataFrame(rel_rows),
+                          use_container_width=True, hide_index=True)
+            st.caption(
+                "Review + Confirm 在 **pages/07 Data Workspace** 處理 — "
+                "本頁僅顯示候選清單。"
+            )
 
 
 # ── Tab 6:System status(spec §14 / §15 security limits) ──

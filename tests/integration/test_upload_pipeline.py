@@ -206,6 +206,237 @@ def test_e2e_correction_creates_new_version(
 
 
 # ============================================================
+# v0.18 M1: Multi-sheet upload pipeline
+# ============================================================
+def _build_multi_sheet_xlsx(path):
+    """Synthesize a 3-sheet xlsx in tests/integration/ via openpyxl.
+
+    Sheet layout intentionally exercises all three table_role detections:
+      - Employee:        clear PK (employee_id), 2 categorical attrs  → dimension
+      - Department:      clear PK (department_id), 1 categorical      → dimension
+      - EmployeeProject: no own PK, 2 FK-shaped cols (employee_id +
+                         project_id), but only 1 FK matches another
+                         table's PK (employee.employee_id) — Department
+                         doesn't have project_id, so this resolves as
+                         "unknown" rather than "bridge" with only 2 setup
+                         tables. Adjusted below to include project_id PK
+                         elsewhere if needed.
+    """
+    import openpyxl
+    wb = openpyxl.Workbook()
+    # First sheet is auto-created — repurpose it
+    wb.active.title = "Employee"
+    ws_emp = wb.active
+    ws_emp.append(["employee_id", "name", "department_id"])
+    # Names intentionally include duplicates so only employee_id qualifies
+    # as PK candidate (real Employee tables have duplicate first names).
+    names = ["Alice", "Bob", "Carol", "Alice", "Bob",
+             "David", "Eve", "Carol", "Bob", "Frank"]
+    for i in range(1, 11):
+        ws_emp.append([f"E{i:03d}", names[i - 1], f"D{(i % 3) + 1}"])
+
+    ws_dept = wb.create_sheet("Department")
+    ws_dept.append(["department_id", "dept_name"])
+    for i in range(1, 4):
+        ws_dept.append([f"D{i}", f"Dept_{i}"])
+
+    ws_link = wb.create_sheet("EmployeeProject")
+    ws_link.append(["employee_id", "project_id", "role"])
+    for i in range(1, 16):
+        emp = f"E{(i % 10) + 1:03d}"
+        proj = f"P{(i % 4) + 1}"
+        ws_link.append([emp, proj, "dev" if i % 2 else "lead"])
+
+    wb.save(path)
+
+
+@pytest.mark.integration
+@pytest.mark.requires_mongo
+def test_e2e_multisheet_excel_creates_three_tables(
+    mongo_db, tmp_path,
+):
+    """v0.18 M1 acceptance (spec §17 M1 row):
+    Upload a multi-sheet xlsx → see N upload_tables rows, each with
+    spec §5.2 fields (table_role, grain, primary_key, sheet_name)
+    populated.
+
+    Default `excel_multi_sheet=True` per v0.18 — no flag needed.
+    """
+    from upload_repository import UploadRepository
+    from upload_service import UploadService
+
+    # 1. Synthesize 3-sheet xlsx
+    xlsx_path = tmp_path / "hr_workbook.xlsx"
+    _build_multi_sheet_xlsx(xlsx_path)
+
+    repo = UploadRepository(mongo_db)
+    repo.ensure_indexes()
+    service = UploadService(upload_repo=repo, uploads_root=tmp_path / "uploads")
+
+    # 2. Upload (no excel_multi_sheet flag — relies on v0.18 default True)
+    dataset_id = service.handle_upload(
+        file_obj=xlsx_path.read_bytes(),
+        filename="hr_workbook.xlsx",
+        owner="alice",
+    )
+
+    # 3. Dataset reached profiled status
+    dataset = repo.get_dataset(dataset_id)
+    assert dataset["status"] == "profiled"
+    assert dataset["file"]["file_type"] == "excel"
+
+    # 4. All 3 sheets became upload_tables rows
+    tables = repo.list_tables(dataset_id)
+    assert len(tables) == 3
+    table_names = {t["table_name"] for t in tables}
+    assert table_names == {"Employee", "Department", "EmployeeProject"}
+
+    # 5. Each row got v0.18 enrichment fields per spec §5.2.
+    # update_table_profile_fields treats None as "leave alone" so the `grain`
+    # field is only present when PK was detected (non-None grain). table_role,
+    # sheet_name, primary_key are always set (the last as [] for unknown).
+    for t in tables:
+        assert "sheet_name" in t, f"sheet_name missing on {t['table_id']}"
+        assert "table_role" in t, f"table_role missing on {t['table_id']}"
+        assert "primary_key" in t, f"primary_key missing on {t['table_id']}"
+        # grain only present when PK non-empty
+        if t["primary_key"]:
+            assert "grain" in t and t["grain"], (
+                f"grain should be set when PK exists on {t['table_id']}"
+            )
+
+    # 6. Employee table specifically: PK=employee_id, role=dimension or bridge
+    #    (bridge if Employee's employee_id PK matches EmployeeProject's
+    #     employee_id col + something else — usually dimension here)
+    emp_row = next(t for t in tables if t["table_name"] == "Employee")
+    assert emp_row["sheet_name"] == "Employee"
+    assert emp_row["primary_key"] == ["employee_id"]
+    assert emp_row["grain"] == "one row per employee"
+    assert emp_row["table_role"] in ("dimension", "fact")
+
+    # 7. EmployeeProject: bridge candidate — has 2+ cols matching other
+    #    tables' PKs (employee_id from Employee, department_id NOT here so
+    #    only one FK match → falls back to "unknown" or "dimension").
+    #    We don't pin the exact role since detection depends on PK overlap;
+    #    we DO require that profile didn't crash and the field exists.
+    link_row = next(t for t in tables if t["table_name"] == "EmployeeProject")
+    assert link_row["sheet_name"] == "EmployeeProject"
+    assert "table_role" in link_row
+
+    # 8. upload_profiles still keyed by parser table_id — regenerate_metadata
+    #    contract preserved. Verify by walking the profile doc.
+    profile = repo.get_latest_profile(dataset_id)
+    assert len(profile["tables"]) == 3
+    upload_tids = {t["table_id"] for t in tables}
+    profile_tids = {tp["table_id"] for tp in profile["tables"]}
+    assert profile_tids == upload_tids, (
+        f"profile/upload_tables table_id mismatch — "
+        f"regenerate_metadata would break. "
+        f"profile={profile_tids}, upload={upload_tids}"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.requires_mongo
+def test_e2e_multisheet_detects_and_persists_relationships(
+    mongo_db, tmp_path,
+):
+    """v0.18 M2: after uploading a multi-sheet xlsx, relationship_profiler
+    runs and saves candidates to upload_relationship_candidates. The
+    Employee → EmployeeProject FK (shared employee_id) should be detected
+    at high confidence.
+    """
+    from upload_repository import UploadRepository
+    from upload_service import UploadService
+
+    xlsx_path = tmp_path / "hr.xlsx"
+    _build_multi_sheet_xlsx(xlsx_path)
+
+    repo = UploadRepository(mongo_db)
+    repo.ensure_indexes()
+    service = UploadService(upload_repo=repo, uploads_root=tmp_path / "uploads")
+    dataset_id = service.handle_upload(
+        file_obj=xlsx_path.read_bytes(),
+        filename="hr.xlsx",
+        owner="alice",
+    )
+
+    # 1. Candidates persisted
+    cands = repo.list_relationship_candidates(dataset_id)
+    assert len(cands) >= 1, (
+        "upload pipeline must persist at least one relationship candidate "
+        "for a 3-sheet workbook where Employee + EmployeeProject share "
+        "employee_id"
+    )
+
+    # 2. Each candidate has spec §5.3 fields
+    for c in cands:
+        for k in ("relationship_id", "from_table", "from_field",
+                  "to_table", "to_field", "relationship_type",
+                  "default_join_type", "confidence", "evidence",
+                  "status", "dataset_id", "metadata_version"):
+            assert k in c, f"missing key `{k}` in {c}"
+        assert c["dataset_id"] == dataset_id
+        assert c["status"] == "candidate"  # spec default before user review
+
+    # 3. The employee_id link is detectable at high tier.
+    emp_rels = [
+        c for c in cands
+        if c["from_field"] == "employee_id"
+        and {c["from_table"], c["to_table"]} == {"Employee", "EmployeeProject"}
+    ]
+    assert emp_rels, (
+        "expected at least one Employee↔EmployeeProject candidate on "
+        "employee_id"
+    )
+    # The from→to direction with EmployeeProject as `from` should be m2o.
+    m2o_match = next(
+        (c for c in emp_rels
+         if c["from_table"] == "EmployeeProject"
+         and c["to_table"] == "Employee"),
+        None,
+    )
+    assert m2o_match is not None
+    assert m2o_match["relationship_type"] == "many_to_one"
+    assert m2o_match["confidence_tier"] == "high"
+    assert m2o_match["confidence"] >= 0.90
+
+
+@pytest.mark.integration
+@pytest.mark.requires_mongo
+def test_e2e_csv_upload_still_works_with_default_multi_sheet_true(
+    mongo_db, golden_data_dir, tmp_path,
+):
+    """Flipping excel_multi_sheet=True default must not break CSV uploads.
+    CSV path doesn't branch on the flag (is_excel=False), but the new
+    enrichment block runs for all uploads — verify it's safe on CSV too.
+    """
+    from upload_repository import UploadRepository
+    from upload_service import UploadService
+
+    repo = UploadRepository(mongo_db)
+    repo.ensure_indexes()
+    service = UploadService(upload_repo=repo, uploads_root=tmp_path)
+
+    csv_bytes = (golden_data_dir / "projects_clean.csv").read_bytes()
+    dataset_id = service.handle_upload(
+        file_obj=csv_bytes, filename="projects_clean.csv", owner="alice",
+    )
+
+    dataset = repo.get_dataset(dataset_id)
+    assert dataset["status"] == "profiled"
+
+    tables = repo.list_tables(dataset_id)
+    assert len(tables) == 1
+    # Enrichment ran on the single CSV "table" too
+    t = tables[0]
+    assert "table_role" in t
+    assert "primary_key" in t
+    # project_id is unique in projects_clean.csv → PK candidate
+    assert "project_id" in t["primary_key"]
+
+
+# ============================================================
 # Test 6:Confirm 流程
 # ============================================================
 @pytest.mark.integration
