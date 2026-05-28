@@ -376,6 +376,30 @@ class UploadAnalysisService:
                 "messages_appended": 2,
             }
 
+        # v0.18+ [META] 短路 — 結構性問題已在 plan_text 完整回答,
+        # 不必走 Phase A/B/C/D。同 [REFUSE] 的 marker 機制,
+        # 由 Phase 0 prompt 教 LLM 標記。省去 ~50s 不必要的 Phase exec。
+        is_meta = (
+            plan_text.strip()[:400].startswith("[META]")
+            or "[META]" in plan_text[:400]
+        )
+        if is_meta:
+            clean_plan = plan_text.replace("[META]", "").strip()
+            self.repo.append_message(
+                session_id, role="assistant",
+                content=clean_plan,
+                meta_structural=True,
+                plan_text=plan_text,
+            )
+            trace.finalize(status="completed")
+            return {
+                "status": "meta_structural",
+                "intent": intent,
+                "trace_id": trace.trace_id,
+                "plan_text": plan_text,
+                "messages_appended": 2,
+            }
+
         # ────────────────────────────────────────
         # Phase A: Pandas filter
         # ────────────────────────────────────────

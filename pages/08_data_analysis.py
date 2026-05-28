@@ -360,6 +360,11 @@ else:
             if msg.get("meta_intent"):
                 st.markdown(content)
                 continue
+            # v0.18 META 結構性問題短路 — plan_text 已含答案,跳過 phase 展示
+            if msg.get("meta_structural"):
+                st.info("ℹ️ 結構性問題 — 直接從 metadata 回答(略過 Phase A/B/C/D)")
+                st.markdown(content)
+                continue
             # 正常 assistant
             if role == "assistant" and msg.get("plan_text"):
                 with st.expander("📋 Plan", expanded=False):
