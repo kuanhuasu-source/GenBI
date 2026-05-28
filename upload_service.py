@@ -381,14 +381,17 @@ class UploadService:
             raise ValueError(f"Dataset `{dataset_id}` 沒 profile")
 
         # v0.18 M3 fix:多 table 時 loop 每張 table call build_metadata,然後 merge
-        # collections。Dataset-level 欄位(dataset_name / business_context /
-        # recommended_mongodb / data_limitations)從最後一張 table 的 metadata 取
-        # — 它們對所有 tables 都相同,因為 build_metadata 從 dataset_doc 算出來。
-        # 若任一 table 無 profile,log warning 跳過(不阻擋其他 table)。
+        # collections + 跨表 properly merge dataset-level fields。
+        # 收集 per-table 結果,稍後合併:
+        #   - data_limitations: 取交集(只有所有 table 都共享的 restriction 才保留)
+        #   - kpi_definitions: 取聯集(所有 table 的 KPI 都要)
+        #   - business_context / recommended_mongodb / dataset_name: 取最後一個
+        #     (這些欄位本來就只跟 dataset_doc 有關,跨 table 一樣)
         profile_lookup = {
             tp.get("table_id"): tp for tp in profile.get("tables", [])
         }
         merged_collections: dict[str, dict] = {}
+        per_table_mds: list[dict] = []   # v0.18 fix · keep all for proper merge
         last_per_table_md: Optional[dict] = None
         skipped_tables: list[str] = []
 
@@ -418,6 +421,7 @@ class UploadService:
             # Each call returns metadata with exactly one entry in `collections`
             # (the one for this table) — merge them all into one dict.
             merged_collections.update(per_table_md["collections"])
+            per_table_mds.append(per_table_md)
             last_per_table_md = per_table_md
 
         if not merged_collections:
@@ -432,6 +436,41 @@ class UploadService:
         assert last_per_table_md is not None  # for type checker
         metadata = dict(last_per_table_md)
         metadata["collections"] = merged_collections
+
+        # v0.18 fix · properly merge tables-spanning fields:
+        # data_limitations uses INTERSECTION (a restriction is only valid if
+        # ALL tables share it — otherwise the dataset DOES have a measure
+        # somewhere → no aggregate restriction). KPI dict uses UNION
+        # (all per-table KPIs are accessible on the dataset).
+        if len(per_table_mds) > 1:
+            # Intersection of data_limitations across tables
+            def _intersect_lists(lol: list[list[str]]) -> list[str]:
+                if not lol:
+                    return []
+                common = set(lol[0])
+                for lst in lol[1:]:
+                    common &= set(lst)
+                return sorted(common)
+
+            missing_lol = [
+                (m.get("data_limitations", {}) or {}).get(
+                    "missing_dimensions", [])
+                for m in per_table_mds
+            ]
+            not_supp_lol = [
+                (m.get("data_limitations", {}) or {}).get(
+                    "not_supported_analysis", [])
+                for m in per_table_mds
+            ]
+            metadata["data_limitations"] = {
+                "missing_dimensions": _intersect_lists(missing_lol),
+                "not_supported_analysis": _intersect_lists(not_supp_lol),
+            }
+            # Union of KPI definitions
+            merged_kpis: dict = {}
+            for m in per_table_mds:
+                merged_kpis.update(m.get("kpi_definitions", {}) or {})
+            metadata["kpi_definitions"] = merged_kpis
 
         # Rewrite business_description for multi-table case so the LLM sees
         # "N tables" not just one table's row count.
