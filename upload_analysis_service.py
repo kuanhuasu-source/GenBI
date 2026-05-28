@@ -383,6 +383,72 @@ class UploadAnalysisService:
             plan_text.strip()[:400].startswith("[META]")
             or "[META]" in plan_text[:400]
         )
+        # v0.18 false-positive guard:即使 LLM 標 [META],若使用者 query
+        # 含「分析動詞」(統計/計算/比較/排名 etc 或 sum/count/chart 等),
+        # 那就是 LLM 誤判 — 否決 [META] 強制走正常 Phase A/B/C/D。
+        if is_meta:
+            _q_lower = (query or "").lower()
+            _ANALYSIS_KEYWORDS = (
+                # Chinese aggregation / measure verbs
+                "統計", "計算", "加總", "總和", "平均", "中位",
+                "排名", "排序", "比較", "差異",
+                "趨勢", "走勢", "變化",
+                "比例", "百分比", "占比", "佔比",
+                "篩選", "過濾",
+                "圖", "畫", "畫圖", "趨勢圖", "長條圖", "圓餅",
+                "依", "各",   # "依部門" / "各員工" pattern
+                # English equivalents
+                "aggregate", "sum", "count", "average", "mean", "median",
+                "total", "top", "rank", "compare",
+                "trend",
+                "chart", "plot", "graph",
+                "filter", "where", "between",
+                "per ", "by department", "by team", "group by",
+            )
+            has_analysis_kw = any(
+                kw.lower() in _q_lower for kw in _ANALYSIS_KEYWORDS
+            )
+            if has_analysis_kw:
+                logger.warning(
+                    f"[META] false-positive BLOCKED for dataset_id={dataset_id} "
+                    f"— LLM emitted [META] but query contains analysis "
+                    f"keyword(s); retrying Phase 0 with anti-META hint. "
+                    f"query={query!r}"
+                )
+                # plan_text is the META-style structural answer, not an
+                # A/B/C plan — Phase A would choke on it. Retry Phase 0
+                # ONCE with an explicit instruction not to use [META].
+                _hinted_query = (
+                    f"{query}\n\n"
+                    f"[系統提示:此為實際分析需求(含計算/篩選/聚合/比較動作),"
+                    f"**禁止**使用 [META] 短路。請走完整 A/B/C 三段規劃,"
+                    f"A 段描述 Pandas filter,B 段描述 groupby/agg,"
+                    f"C 段描述視覺化建議。]"
+                )
+                try:
+                    with trace.step("phase_0_plan_retry", kind="llm_call"):
+                        retry_res = self.llm.generate_plan(
+                            query=_hinted_query,
+                            followup_context=followup_context,
+                        )
+                    retry_text = (
+                        retry_res.get("plan_text", "")
+                        if isinstance(retry_res, dict)
+                        else str(retry_res)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Phase 0 retry failed (continuing with stripped "
+                        f"[META] plan): {e}"
+                    )
+                    retry_text = ""
+                if retry_text and "[META]" not in retry_text[:400]:
+                    plan_text = retry_text
+                else:
+                    # LLM still marked [META] or retry failed — strip the
+                    # marker and proceed with whatever plan_text we have.
+                    plan_text = plan_text.replace("[META]", "").strip()
+                is_meta = False
         if is_meta:
             clean_plan = plan_text.replace("[META]", "").strip()
             self.repo.append_message(
